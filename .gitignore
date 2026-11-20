@@ -1,0 +1,40 @@
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Editors / IDEs
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Logs
+logs/
+*.log
+
+# Archives and binaries
+*.zip
+*.7z
+*.tar.gz
+*.rar
+*.lnk
+
+# LaTeX build outputs
+*.aux
+*.bbl
+*.blg
+*.toc
+*.out
+*.xdv
+
+# Node / TypeScript build outputs
+node_modules/
+lib/
+dist/
+coverage/
+*.tsbuildinfo

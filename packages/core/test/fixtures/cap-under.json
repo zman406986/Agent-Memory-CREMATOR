@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "sessionId": "session-cap-under",
+  "revision": "revision-3",
+  "currentTurnOrdinal": 1,
+  "completedThroughTurnOrdinal": 0,
+  "currentStepOrdinal": 2,
+  "cache": { "kind": "unknown" },
+  "nodes": [
+    {
+      "id": "read-manifest", "kind": "message", "role": "assistant",
+      "turnOrdinal": 1, "stepOrdinal": 1, "toolCallIds": ["call-manifest"],
+      "content": { "utf8": "I will read the package name and scripts." }
+    },
+    {
+      "id": "manifest-result", "kind": "tool-result", "callId": "call-manifest",
+      "turnOrdinal": 1, "stepOrdinal": 1, "embeddedRecords": [],
+      "content": { "utf8": "{\n  \"name\": \"parcel-board\",\n  \"scripts\": { \"test\": \"node --test\" }\n}\n" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "package.json", "displayPath": "package.json", "title": null, "lineCount": 4, "byteLength": null, "outcome": "unknown" }]
+      }
+    },
+    {
+      "id": "read-routes", "kind": "message", "role": "assistant",
+      "turnOrdinal": 1, "stepOrdinal": 2, "toolCallIds": ["call-routes"],
+      "content": { "utf8": "I will read src/routes.ts." }
+    },
+    {
+      "id": "routes-result", "kind": "tool-result", "callId": "call-routes",
+      "turnOrdinal": 1, "stepOrdinal": 2, "embeddedRecords": [],
+      "content": { "utf8": "export const routes = ['/parcels', '/depots'];\n" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/routes.ts", "displayPath": "src/routes.ts", "title": null, "lineCount": 1, "byteLength": null, "outcome": "unknown" }]
+      }
+    }
+  ]
+}

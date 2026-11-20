@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": ".",
+    "types": ["node"],
+    "paths": {
+      "@cremator/core": ["./packages/core/src/index.ts"],
+      "cremator-dsh": ["./packages/adapters/dsh/src/index.ts"],
+      "cremator-opencode": ["./packages/adapters/opencode/src/index.ts"]
+    }
+  },
+  "include": [
+    "examples/**/*.ts",
+    "packages/core/src/**/*.ts",
+    "packages/core/test/**/*.ts",
+    "packages/adapters/dsh/src/**/*.ts",
+    "packages/adapters/dsh/test/**/*.ts",
+    "packages/adapters/opencode/src/**/*.ts",
+    "packages/adapters/opencode/test/**/*.ts"
+  ]
+}

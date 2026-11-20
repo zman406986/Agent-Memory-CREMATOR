@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "sessionId": "session-crlf-bom",
+  "revision": "revision-2",
+  "currentTurnOrdinal": 2,
+  "completedThroughTurnOrdinal": 1,
+  "currentStepOrdinal": 2,
+  "cache": { "kind": "unknown" },
+  "nodes": [
+    {
+      "id": "windows-config", "kind": "tool-result", "callId": "call-windows-config",
+      "turnOrdinal": 1, "stepOrdinal": 1, "embeddedRecords": [],
+      "content": { "utf8": "\ufeff# Courier settings\r\nname=café\r\nretryLimit=3\r\nregion=北" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "config/courier.ini", "displayPath": "config/courier.ini", "title": "Courier settings", "lineCount": 4, "byteLength": 59, "outcome": "unknown" }]
+      }
+    },
+    {
+      "id": "follow-up", "kind": "message", "role": "user",
+      "turnOrdinal": 2, "stepOrdinal": 2, "toolCallIds": [],
+      "content": { "utf8": "Keep the original line endings when changing retryLimit." }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "sessionId": "session-search-miss",
+  "revision": "revision-12",
+  "currentTurnOrdinal": 4,
+  "completedThroughTurnOrdinal": 3,
+  "currentStepOrdinal": 10,
+  "cache": { "kind": "warm", "watermarkNodeIndex": 0 },
+  "nodes": [
+    {
+      "id": "find-handler", "kind": "message", "role": "user",
+      "turnOrdinal": 3, "stepOrdinal": 6, "toolCallIds": [],
+      "content": { "utf8": "Find a retryShipment handler in the shipping code." }
+    },
+    {
+      "id": "read-service", "kind": "message", "role": "assistant",
+      "turnOrdinal": 3, "stepOrdinal": 7, "toolCallIds": ["call-service"],
+      "content": { "utf8": "I will check src/shipping/service.ts for retryShipment." }
+    },
+    {
+      "id": "service-miss", "kind": "tool-result", "callId": "call-service",
+      "turnOrdinal": 3, "stepOrdinal": 7, "embeddedRecords": [],
+      "content": { "utf8": "export function dispatchShipment(id: string) {\n  return { id, state: 'queued' };\n}\n" },
+      "evidence": {
+        "kind": "read", "target": { "key": "symbol:retryShipment", "label": "retryShipment" }, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/shipping/service.ts", "displayPath": "src/shipping/service.ts", "title": null, "lineCount": 3, "byteLength": null, "outcome": "miss" }]
+      }
+    },
+    {
+      "id": "search-routes", "kind": "message", "role": "assistant",
+      "turnOrdinal": 3, "stepOrdinal": 8, "toolCallIds": ["call-search-routes"],
+      "content": { "utf8": "I will search routes.ts and queue.ts for the exact symbol." }
+    },
+    {
+      "id": "routes-miss", "kind": "tool-result", "callId": "call-search-routes",
+      "turnOrdinal": 3, "stepOrdinal": 8, "embeddedRecords": [],
+      "content": { "utf8": "No matches for retryShipment in src/shipping/routes.ts or src/shipping/queue.ts.\n" },
+      "evidence": {
+        "kind": "search", "target": { "key": "symbol:retryShipment", "label": "retryShipment" }, "sourceRecallId": null,
+        "paths": [
+          { "pathKey": "src/shipping/routes.ts", "displayPath": "src/shipping/routes.ts", "title": null, "lineCount": null, "byteLength": null, "outcome": "miss" },
+          { "pathKey": "src/shipping/queue.ts", "displayPath": "src/shipping/queue.ts", "title": null, "lineCount": null, "byteLength": null, "outcome": "miss" }
+        ]
+      }
+    },
+    {
+      "id": "read-worker", "kind": "message", "role": "assistant",
+      "turnOrdinal": 3, "stepOrdinal": 9, "toolCallIds": ["call-worker"],
+      "content": { "utf8": "I will check src/shipping/worker.ts for the same symbol." }
+    },
+    {
+      "id": "worker-miss", "kind": "tool-result", "callId": "call-worker",
+      "turnOrdinal": 3, "stepOrdinal": 9, "embeddedRecords": [],
+      "content": { "utf8": "export const worker = { concurrency: 2, queue: 'shipping' };\n" },
+      "evidence": {
+        "kind": "read", "target": { "key": "symbol:retryShipment", "label": "retryShipment" }, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/shipping/worker.ts", "displayPath": "src/shipping/worker.ts", "title": null, "lineCount": 1, "byteLength": null, "outcome": "miss" }]
+      }
+    },
+    {
+      "id": "move-on", "kind": "message", "role": "assistant",
+      "turnOrdinal": 3, "stepOrdinal": 9, "toolCallIds": [],
+      "content": { "utf8": "retryShipment is absent from these four files. I will inspect the delivery status model next." }
+    },
+    {
+      "id": "next-request", "kind": "message", "role": "user",
+      "turnOrdinal": 4, "stepOrdinal": 10, "toolCallIds": [],
+      "content": { "utf8": "Show the delivery states instead." }
+    }
+  ]
+}

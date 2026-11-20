@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "sessionId": "session-cold-resume",
+  "revision": "revision-18",
+  "currentTurnOrdinal": 5,
+  "completedThroughTurnOrdinal": 4,
+  "currentStepOrdinal": 13,
+  "cache": { "kind": "cold", "boundary": { "kind": "resume", "observedAtMs": 1792483200000 } },
+  "nodes": [
+    {
+      "id": "policy", "kind": "message", "role": "system",
+      "turnOrdinal": 0, "stepOrdinal": 0, "toolCallIds": [],
+      "content": { "utf8": "Ask before changing the deploy file.\n" }
+    },
+    {
+      "id": "old-request", "kind": "message", "role": "user",
+      "turnOrdinal": 4, "stepOrdinal": 11, "toolCallIds": [],
+      "content": { "utf8": "Inspect the queue timeout before editing it." }
+    },
+    {
+      "id": "old-read", "kind": "message", "role": "assistant",
+      "turnOrdinal": 4, "stepOrdinal": 12, "toolCallIds": ["call-old-config"],
+      "content": { "utf8": "I will read config/queue.json." }
+    },
+    {
+      "id": "old-result", "kind": "tool-result", "callId": "call-old-config",
+      "turnOrdinal": 4, "stepOrdinal": 12, "embeddedRecords": [],
+      "content": { "utf8": "{\n  \"timeoutMs\": 5000,\n  \"maxPending\": 24\n}\n" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "config/queue.json", "displayPath": "config/queue.json", "title": null, "lineCount": 4, "byteLength": null, "outcome": "unknown" }]
+      }
+    },
+    {
+      "id": "pending-approval", "kind": "message", "role": "assistant",
+      "turnOrdinal": 4, "stepOrdinal": 12, "toolCallIds": [],
+      "content": { "utf8": "May I raise the deploy queue timeout to 10000 ms?" }
+    },
+    {
+      "id": "resume-request", "kind": "message", "role": "user",
+      "turnOrdinal": 5, "stepOrdinal": 13, "toolCallIds": [],
+      "content": { "utf8": "Resume inspection. Leave the approval pending while we check the worker." }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# Mount cremator-dsh into a dsh profile. Pass this file to `dsh --patch`:
+#
+#   dsh --profile headless --patch ./patch.yml "your task"
+#
+# `name` is a file:/// URL to the built entry, not a package specifier: after
+# `npm run build`, replace the placeholder with
+# `file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js`
+# Values are the mount's flat config knobs; every key is optional.
+- insert:
+    - id: cremator-mount
+      name: 'file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js'
+      config:
+        barBytes: 512
+        enforcement: apply
+        contextWindowTokens: 400000
+        pruneThresholdTokens: 60000
+        entryAskTrigger: { mode: 'off' }
+        pruneAskGrammar: nokeepall
+        nativeCompactionBackstop: true

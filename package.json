@@ -1,0 +1,33 @@
+{
+  "name": "cremator",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Harness-agnostic context hygiene for coding agents: offload trash, do not summarize it.",
+  "workspaces": [
+    "packages/*",
+    "packages/adapters/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @cremator/core && npm run build -w cremator-dsh && npm run build -w cremator-opencode",
+    "pretest": "npm run build",
+    "test": "node scripts/run-tests.mjs",
+    "test:dev": "node --test \"dev/**/*.test.mjs\" \"scripts/check-core-purity.test.mjs\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:purity": "node scripts/check-core-purity.mjs",
+    "check": "npm run typecheck && npm run check:purity && npm run test && npm run test:dev"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "es-module-lexer": "^3.0.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.13.0 <23.0.0 || >=23.4.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

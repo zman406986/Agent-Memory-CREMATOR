@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "sessionId": "session-cap-oversize",
+  "revision": "revision-7",
+  "currentTurnOrdinal": 2,
+  "completedThroughTurnOrdinal": 1,
+  "currentStepOrdinal": 5,
+  "cache": { "kind": "warm", "watermarkNodeIndex": 1 },
+  "nodes": [
+    {
+      "id": "request", "kind": "message", "role": "user",
+      "turnOrdinal": 2, "stepOrdinal": 3, "toolCallIds": [],
+      "content": { "utf8": "Check the export worker log, then read its retry limit." }
+    },
+    {
+      "id": "read-log", "kind": "message", "role": "assistant",
+      "turnOrdinal": 2, "stepOrdinal": 4, "toolCallIds": ["call-worker-log"],
+      "content": { "utf8": "I will inspect logs/export-worker.log." }
+    },
+    {
+      "id": "large-result", "kind": "tool-result", "callId": "call-worker-log",
+      "turnOrdinal": 2, "stepOrdinal": 4, "embeddedRecords": [],
+      "content": {
+        "utf8": "2026-10-20T08:14:02.000Z INFO worker=exports queue=nightly job=inventory-refresh state=waiting retry=0 nextPollMs=1000\n",
+        "repeat": 192
+      },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "logs/export-worker.log", "displayPath": "logs/export-worker.log", "title": null, "lineCount": 192, "byteLength": null, "outcome": "unknown" }]
+      }
+    },
+    {
+      "id": "read-config", "kind": "message", "role": "assistant",
+      "turnOrdinal": 2, "stepOrdinal": 5, "toolCallIds": ["call-retry-limit"],
+      "content": { "utf8": "I will read config/export-worker.json." }
+    },
+    {
+      "id": "small-result", "kind": "tool-result", "callId": "call-retry-limit",
+      "turnOrdinal": 2, "stepOrdinal": 5, "embeddedRecords": [],
+      "content": { "utf8": "{\n  \"retryLimit\": 3,\n  \"queue\": \"nightly\"\n}\n" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "config/export-worker.json", "displayPath": "config/export-worker.json", "title": null, "lineCount": 4, "byteLength": null, "outcome": "unknown" }]
+      }
+    }
+  ]
+}

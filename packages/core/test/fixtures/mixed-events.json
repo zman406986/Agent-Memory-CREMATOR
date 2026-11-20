@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "sessionId": "session-mixed-events",
+  "revision": "revision-9",
+  "currentTurnOrdinal": 3,
+  "completedThroughTurnOrdinal": 2,
+  "currentStepOrdinal": 8,
+  "cache": { "kind": "warm", "watermarkNodeIndex": 1 },
+  "nodes": [
+    {
+      "id": "read-model", "kind": "message", "role": "assistant", "turnOrdinal": 2, "stepOrdinal": 4, "toolCallIds": ["call-model"],
+      "content": { "utf8": "I will read src/delivery/model.ts before looking for the parser." }
+    },
+    {
+      "id": "model-result", "kind": "tool-result", "callId": "call-model",
+      "turnOrdinal": 2, "stepOrdinal": 4, "embeddedRecords": [],
+      "content": { "utf8": "export type DeliveryState = 'queued' | 'sent';\n" },
+      "evidence": {
+        "kind": "read", "target": null, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/delivery/model.ts", "displayPath": "src/delivery/model.ts", "title": null, "lineCount": 1, "byteLength": null, "outcome": "unknown" }]
+      }
+    },
+    {
+      "id": "find-parser-files", "kind": "message", "role": "assistant", "turnOrdinal": 2, "stepOrdinal": 5, "toolCallIds": ["call-glob"],
+      "content": { "utf8": "I will list src/delivery/*parser*.ts." }
+    },
+    {
+      "id": "glob-result", "kind": "tool-result", "callId": "call-glob",
+      "turnOrdinal": 2, "stepOrdinal": 5, "embeddedRecords": [],
+      "content": { "utf8": "src/delivery/state-parser.ts\n" },
+      "evidence": {
+        "kind": "glob", "target": { "key": "path:delivery-parsers", "label": "src/delivery/*parser*.ts" }, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/delivery/state-parser.ts", "displayPath": "src/delivery/state-parser.ts", "title": null, "lineCount": null, "byteLength": null, "outcome": "hit" }]
+      }
+    },
+    {
+      "id": "read-doc", "kind": "message", "role": "assistant", "turnOrdinal": 2, "stepOrdinal": 6, "toolCallIds": ["call-doc"],
+      "content": { "utf8": "I will check docs/delivery.md for parseDeliveryState." }
+    },
+    {
+      "id": "doc-miss", "kind": "tool-result", "callId": "call-doc",
+      "turnOrdinal": 2, "stepOrdinal": 6, "embeddedRecords": [],
+      "content": { "utf8": "# Delivery\nQueued parcels wait for a courier.\n" },
+      "evidence": {
+        "kind": "read", "target": { "key": "symbol:parseDeliveryState", "label": "parseDeliveryState" }, "sourceRecallId": null,
+        "paths": [{ "pathKey": "docs/delivery.md", "displayPath": "docs/delivery.md", "title": "Delivery", "lineCount": 2, "byteLength": null, "outcome": "miss" }]
+      }
+    },
+    {
+      "id": "search-parser", "kind": "message", "role": "assistant", "turnOrdinal": 2, "stepOrdinal": 7, "toolCallIds": ["call-search"],
+      "content": { "utf8": "I will search state-parser.ts for parseDeliveryState." }
+    },
+    {
+      "id": "search-hit", "kind": "tool-result", "callId": "call-search",
+      "turnOrdinal": 2, "stepOrdinal": 7, "embeddedRecords": [],
+      "content": { "utf8": "src/delivery/state-parser.ts:12:export function parseDeliveryState(value: string) {\n" },
+      "evidence": {
+        "kind": "search", "target": { "key": "symbol:parseDeliveryState", "label": "parseDeliveryState" }, "sourceRecallId": null,
+        "paths": [{ "pathKey": "src/delivery/state-parser.ts", "displayPath": "src/delivery/state-parser.ts", "title": null, "lineCount": null, "byteLength": null, "outcome": "hit" }]
+      }
+    },
+    {
+      "id": "check-worktree", "kind": "message", "role": "assistant", "turnOrdinal": 3, "stepOrdinal": 8, "toolCallIds": ["call-status"],
+      "content": { "utf8": "The parser is in src/delivery/state-parser.ts. I will run git status --short." }
+    },
+    {
+      "id": "command-result", "kind": "tool-result", "callId": "call-status",
+      "turnOrdinal": 3, "stepOrdinal": 8, "embeddedRecords": [],
+      "content": { "utf8": " M docs/delivery.md\n" },
+      "evidence": { "kind": "other", "target": null, "paths": [], "sourceRecallId": null }
+    }
+  ]
+}
