@@ -23,6 +23,15 @@ import { readAssistantUsage } from './usage.js';
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
 /**
+ * The largest delay the platform timers accept (`2^31-1` ms, about 24.9 days).
+ * `AbortSignal.timeout` (and `setTimeout`) clamp a larger delay to 1 ms, which
+ * would turn a long deadline into an immediate abort (ISSUE-425). This is the
+ * platform's range, not a cap this package invents (standing rule 7 /
+ * ADR-0060); a value beyond it is refused by name at mount and here.
+ */
+export const MAX_ASK_DEADLINE_MS = 2_147_483_647;
+
+/**
  * The process-local mark every ask from this package carries. The mount's
  * `llm/stream` observer uses it to tell a racoons ask (entry, prune) from
  * main's requests: an ask must never become the next fork seed. A symbol, so
@@ -69,7 +78,9 @@ export interface StreamAskOptions {
    * (ISSUE-088): no deadline is built and only the caller's `signal` can end the
    * ask. A negative or non-finite value is a misconfiguration, not an off switch:
    * it is refused by name (`invalid-timeout`) so it can never silently hang a
-   * step behind a long-lived outer signal (ISSUE-344).
+   * step behind a long-lived outer signal (ISSUE-344). A value beyond the
+   * platform timer range (`MAX_ASK_DEADLINE_MS`) is refused the same way, because
+   * the platform would clamp it to a 1 ms abort (ISSUE-425).
    */
   readonly timeoutMs?: number;
   readonly maxTokens?: number;
@@ -259,6 +270,14 @@ async function askRequest(llm: DshLlmService, fields: {
     return refuse('invalid-timeout',
       'timeoutMs must be a positive finite number, or 0 to disable the deadline '
       + `(ISSUE-088); got ${String(options.timeoutMs)}`, 'invalid-timeout');
+  }
+  // ISSUE-425: the platform clamps a delay beyond `2^31-1` ms to 1 ms, so a huge
+  // but valid config would abort almost immediately. Refuse it by name instead.
+  if (options.timeoutMs !== undefined && timeoutMs > MAX_ASK_DEADLINE_MS) {
+    return refuse('invalid-timeout',
+      'timeoutMs must not exceed the platform timer range '
+      + `(${String(MAX_ASK_DEADLINE_MS)} ms); got ${String(options.timeoutMs)}`,
+      'invalid-timeout');
   }
   // The stdlib owns the deadline and the race: `AbortSignal.timeout` fires once and
   // does not hold the event loop; `AbortSignal.any` keeps the FIRST source's reason

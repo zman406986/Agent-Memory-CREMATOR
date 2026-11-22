@@ -94,6 +94,205 @@ class FakeEventStream {
   }
 }
 
+/** An ephemeral stream: an event pushed before anyone subscribes is lost. */
+class EphemeralStream extends FakeEventStream {
+  private subscribed = false;
+
+  override push(event: OpencodeHostEvent): void {
+    if (!this.subscribed) return;
+    super.push(event);
+  }
+
+  override [Symbol.asyncIterator](): AsyncIterator<OpencodeHostEvent> {
+    this.subscribed = true;
+    return super[Symbol.asyncIterator]();
+  }
+}
+
+test('ISSUE-411: the event consumer is live before the idle hook registers', async () => {
+  const lines = journalLines();
+  const stream = new EphemeralStream();
+  const order: string[] = [];
+  let releaseIdleHook = (): void => {};
+  const idleHookGate = new Promise<void>(resolve => { releaseIdleHook = resolve; });
+  const hooks: {
+    context: ((input: OpencodeSessionContext) => Promise<void> | void) | null;
+  } = { context: null };
+  const context = {
+    session: {
+      hook: async (name: string, callback: (input: never) => Promise<void> | void) => {
+        order.push(`hook:${name}`);
+        if (name === 'context') {
+          hooks.context = callback as unknown as typeof hooks.context;
+          return {};
+        }
+        // The awaited idle registration is in progress. The stream has no
+        // subscriber under the old ordering, so this event is dropped there.
+        stream.push({ type: 'session.compaction.started', data: { sessionID: sessionId } });
+        await idleHookGate;
+        return {};
+      },
+      generate: async () => ({ text: '{}' }),
+    },
+    tool: {
+      transform: async (callback: (editor: { add: (tool: unknown) => void }) => Promise<void>) => {
+        await callback({ add: () => {} });
+        return {};
+      },
+      hook: async () => ({}),
+    },
+    event: {
+      subscribe: () => { order.push('subscribe'); return stream; },
+    },
+  } as unknown as OpencodePluginContext;
+  const plugin = createOpencodePlugin({
+    storage: { databasePath: ':memory:' },
+    journal: record => lines.records.push(record),
+  });
+  const settingUp = plugin.setup(context);
+  try {
+    // The consumer must consume the event while the idle hook registration is
+    // still pending: that is the ISSUE-411 gap.
+    await waitFor(() => lines.of('compacted').length === 1);
+    assert.ok(order.indexOf('subscribe') < order.indexOf('hook:experimental.idle'),
+      'the subscription is live before the idle hook registers');
+    releaseIdleHook();
+    const cleanup = await settingUp;
+    try {
+      assert.equal(lines.of('idle-hook').length, 1, 'the registration is journalled');
+      assert.equal(lines.of('idle-hook')[0]?.['registered'], true,
+        'the journal says the hook registered, not that it was never called');
+    } finally { await cleanup(); }
+  } finally { releaseIdleHook(); }
+});
+
+test('ISSUE-482: an idle during the idle-hook registration asks exactly once', async () => {
+  const lines = journalLines();
+  const stream = new FakeEventStream();
+  let asks = 0;
+  let releaseRegistration = (): void => {};
+  const registrationGate = new Promise<void>(resolve => { releaseRegistration = resolve; });
+  const hooks: {
+    context: ((input: OpencodeSessionContext) => Promise<void> | void) | null;
+    idle: ((input: OpencodeIdleHookInput) => Promise<void> | void) | null;
+  } = { context: null, idle: null };
+  const context = {
+    session: {
+      hook: async (name: string, callback: (input: never) => Promise<void> | void) => {
+        if (name === 'context') {
+          hooks.context = callback as unknown as typeof hooks.context;
+          return {};
+        }
+        if (name !== 'experimental.idle') throw new Error(`unexpected session hook: ${name}`);
+        hooks.idle = callback as unknown as typeof hooks.idle;
+        // Hold the registration open: this is the pre-registration window.
+        await registrationGate;
+        return {};
+      },
+      generate: async () => ({ text: '{"1":{"keepall":true}}' }),
+    },
+    tool: {
+      transform: async (callback: (editor: { add: (tool: unknown) => void }) => Promise<void>) => {
+        await callback({ add: () => {} });
+        return {};
+      },
+      hook: async () => ({}),
+    },
+    event: { subscribe: () => stream },
+  } as unknown as OpencodePluginContext;
+  const plugin = createOpencodePlugin({
+    storage: { databasePath: ':memory:' },
+    contextWindowTokens: 400_000,
+    pruneThresholdTokens: 100,
+    askGrammar: 'prune-two-option',
+    askGenerate: async () => { asks += 1; return { text: '{"1":{"keepall":true}}' }; },
+    journal: record => lines.records.push(record),
+  });
+  const settingUp = plugin.setup(context);
+  try {
+    // ISSUE-482: the context hook is live while `experimental.idle` is still
+    // registering, so this test walks the registration window on a mount that
+    // really registers, not on `createOpencodeMount`'s default flag.
+    await waitFor(() => hooks.context !== null);
+    const deliver = hooks.context as (input: OpencodeSessionContext) => Promise<void> | void;
+    assert.equal(lines.of('idle-hook').length, 0, 'the idle registration has not returned');
+    // Step 1 ships the units; a below-bar host reading keeps the step ask quiet.
+    await deliver(sessionContext(largeMessages()));
+    stream.push(stepUsage('msg_482_1', 50));
+    await waitFor(() => lines.of('usage-reconciled').length === 1);
+    await deliver(sessionContext(largeMessages()));
+    stream.push(stepUsage('msg_482_2', 150));
+    await waitFor(() => lines.of('usage-reconciled').length === 2);
+    // An idle delivered inside the pending registration is the event path's.
+    stream.push({ type: 'session.idle', data: { sessionID: sessionId } });
+    await waitFor(() => lines.of('ask').length === 1);
+    assert.equal(asks, 1, 'the idle that arrives before the hook registers asks once');
+    assert.equal(lines.of('ask')[0]?.['origin'], 'idle', 'the fire names the idle origin');
+    // Registration completes; the hook firing for the same revision asks nothing.
+    releaseRegistration();
+    const cleanup = await settingUp;
+    try {
+      assert.equal(lines.of('idle-hook').length, 1, 'the registration is journalled');
+      await hooks.idle?.({ sessionID: sessionId, background: [] });
+      assert.equal(asks, 1, 'the hook firing for the same revision never stacks a second ask');
+      assert.equal(lines.of('ask').length, 1, 'still exactly one fire');
+    } finally { await cleanup(); }
+  } finally {
+    releaseRegistration();
+    await settingUp.catch(() => {});
+  }
+});
+
+test('ISSUE-411: a refused idle hook keeps the event-path ask', async () => {
+  const lines = journalLines();
+  const stream = new FakeEventStream();
+  const hooks: {
+    context: ((input: OpencodeSessionContext) => Promise<void> | void) | null;
+  } = { context: null };
+  const context = {
+    session: {
+      hook: async (name: string, callback: (input: never) => Promise<void> | void) => {
+        if (name === 'context') {
+          hooks.context = callback as unknown as typeof hooks.context;
+          return {};
+        }
+        throw new Error(`this host predates ${name}`);
+      },
+      generate: async () => ({ text: '{"1":{"keepall":true}}' }),
+    },
+    tool: {
+      transform: async (callback: (editor: { add: (tool: unknown) => void }) => Promise<void>) => {
+        await callback({ add: () => {} });
+        return {};
+      },
+      hook: async () => ({}),
+    },
+    event: { subscribe: () => stream },
+  } as unknown as OpencodePluginContext;
+  const plugin = createOpencodePlugin({
+    storage: { databasePath: ':memory:' },
+    contextWindowTokens: 400_000,
+    pruneThresholdTokens: 100,
+    askGrammar: 'prune-two-option',
+    journal: record => lines.records.push(record),
+  });
+  const cleanup = await plugin.setup(context);
+  try {
+    assert.equal(lines.of('idle-hook-error').length, 1, 'the refusal is journalled');
+    assert.ok(hooks.context !== null, 'the context hook is registered');
+    await hooks.context(sessionContext(largeMessages()));
+    stream.push(stepUsage('msg_411_1', 50));
+    await waitFor(() => lines.of('usage-reconciled').length === 1);
+    await hooks.context(sessionContext(largeMessages()));
+    stream.push(stepUsage('msg_411_2', 150));
+    await waitFor(() => lines.of('usage-reconciled').length === 2);
+    // No awaited hook: the event path still owns the idle ask.
+    stream.push({ type: 'session.idle', data: { sessionID: sessionId } });
+    await waitFor(() => lines.of('ask').length === 1);
+    assert.equal(lines.of('ask')[0]?.['origin'], 'idle', 'the event path asked');
+  } finally { await cleanup(); }
+});
+
 test('ISSUE-373: the idle-origin ask blocks inside the awaited experimental.idle hook', async () => {
   const lines = journalLines();
   const stream = new FakeEventStream();

@@ -56,7 +56,7 @@ export interface DshForgetScheduled {
 export interface DshForgetRefusal {
   readonly status: 'refused';
   readonly code: 'unresolved-request' | 'unsupported-capability';
-  readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam';
+  readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam' | 'not-durable';
   readonly detail: string;
 }
 
@@ -145,6 +145,16 @@ export function forgetUnavailable(): DshForgetRefusal {
 }
 
 /**
+ * The refusal a mount gives when the accepted request could not be made
+ * durable (ISSUE-417). Answering "scheduled" would promise a removal an unload
+ * can lose, so the tool says what it can prove: nothing was queued.
+ */
+export function forgetNotDurable(): DshForgetRefusal {
+  return { status: 'refused', code: 'unsupported-capability', reason: 'not-durable',
+    detail: 'the removal could not be made durable, so nothing was scheduled' };
+}
+
+/**
  * The answer value the model receives. Plain JSON by construction (the host
  * snapshots every tool value), and it echoes the caller's own spellings:
  * `startLine`/`endLine` as the spec declared them.
@@ -158,7 +168,8 @@ export type DshForgetValue =
   | {
       readonly status: 'refused';
       readonly code: 'unresolved-request' | 'unsupported-capability';
-      readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam';
+      readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam'
+        | 'not-durable';
       readonly detail: string;
     };
 

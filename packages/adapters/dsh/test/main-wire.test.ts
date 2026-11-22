@@ -211,6 +211,8 @@ const ROWS: readonly Row[] = [
       assert.equal(capture.last('s3'), null, at('the second evicted session has no capture'));
       assert.equal(capture.last('s2')?.wire.messages[0]?.text, 'main s2',
         at('the live session keeps its capture'));
+      assert.deepEqual(capture.sessionIds(), ['s2'],
+        at('the key list names only the live capture (ISSUE-455)'));
       // Evicting a session never seen is a no-op, never a throw.
       capture.evict('never-seen');
       assert.equal(capture.last('s2')?.wire.messages[0]?.text, 'main s2',

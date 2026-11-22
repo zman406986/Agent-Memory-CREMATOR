@@ -22,10 +22,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { LedgerError } from '@cremator/core';
+import { LedgerError, PRUNE_ASK_JSONL_20_LATER_SYSTEM_PROMPT,
+  PRUNE_ASK_JSONL_20_SLOT, PRUNE_ASK_JSONL_20_SYSTEM_PROMPT } from '@cremator/core';
 import type {
   DshLlmChunk, DshLlmStreamOptions, DshMountContext, DshMountEvent, DshMountSession,
-  RacoonsJournalRecord,
+  RacoonsJournalRecord, RacoonsPluginConfig,
 } from '../src/plugin.js';
 import { createRacoonsPlugin, resolveSessionStorage } from '../src/plugin.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
@@ -37,17 +38,20 @@ const FORGET = '{"1":{"forgetall":"oversized read"}}';
 const KEEP = '{"1":{"keepall":true}}';
 
 interface FakeLlm {
+  readonly calls: DshLlmStreamOptions[];
   stream(options: DshLlmStreamOptions): AsyncIterable<DshLlmChunk>;
 }
 
 /** A scripted model seam: reply N is the Nth answer, the last answer repeats. */
 function fakeLlm(answers: readonly string[]): FakeLlm {
-  let calls = 0;
+  let index = 0;
+  const calls: DshLlmStreamOptions[] = [];
   return {
+    calls,
     stream(options) {
-      void options;
-      const answer = answers[Math.min(calls, answers.length - 1)] ?? '';
-      calls += 1;
+      calls.push(options);
+      const answer = answers[Math.min(index, answers.length - 1)] ?? '';
+      index += 1;
       return (async function* emit() {
         yield { type: 'text-delta', index: 0, text: answer.slice(0, 5) };
         yield { type: 'text-delta', index: 0, text: answer.slice(5) };
@@ -134,9 +138,10 @@ function oversizedBody(bytes: number): string {
  * it is the prune's only seed (ADR-0010), and a pass with no seed asks nothing.
  */
 function fakeMount(root: string, journal: JournalLine[],
-  answers: readonly string[] = [FORGET]): {
+  answers: readonly string[] = [FORGET], config: RacoonsPluginConfig = {}): {
   readonly listeners: Map<string, (...args: never[]) => unknown>;
   readonly tools: RegisteredTool[];
+  readonly llm: FakeLlm;
   wire(sessionId: string): void;
   apply(): Promise<void>;
   close(): Promise<void>;
@@ -144,21 +149,22 @@ function fakeMount(root: string, journal: JournalLine[],
   const listeners = new Map<string, (...args: never[]) => unknown>();
   const tools: RegisteredTool[] = [];
   const cleanups: (() => unknown)[] = [];
+  const llm = fakeLlm(answers);
   const ctx: DshMountContext = {
     logger: { warn: () => {} },
     tools: { register: (tool: unknown) => { tools.push(tool as RegisteredTool); return () => {}; } } as never,
     on: (event, listener) => { listeners.set(event, listener); return () => listeners.delete(event); },
     effect: (register) => { const fn = register(); if (typeof fn === 'function') cleanups.push(fn); },
-    llm: fakeLlm(answers),
+    llm,
   };
   const plugin = createRacoonsPlugin({ journal: (record: RacoonsJournalRecord) => journal.push(record),
     judgeRoute: ROUTE,
-    // The entry checkpoint's ask is its own seam (ISSUE-058 chunk P3c-2): this
-    // test isolates the prune/storage lane, so the floor sits above every
-    // fixture body and no entry ask competes for the scripted answers.
+    // The entry checkpoint's ask is its own seam (ISSUE-058 chunk P3c-2): by
+    // default this test isolates the prune/storage lane, so the floor sits
+    // above every fixture body and no entry ask competes for the answers.
     config: { crematorStorageRoot: root, floorBytes: 1 << 20,
-      barBytes: 64, contextWindowTokens: 200_000 } });
-  return { listeners, tools,
+      barBytes: 64, contextWindowTokens: 200_000, ...config } });
+  return { listeners, tools, llm,
     wire: (sessionId) => { dispatchWire(listeners, sessionId); },
     apply: async () => { await plugin.apply(ctx, {}); },
     close: async () => {
@@ -345,6 +351,61 @@ test('a prune removal through the mount restores its exact bytes after a reopen'
     await assert.rejects(() => recallTool.execute({ id: 'not-a-recall-id' }),
       (error: unknown) => error instanceof LedgerError && error.code === 'not-found');
     assert.equal(resumed.seq, seqBefore, 'a refused recall appends no event');
+  } finally {
+    await first.close();
+    await second.close();
+    cleanup(dir);
+  }
+});
+
+/** The text the ask seam actually sent (the last message's text blocks). */
+function promptText(options: DshLlmStreamOptions): string {
+  const last = options.messages[options.messages.length - 1] as {
+    readonly content?: readonly { readonly text?: string }[];
+  } | undefined;
+  return (last?.content ?? []).map(block => block.text ?? '').join('');
+}
+
+const FIRST_PREFIX = PRUNE_ASK_JSONL_20_SYSTEM_PROMPT
+  .slice(0, PRUNE_ASK_JSONL_20_SYSTEM_PROMPT.indexOf(PRUNE_ASK_JSONL_20_SLOT));
+const LATER_PREFIX = PRUNE_ASK_JSONL_20_LATER_SYSTEM_PROMPT
+  .slice(0, PRUNE_ASK_JSONL_20_LATER_SYSTEM_PROMPT.indexOf(PRUNE_ASK_JSONL_20_SLOT));
+
+test('the first-ask share line is not repeated after a restart (ISSUE-406)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'racoons-restart-first-ask-'));
+  const root = join(dir, 'racoons');
+  const journal1: JournalLine[] = [];
+  const journal2: JournalLine[] = [];
+  const config: RacoonsPluginConfig = { floorBytes: 512, barBytes: 8192,
+    entryAskTrigger: { mode: 'count' }, entryAskGrammar: 'jsonl-20' };
+  const first = fakeMount(root, journal1, [KEEP], config);
+  const second = fakeMount(root, journal2, [KEEP], config);
+  try {
+    // 1. A genuinely first ask states the 70 percent share line.
+    await first.apply();
+    const session = fakeSession('session-restart-first-ask');
+    attach(first, session);
+    first.wire(session.id);
+    step(session, oversizedBody(2_000), 'c1');
+    await preStep(first.listeners, session);
+    assert.equal(first.llm.calls.length, 1, 'the first ask left the seam');
+    assert.equal(promptText(first.llm.calls[0] as DshLlmStreamOptions)
+      .slice(0, FIRST_PREFIX.length), FIRST_PREFIX,
+    'the first ask states the first-ask share line');
+    await first.close();
+
+    // 2. The restart: a fresh mount and surface over the SAME durable state.
+    //    New call ids, because the ledger already records the old event applied.
+    await second.apply();
+    const resumed = fakeSession('session-restart-first-ask');
+    attach(second, resumed);
+    second.wire(resumed.id);
+    step(resumed, oversizedBody(2_000), 'r1');
+    await preStep(second.listeners, resumed);
+    assert.equal(second.llm.calls.length, 1, 'the resumed ask left the seam');
+    assert.equal(promptText(second.llm.calls[0] as DshLlmStreamOptions)
+      .slice(0, LATER_PREFIX.length), LATER_PREFIX,
+    'the resumed ask states the later share line, not the first-ask one');
   } finally {
     await first.close();
     await second.close();

@@ -44,7 +44,8 @@ export type {
   OpencodeContentPart,
   OpencodeEffortPart, OpencodeGenerateInput, OpencodeGenerateOutput, OpencodeHostEvent,
   OpencodeIdleHookInput,
-  OpencodeMediaPart, OpencodeMessage, OpencodeMessageRole, OpencodePluginContext,
+  OpencodeMediaPart, OpencodeMessage, OpencodeMessageRole, OpencodeModelCatalog,
+  OpencodeModelInfo, OpencodePluginContext,
   OpencodePluginDefinition, OpencodeReasoningPart, OpencodeSessionContext, OpencodeTextPart,
   OpencodeToolCallPart, OpencodeToolContext, OpencodeToolDefinition, OpencodeToolEditor,
   OpencodeStepRequestKind, OpencodeToolResult, OpencodeToolResultPart,
@@ -59,15 +60,16 @@ export type {
 } from './meter.js';
 export {
   OPENCODE_ASK_REFUSED_RETRY, OPENCODE_ASK_RETRY, OPENCODE_ASK_TIMEOUT_MS,
-  OPENCODE_MOUNT_SEAMS, OPENCODE_PLUGIN_NAME,
+  OPENCODE_DUPLICATE_MOUNT_CODE, OPENCODE_MOUNT_SEAMS, OPENCODE_PLUGIN_NAME,
+  OpencodeDuplicateMountError,
   OPENCODE_PRUNE_COMMAND, OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
   createFileJournalSink, createOpencodeMount,
   createOpencodePlugin, mountOptionsFromHost,
 } from './plugin.js';
 export type {
-  OpencodeJournalKind, OpencodeJournalRecord, OpencodeJournalSink, OpencodeMount,
-  OpencodeMountOptions, OpencodeMountPort, OpencodeRequestEstimate, OpencodeSessionEntry,
-  PendingForget,
+  OpencodeJournalKind, OpencodeJournalRecord, OpencodeJournalSink, OpencodeModelRef,
+  OpencodeMount, OpencodeMountOptions, OpencodeMountPort, OpencodeRequestEstimate,
+  OpencodeSessionEntry, PendingForget,
 } from './plugin.js';
 export { OpencodeApplicationPort, createOpencodePort } from './port.js';
 export type {

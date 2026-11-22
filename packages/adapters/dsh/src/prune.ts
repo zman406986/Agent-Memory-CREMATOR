@@ -44,6 +44,7 @@ import { runTables } from './judge-tables.js';
 import type { TableLoopOutcome } from './judge-tables.js';
 import type { MountJournal } from './journal-kinds.js';
 import { messageOf } from './llm-ask.js';
+import { seedRouteStale } from './main-wire.js';
 import type { CapturedMainRequest } from './main-wire.js';
 import type { DshLlmService } from './plugin.js';
 import { journalPruneRecord, recordOnlyOutcome } from './prune-record.js';
@@ -93,6 +94,15 @@ export interface RecordOnlyPruneOptions {
    * Omitted means "the mount settled nothing": every unit stays listable.
    */
   readonly settledNodeIds?: ReadonlySet<string>;
+  /**
+   * Result node ids this mount must never table or remove (ISSUE-414): the tool
+   * results already on the host surface when this session's durable state was
+   * first recorded. They arrived before the mount existed, so it never observed
+   * them land; they are filtered out of the snapshot the pass plans against,
+   * which is the one way a unit can reach the table or a removal. Omitted or
+   * empty means nothing is excluded.
+   */
+  readonly excludedNodeIds?: ReadonlySet<string>;
   /**
    * The bulk ask's answer grammar (ISSUE-221), passed straight from the mount's
    * resolved config. The mount's shipped default is `nokeepall` (ADR-0056); a
@@ -167,7 +177,15 @@ function nodesOf(snapshot: SessionSnapshot): readonly ToolResultNode[] {
 export async function runRecordOnlyPrune(
   options: RecordOnlyPruneOptions,
 ): Promise<RecordOnlyPruneOutcome> {
-  const { sessionId, snapshot, journal } = options;
+  const { sessionId, journal } = options;
+  const excluded = options.excludedNodeIds;
+  // ISSUE-414: a pre-install result was never observed by this mount, so it is
+  // absent from the snapshot the pass plans against — and therefore from the
+  // units, the episodes and the table. Nothing downstream can name it.
+  const snapshot = excluded === undefined || excluded.size === 0
+    ? options.snapshot
+    : { ...options.snapshot,
+        nodes: options.snapshot.nodes.filter(node => !excluded.has(node.id)) };
   const units = new UnitTracker({ sessionId, barBytes: options.barBytes }).units(snapshot);
   const nodes = nodesOf(snapshot);
   const episodes: readonly Episode[] = new EpisodeTracker({
@@ -232,6 +250,17 @@ export async function runRecordOnlyPrune(
       askRows: plan.askRows.length, reason: 'no-seed',
       message: "main's sent request was never captured; no fork can be seeded" });
     const outcome = recordOnlyOutcome(plan, null, 'no-seed', 0);
+    journalPruneRecord(sessionId, outcome, journal);
+    return outcome;
+  }
+  // ISSUE-470: the same route comparison the entry ask applies. A capture
+  // dispatched under another model must not seed a request sent to this one.
+  if (route !== null && seedRouteStale(seeded, route)) {
+    journal('seed-model-stale', { sessionId, round: plan.round,
+      seedProvider: seeded.provider, seedModel: seeded.model,
+      routeProvider: route.provider, routeModel: route.model,
+      action: 'seed-invalidated' });
+    const outcome = recordOnlyOutcome(plan, null, 'seed-model-stale', 0);
     journalPruneRecord(sessionId, outcome, journal);
     return outcome;
   }

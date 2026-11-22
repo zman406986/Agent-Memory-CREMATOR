@@ -259,6 +259,11 @@ export interface OpencodeHostEvent {
  * One transient generation request (`session.generate` in 2.2.5's promise API).
  * It reads the active session context, appends `prompt`, makes one model
  * request and returns the reply text; it mutates no session history.
+ *
+ * 2.2.5 takes no `AbortSignal` here, so the mount cannot cancel the call. The
+ * host-reachable cancellation seam is the event stream instead:
+ * `session.execution.interrupted` with `{sessionID, reason}` (ISSUE-413). The
+ * mount subscribes to it and stops waiting; the call itself is abandoned.
  */
 export interface OpencodeGenerateInput {
   readonly sessionID: string;
@@ -325,6 +330,22 @@ export interface OpencodeIdleHookInput {
   readonly [field: string]: unknown;
 }
 
+/** The model-catalog slice this mount reads (`Model.Info` in 2.2.5). */
+export interface OpencodeModelInfo {
+  readonly limit?: { readonly context?: number };
+  readonly [field: string]: unknown;
+}
+
+/**
+ * 2.2.5's model catalog seam (`Context.model`). The mount reads it only to name
+ * the context window a newly selected model declares (ISSUE-432); it never
+ * overrides a window the operator configured. Optional: a host that lacks it
+ * mounts and still observes a switch.
+ */
+export interface OpencodeModelCatalog {
+  get(providerID: string, modelID: string): OpencodeModelInfo | undefined;
+}
+
 /**
  * The part of the 2.2.5 setup context this adapter uses. Structural, so the
  * real `Context` satisfies it without the adapter importing the host at runtime.
@@ -367,6 +388,11 @@ export interface OpencodePluginContext {
    * so on the journal instead of failing every hook.
    */
   readonly command?: OpencodeCommandDomain;
+  /**
+   * The model catalog 2.2.5 exposes as `Context.model` (ISSUE-432). Optional:
+   * a host that lacks it still mounts, and a switch is named without a window.
+   */
+  readonly model?: OpencodeModelCatalog;
   readonly event: {
     subscribe(options?: { readonly types?: readonly string[] }): AsyncIterable<OpencodeHostEvent>;
   };

@@ -672,10 +672,11 @@ test('a committed append survives death before the flush and replays exactly onc
       return count;
     };
     // The death: the append is committed but NEVER flushed — no publishAppend,
-    // no boundary flush. Closing the mount abandons the in-memory queue.
+    // no boundary flush. A dead process never runs `close()` (and since
+    // ISSUE-416 `close()` is a graceful shutdown that would flush), so this
+    // mount is simply abandoned with its in-memory queue; the durable intent
+    // written at commit is the only thing that survives.
     assert.equal(factCount(), 0, 'the host holds no record before the flush');
-    await created.close();
-    mount = undefined;
     // The resumed process: a fresh mount, the same durable root, the same surface.
     const journal2: { kind: string; [field: string]: unknown }[] = [];
     const resumed = createRacoonsMount({ config: resolvePluginConfig({}),
@@ -741,9 +742,13 @@ test('ISSUE-350: ending or releasing a session evicts its capture and call facts
       assert.ok(mainWire.last(session.id) !== null, `capture held for ${session.id}`);
       assert.equal(factsFor(session, 'c1'), 'read', `call facts held for ${session.id}`);
     }
-    // Two sessions end; the third stays live.
+    // Two sessions end; the third stays live. `close()` is now a graceful
+    // shutdown that flushes and releases every session, so the test settles the
+    // end explicitly (ISSUE-416) and reads the release path's eviction.
     endedA.append('session/end', {});
     endedB.append('session/end', {});
+    await created.endSession(endedA);
+    await created.endSession(endedB);
     assert.equal(mainWire.last(endedA.id), null, 'the ended session leaves no capture');
     assert.equal(mainWire.last(endedB.id), null, 'the second ended session leaves no capture');
     assert.ok(mainWire.last(live.id) !== null, 'the live session keeps its capture');

@@ -105,7 +105,8 @@ const DECLARED = {
   // names every receipt the array renders, so a receipt is not an append
   // record.
   appendRecords: false,
-  // The applied-plan index lives in process; a restart re-applies nothing.
+  // The applied-plan index is seeded from the ledger at open, so a restart
+  // re-applies the banked removals instead of treating them as new (ISSUE-409).
   rehydrateOnResume: false,
 } as const;
 

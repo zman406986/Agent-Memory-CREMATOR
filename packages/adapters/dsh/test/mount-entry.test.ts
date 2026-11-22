@@ -62,6 +62,8 @@ const decoder = new TextDecoder();
 interface FakeSession extends DshMountSession {
   readonly log: DshMountEvent[];
   on(listener: (session: FakeSession, event: DshMountEvent) => void): () => void;
+  /** ISSUE-432: switch the route the next `requestHeader()` reports. */
+  setRoute(next: { readonly provider: string; readonly model: string }): void;
 }
 
 /**
@@ -73,12 +75,16 @@ function fakeSession(id: string): FakeSession {
   const log: DshMountEvent[] = [];
   const surfaceNodes: number[] = [];
   const listeners = new Set<(session: FakeSession, event: DshMountEvent) => void>();
+  let route = { ...ROUTE };
   const session = {
     id,
     get seq() { return log.length; },
     get surface() { return { nodes: surfaceNodes, contentGeneration: log.length }; },
     get log() { return log; },
-    requestHeader: () => ({ config: { provider: ROUTE.provider, model: ROUTE.model } }),
+    requestHeader: () => ({ config: { provider: route.provider, model: route.model } }),
+    setRoute(next: { readonly provider: string; readonly model: string }) {
+      route = { provider: next.provider, model: next.model };
+    },
     eventAt: (seq: number) => log[seq],
     append(type: string, data: unknown, options: Record<string, unknown> = {}) {
       const seq = log.length;
@@ -1783,8 +1789,14 @@ test('a fail-open apply whose exchange is already off the surface writes nothing
     assert.equal(collapsed[0]?.['status'], 'refused', 'the surface no longer holds the pair');
     assert.equal(collapsed[0]?.['code'], 'ask-exchange-missing',
       'the refusal names the missing exchange');
-    assert.equal(h.session.seq, seqAfterTrim,
-      'the mount wrote nothing after the host trim');
+    // ISSUE-404 moved the card close after the apply leg, so the only event
+    // allowed past the host trim is that log-only `command/done`. The surface
+    // itself takes no write: the fail-open collapse must still write nothing.
+    const afterTrim = h.session.log.slice(seqAfterTrim);
+    assert.deepEqual(afterTrim.map(event => event.type), ['command/done'],
+      'the mount wrote only the log-only card close after the host trim');
+    assert.ok(afterTrim.every(event => event.surfaceOp === undefined),
+      'no surface write followed the host trim');
     assert.equal(resultText(h.session, 'c1'), body, 'the landed result stays whole');
   } finally {
     await h.mount.close();
@@ -2018,6 +2030,305 @@ test('resume collapses an orphaned ask exchange and re-delivers the landing (ISS
       assert.equal(resultText(h.session, 'c1'), body, 'the kept result keeps its bytes');
       assert.equal(entryKinds(journal2, 'entry-resume-recovered').length, 1,
         'the recovery is journaled once');
+    } finally {
+      await mount2.close();
+    }
+  } finally {
+    await h.mount.close();
+  }
+});
+
+// --- a partial ask append never leaves an orphan (ISSUE-403) ----------------
+
+test('a host failure on the answer turn collapses the ask already on the surface (ISSUE-403)',
+  async () => {
+    const h = harness({ id: 'session-append-fail-403', entryAskGrammar: '3option',
+      llm: fakeLlm(answerChunks('{"keepall":true}')) });
+    try {
+      wire(h);
+      const body = bodyOf(40);
+      step(h.session, { turn: 1, step: 1, results: [{ callId: 'c1', body }] });
+      // The death this time is INSIDE `appendAskTurns`: the ask turn lands, the
+      // answer turn throws. The prefix must collapse in the same call.
+      const realAppend = h.session.append;
+      let askTurns = 0;
+      h.session.append = (type: string, data: unknown, options: Record<string, unknown> = {}) => {
+        const source = (data as { source?: { kind?: string } }).source;
+        if (type === 'user/message' && source?.kind === 'racoons/negation/entry-ask') {
+          askTurns += 1;
+          if (askTurns === 2) throw new Error('host failed on the answer turn');
+        }
+        return realAppend(type, data, options);
+      };
+      await h.mount.runStep(h.session, { turn: 1, step: 2 });
+      h.session.append = realAppend;
+      assert.equal(askTurns, 2, 'the answer turn was attempted');
+      const askNodes = (h.session.surface?.nodes ?? []).filter(seq => {
+        const event = h.session.eventAt?.(seq);
+        return event?.type === 'user/message'
+          && (event.data as { source?: { kind?: string } }).source?.kind
+            === 'racoons/negation/entry-ask';
+      });
+      assert.equal(askNodes.length, 0, 'the written ask prefix left no orphan on the wire');
+      const failed = entryKinds(h.journal, 'entry-ask-append-failed');
+      assert.equal(failed.length, 1, 'the failure is journaled by name');
+      assert.equal(failed[0]?.['appended'], 1, 'one turn had been written');
+      assert.equal(failed[0]?.['collapse'], 'applied', 'the prefix was rewound');
+      assert.equal(entryKinds(h.journal, 'entry-ask').length, 0,
+        'nothing was recorded as an answered exchange');
+      assert.equal(resultText(h.session, 'c1'), body, 'the result stands whole');
+    } finally {
+      await h.mount.close();
+    }
+  });
+
+test('a host whose answer append writes then throws leaves the exchange owed, and the next '
+  + 'boundary collapses it on the same mount (ISSUE-479)', async () => {
+  const h = harness({ id: 'session-append-wrote-threw', entryAskGrammar: '3option',
+    llm: fakeLlm(answerChunks('{"keepall":true}')) });
+  try {
+    wire(h);
+    const body = bodyOf(40);
+    step(h.session, { turn: 1, step: 1, results: [{ callId: 'c1', body }] });
+    // The death: the answer turn is WRITTEN, then the host throws. The append
+    // returned no event, so the mount never sees that turn.
+    const realAppend = h.session.append;
+    let askTurns = 0;
+    h.session.append = (type: string, data: unknown, options: Record<string, unknown> = {}) => {
+      const source = (data as { source?: { kind?: string } }).source;
+      if (type === 'user/message' && source?.kind === 'racoons/negation/entry-ask') {
+        askTurns += 1;
+        if (askTurns === 2) {
+          realAppend(type, data, options);
+          throw new Error('host failed after writing the answer turn');
+        }
+      }
+      return realAppend(type, data, options);
+    };
+    const askNodes = (): number[] => (h.session.surface?.nodes ?? []).filter(seq => {
+      const event = h.session.eventAt?.(seq);
+      return event?.type === 'user/message'
+        && (event.data as { source?: { kind?: string } }).source?.kind
+          === 'racoons/negation/entry-ask';
+    });
+    await h.mount.runStep(h.session, { turn: 1, step: 2 });
+    h.session.append = realAppend;
+    assert.equal(askTurns, 2, 'the answer append was attempted');
+    const failed = entryKinds(h.journal, 'entry-ask-append-failed');
+    assert.equal(failed.length, 1, 'the failure is journaled by name');
+    assert.equal(failed[0]?.['appended'], 1, 'only the ask turn was returned');
+    assert.equal(failed[0]?.['collapse'], 'applied', 'the returned prefix was rewound');
+    // The unreturned answer turn landed and is still on the surface: the
+    // collapse of `[ask…ask]` cannot prove it left.
+    assert.equal(askNodes().length, 1, 'the orphan answer turn survives the failed boundary');
+    assert.equal(entryKinds(h.journal, 'entry-resume-recovered').length, 0,
+      'the failing boundary claims no recovery');
+    assert.equal(resultText(h.session, 'c1'), body, 'the result stands whole');
+    // The same mount owes the exchange now, so the next boundary's surface scan
+    // collapses the turns that actually landed.
+    await h.mount.runStep(h.session, { turn: 1, step: 3 });
+    assert.equal(askNodes().length, 0, 'the next boundary removed the orphan');
+    const recovered = entryKinds(h.journal, 'entry-resume-recovered');
+    assert.equal(recovered.length, 1, 'the next boundary finished the recovery');
+    assert.equal(recovered[0]?.['collapsed'], 1, 'the orphan answer was one applied collapse');
+  } finally {
+    await h.mount.close();
+  }
+});
+
+test('a host whose FIRST ask append writes then throws still owes the exchange, and the next '
+  + 'boundary collapses the landed turn (ISSUE-479)', async () => {
+  const h = harness({ id: 'session-append-first-threw', entryAskGrammar: '3option',
+    llm: fakeLlm(answerChunks('{"keepall":true}')) });
+  try {
+    wire(h);
+    const body = bodyOf(40);
+    step(h.session, { turn: 1, step: 1, results: [{ callId: 'c1', body }] });
+    // The death: the FIRST ask turn is written, then the host throws. No append
+    // returned an event, so `events` is empty and there is no range to collapse.
+    const realAppend = h.session.append;
+    let askTurns = 0;
+    h.session.append = (type: string, data: unknown, options: Record<string, unknown> = {}) => {
+      const source = (data as { source?: { kind?: string } }).source;
+      if (type === 'user/message' && source?.kind === 'racoons/negation/entry-ask') {
+        askTurns += 1;
+        if (askTurns === 1) {
+          realAppend(type, data, options);
+          throw new Error('host failed after writing the first ask turn');
+        }
+      }
+      return realAppend(type, data, options);
+    };
+    const askNodes = (): number[] => (h.session.surface?.nodes ?? []).filter(seq => {
+      const event = h.session.eventAt?.(seq);
+      return event?.type === 'user/message'
+        && (event.data as { source?: { kind?: string } }).source?.kind
+          === 'racoons/negation/entry-ask';
+    });
+    await h.mount.runStep(h.session, { turn: 1, step: 2 });
+    h.session.append = realAppend;
+    assert.equal(askTurns, 1, 'the first append threw before returning an event');
+    const failed = entryKinds(h.journal, 'entry-ask-append-failed');
+    assert.equal(failed.length, 1, 'the failure is journaled by name');
+    assert.equal(failed[0]?.['appended'], 0, 'no append returned an event');
+    assert.equal(failed[0]?.['collapse'], undefined,
+      'with zero returned events there is no range to collapse at the failure');
+    // The written ask turn is orphaned; the debt must survive even though the
+    // empty event list gives the failure path nothing to rewind.
+    assert.equal(askNodes().length, 1, 'the written ask turn survives the failed boundary');
+    assert.equal(entryKinds(h.journal, 'entry-resume-recovered').length, 0,
+      'the failing boundary claims no recovery');
+    assert.equal(resultText(h.session, 'c1'), body, 'the result stands whole');
+    // The same mount owes the exchange now, so the next boundary's surface scan
+    // collapses the lone `entry-ask` turn that actually landed.
+    await h.mount.runStep(h.session, { turn: 1, step: 3 });
+    assert.equal(askNodes().length, 0, 'the next boundary removed the orphaned ask turn');
+    const recovered = entryKinds(h.journal, 'entry-resume-recovered');
+    assert.equal(recovered.length, 1, 'the next boundary finished the recovery');
+    assert.equal(recovered[0]?.['collapsed'], 1, 'the lone ask turn was one applied collapse');
+  } finally {
+    await h.mount.close();
+  }
+});
+
+test('a mixed batch with one undecided row settles an error card naming the count (ISSUE-480)',
+  async () => {
+    const h = harness({ id: 'session-batch-refused-row', entryAskBatchSize: 2,
+      entryAskGrammar: '3option', llm: fakeLlm(answerChunks('{"1":{"keepall":true}}')) });
+    try {
+      wire(h);
+      const bodies = [bodyOf(40, 'ROW1'), bodyOf(40, 'ROW2')];
+      step(h.session, { turn: 1, step: 1, results: bodies.map((body, index) => ({
+        callId: `c${String(index + 1)}`, body })) });
+      await h.mount.runStep(h.session, { turn: 1, step: 2 });
+      // Row 1 applies; index 2 carries no verdict, so the table reader refuses
+      // it and the row keeps its unit whole.
+      const refused = entryKinds(h.journal, 'entry-ask-refused');
+      assert.equal(refused.length, 1, 'the undecided row is refused by name');
+      assert.equal(refused[0]?.['batchIndex'], 2, 'the second row is the refused one');
+      assert.equal(refused[0]?.['code'], 'missing-index', 'the reader names the omission');
+      assert.equal(entryKinds(h.journal, 'entry-apply').length, 1, 'the answered row still applied');
+      assert.equal(resultText(h.session, 'c2'), bodies[1], 'the refused row keeps its bytes');
+      // The visible card must not read as a completed ask while a paid answer
+      // was lost.
+      const done = h.session.log.filter(event => event.type === 'command/done');
+      assert.equal(done.length, 1, 'exactly one card settled');
+      const data = done[0]?.data as { kind?: string; text?: string } | undefined;
+      assert.equal(data?.kind, 'error', 'a mixed batch is an error card');
+      assert.match(data?.text ?? '', /1 row\(s\) refused/u, 'the text names the refused count');
+    } finally {
+      await h.mount.close();
+    }
+  });
+
+test('a mixed batch whose second row moves between ask and apply settles an error card naming '
+  + 'the refused count (ISSUE-480)', async () => {
+  let h!: Harness;
+  let staleSeq = -1;
+  // The host trims the second row while the model is answering: its bytes move
+  // between the ask's read and the apply's re-read, so the answer names content
+  // that no longer exists.
+  const staleBody = bodyOf(40, 'ROW2-STALE');
+  const answer = answerChunks('{"1":{"keepall":true},"2":{"keepall":true}}');
+  const llm = fakeLlm(() => (async function* emit() {
+    trimResultOnSurface(h.session, staleSeq, { callId: 'c2', body: staleBody,
+      turn: 1, step: 1 });
+    for (const chunk of answer) yield chunk;
+  })());
+  h = harness({ id: 'session-batch-stale-row', entryAskBatchSize: 2,
+    entryAskGrammar: '3option', llm });
+  try {
+    wire(h);
+    const bodies = [bodyOf(40, 'ROW1'), bodyOf(40, 'ROW2')];
+    const seqs = step(h.session, { turn: 1, step: 1, results: bodies.map((body, index) => ({
+      callId: `c${String(index + 1)}`, body })) });
+    staleSeq = seqs[1] as number;
+    await h.mount.runStep(h.session, { turn: 1, step: 2 });
+    // The model answers both rows, but row 2's bytes moved before the apply, so
+    // the apply lane refuses it locally and the row keeps its unit whole.
+    const stale = entryKinds(h.journal, 'entry-apply-refused');
+    assert.equal(stale.length, 1, 'the moved row is refused by the apply lane');
+    assert.equal(stale[0]?.['code'], 'ask-row-stale', 'the refusal names the stale read');
+    assert.equal(stale[0]?.['batchIndex'], 2, 'the second row is the stale one');
+    assert.equal(entryKinds(h.journal, 'entry-apply').length, 1, 'the first row still applied');
+    assert.equal(resultText(h.session, 'c2'), staleBody, 'the stale row keeps its live bytes');
+    // The visible card must not read as a completed ask while a paid answer was
+    // refused for moved bytes.
+    const done = h.session.log.filter(event => event.type === 'command/done');
+    assert.equal(done.length, 1, 'exactly one card settled');
+    const data = done[0]?.data as { kind?: string; text?: string } | undefined;
+    assert.equal(data?.kind, 'error', 'a stale row makes the batch an error card');
+    assert.match(data?.text ?? '', /1 row\(s\) refused/u, 'the text names the refused count');
+  } finally {
+    await h.mount.close();
+  }
+});
+
+test('a refused recovery collapse keeps resume recovery owing, and the retry still lands '
+  + '(ISSUE-403)', async () => {
+  const ledger = new SharedLedger();
+  const h = harness({ id: 'session-refused-recovery-403', ledger, entryAskGrammar: '3option',
+    llm: fakeLlm(answerChunks('{"keepall":true}')) });
+  try {
+    wire(h);
+    const body = bodyOf(40);
+    step(h.session, { turn: 1, step: 1, results: [{ callId: 'c1', body }] });
+    // The death: every host REPLACE throws, so the ask pair stays orphaned.
+    const realAppend = h.session.append;
+    h.session.append = (type: string, data: unknown, options: Record<string, unknown> = {}) => {
+      if (typeof options['surfaceOp'] === 'object' && options['surfaceOp'] !== null) {
+        throw new Error('host died before the apply landed');
+      }
+      return realAppend(type, data, options);
+    };
+    await h.mount.runStep(h.session, { turn: 1, step: 2 });
+    h.session.append = realAppend;
+    const asks = (): number[] => (h.session.surface?.nodes ?? []).filter(seq => {
+      const event = h.session.eventAt?.(seq);
+      return event?.type === 'user/message'
+        && (event.data as { source?: { kind?: string } }).source?.kind === 'racoons/negation/entry-ask';
+    });
+    assert.equal(asks().length, 2, 'the death left the pair orphaned');
+    const answerSeq = asks()[1] as number;
+    // Cold recovery reads the answer once as an ask turn, then the port's
+    // surface derivation reads it again. Make that second read disagree, so the
+    // rewind refuses `ask-exchange-missing` instead of writing.
+    const realEventAt = h.session.eventAt as (seq: number) => DshMountEvent | undefined;
+    let answerReads = 0;
+    h.session.eventAt = (seq: number) => {
+      const event = realEventAt(seq);
+      if (seq !== answerSeq || event === undefined) return event;
+      answerReads += 1;
+      return answerReads <= 1 ? event : Object.freeze({ ...event, type: 'tool/result',
+        data: { message: { source: { callId: 'ghost' } } } }) as DshMountEvent;
+    };
+    const journal2: JournalLine[] = [];
+    const mount2 = createRacoonsMount({
+      config: resolvePluginConfig({ floorBytes: 512, barBytes: 8192,
+        entryAskTrigger: { mode: 'off' } }),
+      storage: resolveStorage(undefined), journal: record => journal2.push(record),
+      llm: fakeLlm(answerChunks('{"keepall":true}')) as never, judgeRoute: ROUTE,
+      openLedger: async () => ledger,
+    });
+    try {
+      await mount2.runStep(h.session, { turn: 1, step: 3 });
+      // The flip was only for the recovery's surface derivation; restore the
+      // host before the assertion reads the surface again.
+      h.session.eventAt = realEventAt;
+      assert.equal(asks().length, 2, 'a refused rewind leaves the pair in place');
+      const collapsed = entryKinds(journal2, 'entry-ask-collapsed');
+      assert.equal(collapsed[0]?.['status'], 'refused', 'the host refused the rewind');
+      const retry = entryKinds(journal2, 'entry-recovery-retry');
+      assert.equal(retry.length, 1, 'the retry is named, not silently dropped');
+      assert.equal(retry[0]?.['step'], 'collapse');
+      assert.equal(retry[0]?.['reason'], 'collapse-refused');
+      assert.equal(entryKinds(journal2, 'entry-resume-recovered').length, 0,
+        'a refused collapse is not counted as recovered');
+      // The next boundary retries with the healthy host and finishes the recovery.
+      await mount2.runStep(h.session, { turn: 1, step: 4 });
+      assert.equal(asks().length, 0, 'the retry removed the orphan');
+      assert.equal(entryKinds(journal2, 'entry-resume-recovered').length, 1,
+        'the recovery finished once the host cooperated');
     } finally {
       await mount2.close();
     }
@@ -2346,3 +2657,89 @@ test('a keep-all on the middle row of a three-row batch applies rewound, not fai
     await h.mount.close();
   }
 });
+
+// --- ISSUE-432: model-derived parameters follow the live host route ----------
+
+test('ISSUE-469: a smaller-floor model switch lets an answered removal apply', async () => {
+  const session = fakeSession('session-engine-floor');
+  const journal: JournalLine[] = [];
+  const llm = fakeLlm(answerChunks('{"forgetall":"an old listing"}'));
+  const mount = createRacoonsMount({
+    // No explicit floor and no fixed route: the host header is the only route
+    // source, so the opening floor is the 1280-byte model.
+    config: resolvePluginConfig({ barBytes: 8192, entryAskTrigger: { mode: 'count' },
+      entryAskGrammar: '3option' }),
+    storage: resolveStorage(undefined),
+    journal: record => journal.push(record),
+    llm: llm as never,
+  });
+  session.on((live, event) => { mount.observe(live, event); });
+  try {
+    session.setRoute({ provider: 'p', model: 'deepseek-v4.1-flash-1017' });
+    mount.observeWire({ sessionId: session.id, provider: 'p',
+      model: 'deepseek-v4.1-flash-1017', ...MAIN_WIRE });
+    step(session, { turn: 1, step: 1, results: [] });
+    await mount.runStep(session, { turn: 1, step: 1 });
+    assert.equal(llm.calls.length, 0, 'the 1280-byte opening floor asks nothing yet');
+
+    session.setRoute({ provider: 'p', model: 'gpt-6-astra' });
+    mount.observeWire({ sessionId: session.id, provider: 'p', model: 'gpt-6-astra',
+      ...MAIN_WIRE });
+    // ~620 bytes: below the old 1280 floor, above the new 256-byte floor.
+    step(session, { turn: 2, step: 1, results: [{ callId: 'c-small', body: bodyOf(20) }] });
+    await mount.runStep(session, { turn: 2, step: 1 });
+
+    assert.equal(llm.calls.length, 1, 'the refreshed floor made the result askable');
+    const refresh = entryKinds(journal, 'model-refresh');
+    assert.equal(refresh.length, 1, 'the switch is named once');
+    assert.deepEqual(refresh[0]?.['to'],
+      { provider: 'p', model: 'gpt-6-astra', floorBytes: 256 }, 'the entry floor follows');
+    const applied = entryKinds(journal, 'entry-apply');
+    assert.deepEqual(applied.map(line => line['status']), ['landed'],
+      'the engine guard enforced the same floor as the ask gate');
+    assert.equal(journal.some(line => line['code'] === 'unknown-unit'), false,
+      'no paid answer is refused against a stale floor');
+  } finally {
+    await mount.close();
+  }
+});
+
+test('ISSUE-432: a mid-session model switch re-derives the entry floor', async () => {
+  const session = fakeSession('session-model-switch');
+  const journal: JournalLine[] = [];
+  const mount = createRacoonsMount({
+    // No explicit `floorBytes` and no fixed `judgeRoute`: the host header is
+    // the only route source, exactly the shape that can switch mid-session.
+    config: resolvePluginConfig({ barBytes: 8192, entryAskTrigger: { mode: 'off' } }),
+    storage: resolveStorage(undefined),
+    journal: record => journal.push(record),
+    llm: fakeLlm(answerChunks('{}')) as never,
+  });
+  session.on((live, event) => { mount.observe(live, event); });
+  try {
+    step(session, { turn: 1, step: 1, results: [{ callId: 'call_floor_a', body: bodyOf(1) }] });
+    await mount.runStep(session, { turn: 1, step: 1 });
+    assert.equal(journal.filter(line => line.kind === 'model-refresh').length, 0,
+      'the opening route is stamped, not reported as a change');
+
+    session.setRoute({ provider: 'p', model: 'deepseek-v4-pro' });
+    step(session, { turn: 2, step: 1, results: [{ callId: 'call_floor_b', body: bodyOf(1) }] });
+    await mount.runStep(session, { turn: 2, step: 1 });
+
+    const refresh = journal.filter(line => line.kind === 'model-refresh');
+    assert.equal(refresh.length, 1, 'the switch is named once');
+    assert.deepEqual(refresh[0]?.['from'],
+      { provider: 'p', model: 'm', floorBytes: 512 }, 'the old route and floor are named');
+    assert.deepEqual(refresh[0]?.['to'],
+      { provider: 'p', model: 'deepseek-v4-pro', floorBytes: 768 },
+    'the new route and its table floor are named');
+    assert.equal(refresh[0]?.['window'], 'mount-option',
+      'the window is named as model-independent instead of claimed refreshed');
+    const entry = mount.sessions.get(session.id);
+    assert.equal(entry?.floorBytes, 768, 'the entry now reads the new model floor');
+    assert.equal(entry?.floorModel, 'deepseek-v4-pro');
+  } finally {
+    await mount.close();
+  }
+});
+

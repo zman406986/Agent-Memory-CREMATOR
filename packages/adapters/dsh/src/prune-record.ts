@@ -17,7 +17,8 @@ import type { MountJournal } from './journal-kinds.js';
 
 /** Why a pass moved no judged answer; journaled by name, never thrown. */
 export type PruneRefusalReason =
-  | 'no-llm-service' | 'not-configured' | 'internal-error' | 'no-seed' | 'seed-refused';
+  | 'no-llm-service' | 'not-configured' | 'internal-error' | 'no-seed' | 'seed-refused'
+  | 'seed-model-stale';
 
 /**
  * The command form's text (ISSUE-022 §What we want, entry point 2). The mount

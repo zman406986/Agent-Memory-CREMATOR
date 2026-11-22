@@ -273,9 +273,16 @@ const STREAM_CODE: Readonly<Record<StreamFailureReason, EntryAskRefusalCode>> = 
   'no-text': 'empty-text',
 });
 
-/** True when the route names a provider and a model; a blank pair is not armed. */
+/**
+ * True when the route names a provider and a model; a blank pair is not armed.
+ * The runtime type check keeps an unvalidated caller's malformed route from
+ * throwing out of `askEntryBatch`: a non-string field reads as "not armed",
+ * exactly as a blank pair does (ISSUE-427).
+ */
 function armed(route: EntryAskRoute | null): route is EntryAskRoute {
-  return route !== null && route.provider.trim() !== '' && route.model.trim() !== '';
+  return route !== null
+    && typeof route.provider === 'string' && typeof route.model === 'string'
+    && route.provider.trim() !== '' && route.model.trim() !== '';
 }
 
 /**

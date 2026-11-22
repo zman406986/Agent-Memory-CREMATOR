@@ -5,7 +5,7 @@ import type {
 } from '@cremator/core';
 import { createDshCapabilities } from './capabilities.js';
 import type { DshToolResultItem } from './envelope.js';
-import { decideForget, forgetAnswer, forgetUnavailable } from './forget-tool.js';
+import { decideForget, forgetAnswer, forgetNotDurable, forgetUnavailable } from './forget-tool.js';
 import type { DshForgetDecision, DshForgetValue } from './forget-tool.js';
 import type { DshAskExchange, DshEntryApplyOutcome, DshEntryRefusal } from './port.js';
 import type { DshRevertSession } from './revert.js';
@@ -172,7 +172,13 @@ export function createDshAdapter(options: DshAdapterOptions): DshAdapter {
       const decision = decideForget({
         snapshot, sessionId: snapshot.sessionId, request,
       });
-      if (decision.status === 'scheduled') queue(decision);
+      if (decision.status === 'scheduled') {
+        // ISSUE-417: the queue makes the request durable before this tool
+        // answers "scheduled". A queue that cannot write throws, and the tool
+        // refuses by name instead of accepting a removal an unload would lose.
+        try { queue(decision); }
+        catch { return forgetAnswer(forgetNotDurable()); }
+      }
       return forgetAnswer(decision);
     };
   /**

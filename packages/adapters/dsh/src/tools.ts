@@ -56,10 +56,15 @@ export const DSH_TOOL_SPECS: readonly ToolSpec[] = Object.freeze([
     } },
 ]);
 
-/** One tool as the host receives it: the spec plus the function behind it. */
+/**
+ * One tool as the host receives it: the spec plus the function behind it. The
+ * host's call context (its session identity, ISSUE-415) rides the optional
+ * second argument and is passed through untouched; a host that supplies none
+ * leaves the resolver to its own single-session fallback.
+ */
 export interface DshToolRegistration {
   readonly spec: ToolSpec;
-  execute(args: unknown): Promise<DshRecallOutput | DshForgetValue>;
+  execute(args: unknown, context?: unknown): Promise<DshRecallOutput | DshForgetValue>;
 }
 
 /** The host's additive registration seam: `ctx.tools.register` returns an unregister. */
@@ -75,8 +80,8 @@ export interface DshToolHost {
  * revert can be built (`forget-tool.ts` states the probe that proved it).
  */
 export interface DshToolSources {
-  readonly recall: (id: RecallId) => Promise<RecallRecord>;
-  readonly forget?: (request: ForgetRequest) => Promise<DshForgetValue>;
+  readonly recall: (id: RecallId, context?: unknown) => Promise<RecallRecord>;
+  readonly forget?: (request: ForgetRequest, context?: unknown) => Promise<DshForgetValue>;
 }
 
 export interface DshRecallPart {
@@ -153,11 +158,12 @@ export function createDshTools(sources: DshToolSources): readonly DshToolRegistr
   }
   return [
     ...(forget === undefined || forgetSpec === undefined ? [] : [{ spec: forgetSpec,
-      execute: async (args: unknown): Promise<DshForgetValue> => forget(readForgetArgs(args)) }]),
+      execute: async (args: unknown, context?: unknown): Promise<DshForgetValue> =>
+        forget(readForgetArgs(args), context) }]),
     { spec: recallSpec,
-      execute: async args => {
+      execute: async (args, context) => {
         const id = recallIdArg(args);
-        return recallText(await sources.recall(id), id);
+        return recallText(await sources.recall(id, context), id);
       } },
   ];
 }

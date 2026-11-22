@@ -20,6 +20,10 @@ const CARD_NAME = 'Cremating memory trash';
 
 interface FakeSession extends DshMountSession {
   readonly log: DshMountEvent[];
+  /** Throw once on the next `seq` getter read, then forget: a failed apply. */
+  throwSeqOnce: boolean;
+  /** Throw on every `surface` read once armed: a torn-down host session. */
+  throwSurface: boolean;
   on(listener: (session: FakeSession, event: DshMountEvent) => void): () => void;
 }
 
@@ -30,8 +34,19 @@ function fakeSession(id: string): FakeSession {
   const listeners = new Set<(session: FakeSession, event: DshMountEvent) => void>();
   const session: FakeSession = {
     id,
-    get seq() { return log.length; },
-    get surface() { return { nodes: surfaceNodes, contentGeneration: log.length }; },
+    throwSeqOnce: false,
+    throwSurface: false,
+    get seq() {
+      if (session.throwSeqOnce) {
+        session.throwSeqOnce = false;
+        throw new Error('seq read failed');
+      }
+      return log.length;
+    },
+    get surface() {
+      if (session.throwSurface) throw new Error('surface read failed');
+      return { nodes: surfaceNodes, contentGeneration: log.length };
+    },
     get log() { return log; },
     eventAt: (seq: number) => log[seq],
     append(type: string, data: unknown, options: Record<string, unknown> = {}) {
@@ -230,6 +245,126 @@ test('the entry card closes on the refusal and provider-error paths too', async 
     } finally {
       await mount.close();
     }
+  }
+});
+
+test('ISSUE-404: an entry ask whose route is off posts no success card', async () => {
+  const session = fakeSession('session-card-entry-off');
+  const journal: { readonly kind: string; readonly [field: string]: unknown }[] = [];
+  const llm = fakeLlm(answerChunks('{"keepall":true}'));
+  const mount = createRacoonsMount({
+    config: resolvePluginConfig({ floorBytes: 512, barBytes: 8192,
+      entryAskTrigger: { mode: 'count' }, entryAskGrammar: '3option' }),
+    storage: resolveStorage(undefined), journal: record => journal.push(record),
+    llm: llm as never, judgeRoute: { provider: '', model: '' },
+  });
+  try {
+    session.on((live, event) => { mount.observe(live, event); });
+    mount.observeWire({ sessionId: session.id, provider: 'p', model: 'm', ...MAIN_WIRE,
+      messages: [...MAIN_WIRE.messages,
+        { role: 'tool', content: [{ type: 'text', text: BODY }] }] });
+    landResult(session, BODY);
+    await mount.runStep(session, { turn: 1, step: 2 });
+    assert.equal(llm.calls.length, 0, 'no ask was sent');
+    assert.equal(session.log.filter(event => event.type === 'command/run').length, 0,
+      'no card implies an ask');
+    const off = journal.filter(line => line.kind === 'entry-ask-off');
+    assert.ok(off.length >= 1 && off.every(line => line['reason'] === 'not-configured'),
+      'each eligible result names the absent route');
+  } finally {
+    await mount.close();
+  }
+});
+
+test('ISSUE-404: a prune pass with zero ask rows says no ask was sent', async () => {
+  const session = fakeSession('session-card-prune-empty');
+  const llm = fakeLlm(answerChunks('{"1":{"forgetall":"an old copy"}}'));
+  const mount = createRacoonsMount({
+    // The bar sits above the fixture body, so the plan has no eligible unit.
+    config: resolvePluginConfig({ barBytes: 1 << 20, capBytes: 1 << 20,
+      episodeNoNewPathSteps: null }),
+    storage: resolveStorage(undefined), journal: () => {},
+    llm: llm as never, judgeRoute: ROUTE,
+  });
+  try {
+    landResult(session, BODY);
+    mount.observeWire({ sessionId: session.id, provider: ROUTE.provider,
+      model: ROUTE.model, ...MAIN_WIRE,
+      messages: [...MAIN_WIRE.messages,
+        { role: 'tool', content: [{ type: 'text', text: BODY }] }] });
+    for (const event of session.log) mount.observe(session, event);
+    const outcome = await mount.runPrune(session);
+    assert.equal(outcome?.plan.askRows.length, 0, 'the pass had nothing to ask');
+    assert.equal(llm.calls.length, 0, 'no model call was made');
+    const pair = cardPair(session);
+    const done = pair.done.data as { kind: string; text: string };
+    assert.equal(done.kind, 'success', 'the pass did run');
+    assert.match(done.text, /no ask was sent/u, 'the text names the truth');
+  } finally {
+    await mount.close();
+  }
+});
+
+test('ISSUE-404: an answered ask whose apply fails settles an error card', async () => {
+  const session = fakeSession('session-card-apply-fail');
+  const journal: { readonly kind: string; readonly [field: string]: unknown }[] = [];
+  const llm = fakeLlm(answerChunks('{"keepall":true}'),
+    () => { session.throwSeqOnce = true; });
+  const mount = createRacoonsMount({
+    config: resolvePluginConfig({ floorBytes: 512, barBytes: 8192,
+      entryAskTrigger: { mode: 'count' }, entryAskGrammar: '3option' }),
+    storage: resolveStorage(undefined), journal: record => journal.push(record),
+    llm: llm as never, judgeRoute: ROUTE,
+  });
+  try {
+    session.on((live, event) => { mount.observe(live, event); });
+    mount.observeWire({ sessionId: session.id, provider: ROUTE.provider,
+      model: ROUTE.model, ...MAIN_WIRE,
+      messages: [...MAIN_WIRE.messages,
+        { role: 'tool', content: [{ type: 'text', text: BODY }] }] });
+    landResult(session, BODY);
+    await mount.runStep(session, { turn: 1, step: 2 });
+    assert.equal(llm.calls.length, 1, 'the ask was sent');
+    const refused = journal.filter(line => line.kind === 'entry-apply-refused');
+    assert.equal(refused[0]?.['code'], 'apply-threw', 'the failed apply is named');
+    const pair = cardPair(session);
+    const done = pair.done.data as { kind: string; text: string };
+    assert.equal(done.kind, 'error', 'the card does not read success');
+    assert.match(done.text, /failed to apply/u, 'the text names the failed leg');
+  } finally {
+    await mount.close();
+  }
+});
+
+test('ISSUE-461: a surface throw after the ask still closes one error card', async () => {
+  const session = fakeSession('session-card-throw');
+  const llm = fakeLlm(answerChunks('{"forgetall":"an old copy"}'),
+    () => { session.throwSurface = true; });
+  const mount = createRacoonsMount({
+    config: resolvePluginConfig({ floorBytes: 512, barBytes: 8192,
+      entryAskTrigger: { mode: 'count' }, entryAskGrammar: '3option' }),
+    storage: resolveStorage(undefined), journal: () => {},
+    llm: llm as never, judgeRoute: ROUTE,
+  });
+  try {
+    session.on((live, event) => { mount.observe(live, event); });
+    mount.observeWire({ sessionId: session.id, provider: ROUTE.provider,
+      model: ROUTE.model, ...MAIN_WIRE,
+      messages: [...MAIN_WIRE.messages,
+        { role: 'tool', content: [{ type: 'text', text: BODY }] }] });
+    landResult(session, BODY);
+    // The host's surface read throws after the answer; the throw may escape the
+    // step, but the card is settled before it does.
+    try { await mount.runStep(session, { turn: 1, step: 2 }); } catch { /* the host throw */ }
+    const pair = cardPair(session);
+    const done = pair.done.data as { kind: string; text: string };
+    assert.equal(done.kind, 'error', 'a thrown pass is an error card, never a success');
+    assert.match(done.text, /surface read failed/u, 'the text names the failure');
+    session.throwSurface = false;
+    assertLogOnly(session, pair);
+  } finally {
+    session.throwSurface = false;
+    await mount.close();
   }
 });
 

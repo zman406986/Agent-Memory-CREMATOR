@@ -82,8 +82,8 @@ export { captureMainRequest, createMainWireCapture } from './main-wire.js';
 export type { CapturedMainRequest, MainWireCapture } from './main-wire.js';
 // The host route both surviving asks read (ADR-0028: the entry checkpoint and
 // the bulk prune). The seam file it used to live in is gone with the judge.
-export { judgeRouteOf } from './route.js';
-export type { JudgeRoute } from './route.js';
+export { JudgeRouteError, judgeRouteOf, normalizeJudgeRoute } from './route.js';
+export type { JudgeRoute, JudgeRouteField } from './route.js';
 export type { MountJournal } from './journal-kinds.js';
 export { PRUNE_COMMAND, callFactsOf, runRecordOnlyPrune } from './prune.js';
 export type {

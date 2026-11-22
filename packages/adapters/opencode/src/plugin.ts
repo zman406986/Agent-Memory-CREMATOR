@@ -31,7 +31,8 @@
  *     cannot be cancelled, so they keep their claim and no retry); a refused row
  *     is carried to one later table, and a terminal refusal spends no re-ask.
  *     Fires follow the depth trigger with no per-session cap (ADR-0060). The
- *     asked set lives in memory: a plugin reload loses it.
+ *     asked set (the revision and unit claims) and an unapplied verdict are
+ *     durable; a plugin reload restores them (ISSUE-409; ADR-0063).
  *   - `context.command.transform` (when the host exposes it) → the manual
  *     `/cremate` command. It runs the same table pass on demand, not gated by
  *     the depth latch; the same-revision guard still applies, and the pass
@@ -101,10 +102,10 @@ import {
   resolveContextWindowTokens, resolvePruneThresholdTokens,
 } from '@cremator/core';
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, parse, resolve } from 'node:path';
 import type {
-  ApplicationPort, CapabilityFlags, Clock, DedupeClasses, ForgetRequest, Ledger,
+  ApplicationPort, ApplyReceipt, CapabilityFlags, Clock, DedupeClasses, ForgetRequest, Ledger,
   MeterReading, NodeId, PruneAnswerRow, PruneAskRow, PrunePassApplication, PrunePassPlan,
   PruneRemoval, RequestPrefix, SessionSnapshot, ToolResultNode, UnitId, WireAnswer,
 } from '@cremator/core';
@@ -136,9 +137,13 @@ import { createOpencodePort, opencodeAppliedPlansFromLedger } from './port.js';
 import type {
   OpencodeApplyRefusal, OpencodeCommitKind, OpencodePortOptions, OpencodePortSnapshotOptions,
 } from './port.js';
+import {
+  readDurableAskState, readDurableReceipts, writeDurableReceipt, writeDurableAskState,
+} from './mount-state.js';
+import type { DurableAskState, DurableAskVerdict } from './mount-state.js';
 import { OPENCODE_RECORD_PREFIX, opencodeToolNodeId } from './snapshot.js';
 import { OpencodeStorageError, openLedger, resolveStorage, sessionStorage } from './storage.js';
-import type { OpencodeStorageOptions, StorageTarget } from './storage.js';
+import type { OpencodeStorageOptions, StorageSelection, StorageTarget } from './storage.js';
 import {
   OPENCODE_RECALL_TOOL_NAME, createOpencodeForgetTool, createOpencodeTool,
 } from './tools.js';
@@ -189,10 +194,20 @@ export const OPENCODE_ASK_REFUSED_RETRY =
  * deadline and journals a timeout as an ask error, never a fire. The
  * underlying request may still complete in the host; the lane does not wait
  * for it and does not count it. The timeout is terminal for the ask's units:
- * they stay claimed and are never generated again for that unit, so a second
- * request cannot run beside the abandoned one.
+ * they stay claimed and are never generated again for that unit. A later
+ * request for a different array still runs beside the abandoned call; only a
+ * generate for those claimed units is refused (ISSUE-410).
  */
 export const OPENCODE_ASK_TIMEOUT_MS = 120_000;
+
+/**
+ * The largest delay a platform timer accepts (`2^31-1` ms). A larger delay is
+ * clamped to 1 ms by `setTimeout`, which would turn a long deadline into an
+ * immediate abort (ISSUE-425). This is the platform's range, not a cap this
+ * mount invents (standing rule 7 / ADR-0060); a value beyond it is refused by
+ * name at mount.
+ */
+export const MAX_PLATFORM_TIMER_MS = 2_147_483_647;
 
 /** The seams this build wires. A host that lacks one fails to mount, loudly. */
 export const OPENCODE_MOUNT_SEAMS: readonly string[] = Object.freeze([
@@ -223,8 +238,15 @@ export type OpencodeJournalKind =
   | 'event-error'
   | 'session-evicted'
   | 'idle-hook-error'
+  // ISSUE-411: the awaited `experimental.idle` hook registered, so a journal
+  // can tell "registered but never called" from "never registered".
+  | 'idle-hook'
   | 'prune-threshold'
   | 'prune-plan'
+  // ISSUE-431: a depth crossing held no tableable unit, so no ask was sent and
+  // none was suppressed — a named outcome distinct from a fire and from a
+  // build failure.
+  | 'prune-outcome'
   | 'command-error'
   | 'cremate'
   | 'forget-scheduled'
@@ -237,7 +259,52 @@ export type OpencodeJournalKind =
   | 'ask-cancel'
   | 'commit'
   | 'transform'
-  | 'transform-error';
+  | 'transform-error'
+  // ISSUE-421: a context hook carrying a timed-out ask's own prompt was
+  // skipped whole — the main array was not overwritten and no pass or ask ran.
+  | 'ask-abandoned'
+  // ISSUE-425: the mount closed while an ask was waiting with its deadline
+  // off; the lane stopped waiting, settled unanswered, and named the outcome.
+  | 'ask-close'
+  // ISSUE-447: the ask lane read the durable ledger before paying the host and
+  // refused the send by name (ledger-unavailable / recovery-pending /
+  // breaker-open) because the apply could not use a table.
+  | 'ask-standdown'
+  // ISSUE-419: the durable ledger file decided fresh install vs restart, and
+  // the pre-install nodes were captured for exclusion by the later passes.
+  | 'install'
+  // ISSUE-422: a `session.compaction.*` event arrived while an ask or its
+  // deferred apply was running, so the depth latch's re-arm was deferred to the
+  // end of that window instead of re-arming mid-flight (ADR-0050's backstop).
+  | 'compaction-deferred'
+  // ISSUE-423: stored `forgetall` verdicts were dropped by name because a host
+  // compaction landed between the ask that read them and the apply that would
+  // have recorded their receipts; no receipt is written for the pre-ask array.
+  | 'compaction-stale'
+  // ISSUE-448: durable receipts came back from the mount's own state on open,
+  // so a prepared ledger row the previous process landed can be resolved instead
+  // of standing the session down in recovery-pending.
+  | 'receipts-resumed'
+  // ISSUE-448 / ADR-0064: a prepared row with no provable receipt after seeding
+  // was closed once with a named abandoned outcome, so it cannot block every
+  // later pass.
+  | 'intent-abandoned'
+  // ISSUE-409: the ask identity a previous process claimed or answered came
+  // back from the mount's durable state, so a claimed unit is not re-asked and
+  // an unapplied verdict is not lost.
+  | 'ask-state-resumed'
+  // ISSUE-409: restored ask state was dropped by name (the ask lane is off, or
+  // every row was unreadable) instead of lingering as an invisible obligation.
+  | 'ask-state-dropped'
+  // ISSUE-448 / ISSUE-409: a durable state write failed. The mount keeps its
+  // in-memory state and names the failure; no write is read as success
+  // (ADR-0065).
+  | 'mount-state-error'
+  // ISSUE-432: a context hook named a provider/model different from the one the
+  // session's window and bar were derived from. Nothing is re-derived (the
+  // operator's window is authoritative); the line stamps each stale value with
+  // the model it came from, so a mid-session switch is detectable.
+  | 'model-change';
 
 export interface OpencodeJournalRecord {
   readonly kind: OpencodeJournalKind;
@@ -337,6 +404,57 @@ export async function appliedRewritesAt(
   return rewrites;
 }
 
+/**
+ * Whether this session's ledger holds any event at all (ISSUE-422). Read once at
+ * session open, stopping at the first row: a ledger whose file exists but whose
+ * events all belong to another session id is a parent's copied state, and the
+ * mount names that instead of treating it as a restart. A ledger read that
+ * throws counts as `true` (the pre-422 restart behaviour): the safe answer for
+ * an unreadable file is not to exclude a live session's own history.
+ */
+async function ledgerHasAnyEvent(ledger: Ledger, sessionId: string): Promise<boolean> {
+  try {
+    for await (const _ of ledger.events(sessionId)) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export type OpencodeAskStanddownReason =
+  'ledger-unavailable' | 'recovery-pending' | 'breaker-open';
+
+/**
+ * The durable-health gate the prune apply would apply anyway (ISSUE-447), read
+ * before the host is paid. Core answers `recovery-pending` before planning when
+ * a prepared intent has no applied/abandoned row, and refuses a disabled
+ * breaker; paying for an ask whose table the apply cannot accept repeats on
+ * every new revision. `null` means the lane may ask. A read failure is the
+ * `ledger-unavailable` standdown, never a throw: the lane does nothing now and
+ * a later crossing reads again (fail-open).
+ */
+export async function opencodeAskStanddown(
+  ledger: Ledger, sessionId: string,
+): Promise<OpencodeAskStanddownReason | null> {
+  try {
+    let disabled = false;
+    const prepared = new Set<string>();
+    const finished = new Set<string>();
+    for await (const { event } of ledger.events(sessionId)) {
+      if (event.kind === 'validation') disabled = event.breaker.disabled;
+      else if (event.kind === 'prepared') prepared.add(event.intentId);
+      else if (event.kind === 'abandoned') finished.add(event.intentId);
+      else if (event.kind === 'applied') finished.add(event.receipt.intentId);
+    }
+    for (const intentId of prepared) {
+      if (!finished.has(intentId)) return 'recovery-pending';
+    }
+    return disabled ? 'breaker-open' : null;
+  } catch {
+    return 'ledger-unavailable';
+  }
+}
+
 /** One measured request: the revision it described and the estimate it cost. */
 export interface OpencodeRequestEstimate {
   readonly revision: string;
@@ -349,8 +467,8 @@ export interface OpencodeRequestEstimate {
  * `verdict.answeredInRound`. A `keepall` is a keep, never a stored verdict, and
  * a `keeplines`/`forgetlines` reply is a terminal `action-not-in-grammar`
  * refusal that keeps the unit and is never re-asked (ADR-0053 §Amendment
- * 2026-11-19). The map lives in the session entry and nowhere else; a plugin
- * reload loses it, like every asked mark.
+ * 2026-11-19). The map is written to durable state and restored at open; a
+ * plugin reload keeps the unapplied verdicts (ISSUE-409; ADR-0063).
  */
 export type OpencodeAskVerdicts = Map<UnitId, WireAnswer>;
 
@@ -372,6 +490,15 @@ export interface OpencodeSessionEntry {
   readonly meter: Meter;
   /** The session's depth latch (ADR-0050); disabled when no bar/window is set. */
   readonly pruneTrigger: PruneWindowTrigger;
+  /**
+   * The provider/model the window and bar above were derived from (ISSUE-432).
+   * Null until a context hook names one. A later hook naming a different model
+   * journals `model-change`, so a value that did not follow the switch is
+   * detectable instead of silent.
+   */
+  parametersDerivedFrom: OpencodeModelRef | null;
+  /** The model the last context hook named; one `model-change` files per switch. */
+  observedModel: OpencodeModelRef | null;
   /**
    * The superseded-read dedupe classes this mount runs (ADR-0037). Absent
    * classes are off; the shipped default is every class off, exactly dsh's.
@@ -432,6 +559,20 @@ export interface OpencodeSessionEntry {
    */
   readonly askVerdicts: OpencodeAskVerdicts;
   /**
+   * The verdicts the durable record still owes an apply (ISSUE-409; ADR-0063).
+   * Kept apart from `askVerdicts`: an applied verdict stays in that map so a
+   * host rebuild re-applies the banked removal, while the durable record is
+   * cleared once the apply landed and the ledger's applied row owns it. Only
+   * this map is serialized.
+   */
+  readonly durableAskVerdicts: Map<UnitId, DurableAskVerdict>;
+  /**
+   * Publish the current ask identity to the mount's durable state. A no-op for
+   * a `':memory:'` session. Called before a paid ask leaves, after a verdict is
+   * stored, and after an apply or drop settles one (ISSUE-409).
+   */
+  readonly persistAskState: () => void;
+  /**
    * Node ids an already-sent request has carried: the ask table and the stored
    * verdicts read this set, so a result that first appears in the step being
    * transformed is tabled on the next request, never the one that produced it
@@ -446,6 +587,21 @@ export interface OpencodeSessionEntry {
    * the eligibility of the previous request.
    */
   pendingSeenNodeIds: Set<NodeId>;
+  /**
+   * The install boundary (ISSUE-419): the node ids present in this mount's
+   * first transform of a fresh durable install. Such nodes were produced before
+   * the plugin mounted, so they are never ask-eligible and never removal-eligible
+   * in the ask/L1/dedupe lanes. Null when this mount has no boundary — a restart
+   * on existing durable state, or a test-only `':memory:'` ledger, both keep
+   * today's behavior.
+   */
+  preInstallNodes: Set<NodeId> | null;
+  /**
+   * True until the first transform captured the fresh install's pre-install
+   * surface. A fresh install's first transform is the earliest observation of
+   * the host's history, so it is the boundary.
+   */
+  installBoundaryPending: boolean;
   /**
    * True when the last `context` hook's step ask left one readable reply. The
    * step ask is primary; the idle ask is a fallback only while this is false, so
@@ -464,10 +620,36 @@ export interface OpencodeSessionEntry {
    * still end a step: while one lives AND this session has seen an ask step
    * row (`askStepRowsSeen`), an unstated step row is the ask lane's, never a
    * main turn's — the same classification the in-flight lock makes. Each
-   * abandoned call decrements this when it truly settles. A count of live
-   * abandoned calls, never a ceiling (ADR-0060).
+   * abandoned call releases this when its late row arrives or when it truly
+   * settles, whichever is first (ISSUE-410); a call that never settles can no
+   * longer freeze classification. A count of live abandoned calls, never a
+   * ceiling (ADR-0060).
    */
   abandonedAsks: number;
+  /**
+   * Obligations a late step row already consumed (ISSUE-410). The late row
+   * decrements `abandonedAsks` and adds one here; the call's own settlement
+   * takes this token instead of decrementing `abandonedAsks` a second time.
+   */
+  abandonedAsksConsumed: number;
+  /**
+   * Resolvers for the asks waiting on this session's `session.execution.
+   * interrupted` event (ISSUE-413). The host's `generate` takes no
+   * `AbortSignal`, but its event stream names the interrupt, so this is the
+   * reachable cancellation seam: the waiter resolves with the host's reason and
+   * the ask settles as a typed refusal instead of waiting for the deadline.
+   * Empty while no ask is in flight.
+   */
+  askInterrupts: Set<(reason: string) => void>;
+  /**
+   * The prompt digests of the asks this session timed out on (ISSUE-421). The
+   * timeout clears `askInFlight` while the host call still lives, so the prompt
+   * is the identity that survives it: a context hook that is exactly one user
+   * message carrying one of these prompts is the abandoned request re-entering,
+   * not the turn's context, and is skipped whole. Never cleared: a late
+   * delivery of the same abandoned request must be skipped too.
+   */
+  readonly abandonedAskPromptDigests: Set<string>;
   /**
    * True once this session saw a step row for the ask lane — a declared
    * `ask`/`generate` kind, or an unstated row during a live ask (ISSUE-357).
@@ -540,6 +722,33 @@ export interface OpencodeSessionEntry {
   readonly pendingForgets: PendingForget[];
   /** The request's fixed system + tool prefix, for the idle fallback's reading. */
   lastPrefix: RequestPrefix | null;
+  /**
+   * How this mount's durable state was identified (ISSUE-422): `fresh` (no
+   * ledger file), `restart` (a ledger file existed before the open), or
+   * `no-durable-state` (`':memory:'`). A fork/clone is not identifiable from
+   * the seam this adapter reads; the first transform's boundary line names
+   * inherited history (`fork: 'unidentified'`) instead of guessing.
+   */
+  readonly installState: 'fresh' | 'restart' | 'no-durable-state';
+  /**
+   * Bumped once per host compaction observation (ISSUE-423). An ask stamps the
+   * generation it was built under; a reply read after a compaction is refused
+   * by name, and verdicts stored under an older generation are dropped before
+   * any apply can record their receipts against the rewritten array.
+   */
+  compactionGeneration: number;
+  /** The generation the last claim was made under; compared after the reply. */
+  askGeneration: number;
+  /**
+   * The generation the stored `askVerdicts` were read under, or null when none
+   * are stored. A later transform compares it with `compactionGeneration`; a
+   * mismatch means the array those verdicts describe was rewritten.
+   */
+  verdictGeneration: number | null;
+  /** True while one ask's `generate` or its deferred apply is running. */
+  applyInFlight: boolean;
+  /** True when a compaction landed inside those windows and owes its re-arm. */
+  compactionRearmDeferred: boolean;
 }
 
 /** One resolved manual forget waiting for the next request boundary. */
@@ -599,6 +808,13 @@ export interface OpencodeAskApplyInput {
    * holds the index itself (a test, a rig) may pass it here instead.
    */
   readonly appliedPlans?: OpencodeAppliedPlanIndex;
+  /**
+   * The install boundary (ISSUE-419): node ids present before this mount
+   * started. A verdict naming one — stored or banked — is dropped, so a ledger
+   * replay cannot remove pre-install history on a fresh install. Defaults to
+   * `entry.preInstallNodes`; a caller holding the boundary may pass it instead.
+   */
+  readonly excludeNodeIds?: ReadonlySet<NodeId>;
   readonly journal: (kind: OpencodeJournalKind, fields: Record<string, unknown>) => void;
 }
 
@@ -687,10 +903,12 @@ export async function applyOpencodeAskVerdicts(
     ? { contentEstimate: window } : { window: hostWindow };
   if (entry.askInFlight) return false;
   if (!Number.isSafeInteger(window) || window <= 0) return false;
+  const excluded = input.excludeNodeIds ?? entry.preInstallNodes ?? undefined;
   const plan = input.plan ?? buildOpencodePassPlan({
     sessionId: entry.sessionId, snapshot, messages,
     round: input.round ?? Math.max(1, entry.passRound),
     ...(entry.dedupeClasses === undefined ? {} : { classes: entry.dedupeClasses }),
+    ...(excluded === undefined ? {} : { excludeNodeIds: excluded }),
   });
   if (plan === null) {
     // Every unit left the array: no stored verdict can name one any more. The
@@ -702,6 +920,10 @@ export async function applyOpencodeAskVerdicts(
       entry.refusedRetriedUnitIds.delete(unitId);
     }
     entry.askVerdicts.clear();
+    entry.durableAskVerdicts.clear();
+    // ISSUE-409: the durable record follows the drop, so a restart neither
+    // replays a verdict naming a unit the array no longer carries nor blocks.
+    entry.persistAskState();
     return false;
   }
   const unitBy = new Map(plan.units.map(unit => [unit.id, unit] as const));
@@ -743,6 +965,7 @@ export async function applyOpencodeAskVerdicts(
      * removed (ISSUE-300 item 6). Every other verdict still needs a sent node.
      */
     if (unit === undefined || row === undefined
+      || excluded?.has(unit.nodeId) === true
       || (!bankedUnitIds.has(unitId) && !isSeenUnit(unit, entry.seenNodeIds))) {
       entry.askVerdicts.delete(unitId);
       /**
@@ -820,6 +1043,7 @@ export async function applyOpencodeAskVerdicts(
     // A caller bug in core's merge is named, never left to stall the request.
     journal('ask-error', { sessionId: entry.sessionId, origin: 'step', stage: 'merge',
       message: error instanceof Error ? error.message : String(error) });
+    entry.persistAskState();
     return false;
   }
   /**
@@ -844,7 +1068,12 @@ export async function applyOpencodeAskVerdicts(
     });
   }
   releaseCancelledUnits(entry, document.cancellations ?? []);
-  if (document.removals.length === 0) return false;
+  if (document.removals.length === 0) {
+    // ISSUE-409: the drops this pass made (retention, unseen, legacy rows) are
+    // durable, so a restart does not retry a verdict the guard already settled.
+    entry.persistAskState();
+    return false;
+  }
   if (plan.l1.removals.length + plan.dedupe.removals.length > 0) {
     entry.passRemovalsApplied = true;
   }
@@ -891,6 +1120,14 @@ export async function applyOpencodeAskVerdicts(
   }
   const committed = result.committed === true || entry.port.commit();
   const applied = committed && result.status === 'applied' && result.receipt !== null;
+  if (applied) {
+    // ISSUE-409: the ledger's `applied` row now owns these removals. A later
+    // host rebuild re-applies them through the banked applied-plan index, so
+    // the durable ask record stops owing them.
+    for (const removal of document.removals) {
+      entry.durableAskVerdicts.delete(removal.unitId);
+    }
+  }
   const refusal = entry.port.refusal?.() ?? null;
   const recallIds = applied
     ? recallIdsByForgottenNode(messages, result.intentId) : new Map<string, string>();
@@ -916,6 +1153,9 @@ export async function applyOpencodeAskVerdicts(
       } }),
     });
   }
+  // ISSUE-409: persist whatever this apply settled (applied verdicts cleared,
+  // guard-dropped ones gone) at the same boundary as the ledger row.
+  entry.persistAskState();
   return applied;
 }
 
@@ -945,6 +1185,17 @@ function recallIdsByForgottenNode(
     if (recallId !== undefined) ids.set(forgotten, recallId);
   }
   return ids;
+}
+
+/**
+ * The provider/model one request was built for (ISSUE-432), read from 2.2.5's
+ * `Model.Ref` (`{id, providerID, variant?}`) on the context hook. A field is
+ * null when the host named no value; it is never a guessed substitution.
+ */
+export interface OpencodeModelRef {
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly variant: string | null;
 }
 
 export interface OpencodeMountOptions {
@@ -977,6 +1228,13 @@ export interface OpencodeMountOptions {
   readonly contextWindowTokens?: number | null;
   readonly pruneThresholdTokens?: number | null;
   /**
+   * The context window the host declares for a model (ISSUE-432), read from
+   * 2.2.5's `context.model` catalog by `createOpencodePlugin`. It is used only
+   * to name the window a mid-session switch would need; the configured window
+   * above is never overridden.
+   */
+  readonly resolveModelWindow?: (ref: OpencodeModelRef) => number | null;
+  /**
    * The superseded-read dedupe classes (ADR-0037), passed straight to the pass
    * planner. Absent means every class is off (dsh's shipped default); the lane
    * is wired and can be enabled, never silently on.
@@ -998,8 +1256,11 @@ export interface OpencodeMountOptions {
   ) => Promise<OpencodeGenerateOutput>;
   /**
    * The ask's deadline, in milliseconds. Defaults to the dsh mount's own
-   * `DEFAULT_ASK_TIMEOUT_MS` (120,000). A non-positive value disables the race;
-   * the lane then waits for the host, and the journal says the deadline was off.
+   * `DEFAULT_ASK_TIMEOUT_MS` (120,000). `0` keeps the deadline off for the ask:
+   * no timer is built and the lane waits for the host while the mount lives;
+   * `close()` stops that wait through the mount's close signal and journals
+   * `ask-close`, so teardown never hangs on it (ISSUE-425). A negative,
+   * non-finite or above-platform-range value is refused by name at mount.
    */
   readonly askTimeoutMs?: number;
 }
@@ -1062,7 +1323,7 @@ export interface OpencodeMount {
    */
   transform(
     sessionId: string, messages: readonly OpencodeMessage[],
-    context?: Pick<OpencodeSessionContext, 'system' | 'tools'> | null,
+    context?: Pick<OpencodeSessionContext, 'system' | 'tools' | 'model'> | null,
   ): Promise<void>;
   /** One manual forget call: resolve and queue it, answering the tool value. */
   forget(sessionId: string, args: unknown): Promise<OpencodeForgetValue>;
@@ -1096,6 +1357,12 @@ export interface OpencodeMount {
    * keeps only observe/turn-fact and one turn never asks twice.
    */
   idleAskOnEvent: boolean;
+  /**
+   * True once `close()` has started (ISSUE-420). Every host callback checks it
+   * and does nothing, so a callback the host kept registered after cleanup has
+   * no effect: no `excludeTools` stripping, no transform, no state mutation.
+   */
+  readonly disposed: boolean;
   close(): Promise<void>;
 }
 
@@ -1121,6 +1388,167 @@ export function createFileJournalSink(path: string): OpencodeJournalSink {
   };
 }
 
+/** The named refusal a second mount on one durable root raises (ISSUE-424, ISSUE-444). */
+export const OPENCODE_DUPLICATE_MOUNT_CODE = 'duplicate-mount';
+
+/**
+ * A second live mount on one durable root (ISSUE-424, narrowed by ADR-0066 and
+ * ISSUE-444). Two mounts would open two ledgers for the same session and
+ * register duplicate asks and cards; the refusal is by name and names the
+ * durable root it collides on, so a host log line says what happened.
+ */
+export class OpencodeDuplicateMountError extends Error {
+  readonly code = OPENCODE_DUPLICATE_MOUNT_CODE;
+  readonly key: string;
+
+  constructor(key: string) {
+    super(`cremator-opencode: a mount for the durable root ${JSON.stringify(key)} is already `
+      + 'active; refusing the second mount rather than open a second ledger for the same session');
+    this.name = 'OpencodeDuplicateMountError';
+    this.key = key;
+  }
+}
+
+/**
+ * The process-level registry (ISSUE-424, narrowed by ADR-0066): the one live
+ * mount per durable root. A mount's ledger paths depend on the resolved root
+ * and the session id only — never on the journal, exclusion, grammar or dedupe
+ * options — so two mounts on one root would eventually open the same ledger. A
+ * `':memory:'` mount has no durable identity and is not tracked, so tests may
+ * build as many as they need.
+ */
+const activeMounts = new Map<string, OpencodeMount>();
+
+/**
+ * The identity "same durable root" means for the registry (ADR-0066, ISSUE-444):
+ * the resolved storage root the mount would derive every session ledger under.
+ * No configuration option that leaves the ledger path alone (`journalFile`,
+ * `excludeTools`, `askGrammar`, `dedupeClasses`, the token numbers) splits the
+ * key. `null` for a memory mount, which is never registered.
+ */
+function mountRegistryKey(selection: StorageSelection): string | null {
+  return selection.kind === 'durable' ? normalizeMountRoot(selection.root) : null;
+}
+
+/**
+ * The one directory a durable root names (ISSUE-464, ISSUE-481). The ledger
+ * path is built with `join`, which collapses a trailing separator, `.` and
+ * `..`; the registry key must describe the same directory the OS will open.
+ * `resolve` handles those lexical forms, `realpathSync.native` resolves the
+ * longest existing ancestor (a junction or symlink, an extended-length
+ * spelling, and a case-insensitive volume's own case), and Windows' trailing
+ * dot and space trimming is applied per component. A tail the filesystem does
+ * not hold yet is appended as typed. On Windows the volume is asked whether it
+ * folds case and the whole key is folded when it does, so the key cannot change
+ * the moment the first mount creates the root.
+ */
+function normalizeMountRoot(root: string): string {
+  const lexical = resolve(stripWindowsExtendedPrefix(root));
+  const trimmed = process.platform === 'win32' ? trimWindowsComponents(lexical) : lexical;
+  return canonicalDirectory(trimmed);
+}
+
+/**
+ * Strip the Windows extended-length prefix (ISSUE-481): `\\?\C:\store` and
+ * `\\?\UNC\server\share` name the same directory as their plain spellings, so
+ * two mounts must not hold two keys for them.
+ */
+function stripWindowsExtendedPrefix(root: string): string {
+  if (process.platform !== 'win32') return root;
+  if (root.startsWith('\\\\?\\UNC\\')) return `\\\\${root.slice('\\\\?\\UNC\\'.length)}`;
+  if (root.startsWith('\\\\?\\')) return root.slice('\\\\?\\'.length);
+  return root;
+}
+
+/**
+ * Windows ignores trailing dots and spaces on every component (ISSUE-481), so
+ * `C:\store.` and `C:\store ` open the same directory as `C:\store`. The
+ * lexical `resolve` keeps those characters; this trims them per component,
+ * never inside the volume root.
+ */
+function trimWindowsComponents(resolvedPath: string): string {
+  const parsed = parse(resolvedPath);
+  const rest = resolvedPath.slice(parsed.root.length);
+  if (rest.length === 0) return resolvedPath;
+  const parts = rest.split(/[\\/]+/u)
+    .map(part => part.replace(/[. ]+$/u, ''))
+    .filter(part => part.length > 0);
+  return parts.length === 0 ? parsed.root : join(parsed.root, ...parts);
+}
+
+/**
+ * Resolve the real directory behind a lexical path (ISSUE-481), asking the
+ * filesystem for the longest existing ancestor: a junction or symlink and its
+ * target then yield one key, and the case is the directory's own, not the
+ * platform's guess. A not-yet-existing tail is appended as typed. The volume
+ * itself is asked whether it folds case, and the whole key is folded when it
+ * does: folding must not depend on whether the root exists yet, or the key of
+ * one root would change the moment the first mount created it.
+ */
+function canonicalDirectory(lexical: string): string {
+  const missing: string[] = [];
+  let current = lexical;
+  for (;;) {
+    try {
+      const real = realpathSync.native(current);
+      const canonical = missing.length === 0 ? real : join(real, ...missing);
+      return volumeFoldsCase(real) ? canonical.toLowerCase() : canonical;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) {
+        // No ancestor exists (an absent drive, for example): the lexical form
+        // stays the fallback, folded on Windows like any unresolved path.
+        return process.platform === 'win32' ? lexical.toLowerCase() : lexical;
+      }
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Whether the volume holding an existing directory folds case (ISSUE-481).
+ * Case is observed, not guessed from `process.platform`: the nearest ancestor
+ * name that has a letter is asked for in the opposite case, and an answer whose
+ * file identity (volume serial and file index) equals the original's means the
+ * volume folds. Identity is used instead of comparing `realpathSync` strings:
+ * on macOS `realpath` echoes the caller's case, so a case-insensitive APFS
+ * volume resolved through a flipped spelling compared unequal to the real path
+ * and was misreported as case-sensitive.
+ */
+function volumeFoldsCase(real: string): boolean {
+  let current = real;
+  for (;;) {
+    const parent = dirname(current);
+    const name = basename(current);
+    const flipped = name.replace(/[a-z]/giu, letter => (letter === letter.toUpperCase()
+      ? letter.toLowerCase() : letter.toUpperCase()));
+    if (parent !== current && flipped !== name) {
+      try { return sameFileIdentity(current, join(parent, flipped)); }
+      catch { return false; }
+    }
+    // A drive or volume root with no letter-bearing component cannot be probed
+    // by spelling; keep Windows' folding default and treat posix roots as exact.
+    if (parent === current) return process.platform === 'win32';
+    current = parent;
+  }
+}
+
+/**
+ * Whether two spellings name one file or directory (ISSUE-481). The volume
+ * serial (`dev`) and file index (`ino`) are the identity the operating system
+ * itself uses, so a case-flipped spelling that resolves to the same entry on a
+ * case-insensitive volume compares equal. A missing flipped path throws and a
+ * distinct entry reports different identity, both meaning the volume does not
+ * fold. An unavailable index (`ino` 0 on some exotic volumes) is not treated as
+ * a match, so the guard fails toward keeping distinct roots distinct.
+ */
+function sameFileIdentity(left: string, right: string): boolean {
+  const a = statSync(left, { bigint: true });
+  const b = statSync(right, { bigint: true });
+  return a.ino !== 0n && a.dev === b.dev && a.ino === b.ino;
+}
+
 /**
  * The one ask grammar a host config may name, or null when the option is absent
  * or empty. Any other value is refused by name: a typo must never silently turn
@@ -1133,6 +1561,23 @@ function askGrammarOf(value: unknown): OpencodeAskGrammar | null {
     + `the only grammar this build measures is "${OPENCODE_ASK_GRAMMAR}"`);
 }
 
+/**
+ * The ask deadline a host config may name, or undefined when the option is
+ * absent. A present value that is not a JS number is refused by name, like
+ * `askGrammarOf` and `dedupeClassesOf`: `"crematorAskTimeoutMs": "60000"` in a
+ * JSON config must never silently fall back to the 120 s default (ISSUE-446).
+ * A number is returned as-is; the mount's own range checks decide whether it
+ * is usable (ISSUE-425).
+ */
+function askTimeoutMsOf(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number') {
+    throw new TypeError(`racoons: crematorAskTimeoutMs is ${JSON.stringify(value)}; `
+      + 'askTimeoutMs must be a number of milliseconds');
+  }
+  return value;
+}
+
 /** Read the config tuple's options: storage root, the ask, the exclusion, the journal. */
 export function mountOptionsFromHost(options: unknown): OpencodeMountOptions {
   if (!isRecord(options)) return {};
@@ -1143,7 +1588,7 @@ export function mountOptionsFromHost(options: unknown): OpencodeMountOptions {
   const contextWindowTokens = options['crematorContextWindowTokens'];
   const pruneThresholdTokens = options['crematorPruneThresholdTokens'];
   const dedupeClasses = dedupeClassesOf(options['crematorDedupeClasses']);
-  const askTimeoutMs = options['crematorAskTimeoutMs'];
+  const askTimeoutMs = askTimeoutMsOf(options['crematorAskTimeoutMs']);
   const names = Array.isArray(excluded)
     ? excluded.filter((name): name is string => typeof name === 'string' && name.length > 0)
     : undefined;
@@ -1158,7 +1603,7 @@ export function mountOptionsFromHost(options: unknown): OpencodeMountOptions {
     ...(pruneThresholdTokens === undefined || pruneThresholdTokens === null
       ? {} : { pruneThresholdTokens: pruneThresholdTokens as number }),
     ...(dedupeClasses === null ? {} : { dedupeClasses }),
-    ...(typeof askTimeoutMs === 'number' ? { askTimeoutMs } : {}),
+    ...(askTimeoutMs === undefined ? {} : { askTimeoutMs }),
   };
 }
 
@@ -1183,6 +1628,31 @@ function dedupeClassesOf(value: unknown): DedupeClasses | null {
     classes[key] = raw;
   }
   return classes;
+}
+
+/**
+ * The provider/model a context hook named, or null when it named none this
+ * build can read (ISSUE-432). 2.2.5's `Model.Ref` is `{id, providerID,
+ * variant?}`; any other shape leaves the provenance unset rather than being
+ * guessed at, so the mount never stamps a model it did not read.
+ */
+function modelProvenanceOf(value: unknown): OpencodeModelRef | null {
+  if (!isRecord(value)) return null;
+  const stringOf = (field: string): string | null => {
+    const raw = value[field];
+    return typeof raw === 'string' && raw.length > 0 ? raw : null;
+  };
+  const provider = stringOf('providerID');
+  const model = stringOf('id');
+  if (provider === null && model === null) return null;
+  return { provider, model, variant: stringOf('variant') };
+}
+
+/** True when two stamps name the same provider, model and variant. */
+function sameModelRef(left: OpencodeModelRef, right: OpencodeModelRef): boolean {
+  return left.provider === right.provider
+    && left.model === right.model
+    && left.variant === right.variant;
 }
 
 /**
@@ -1223,9 +1693,22 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     throw new Error('cremator: contextWindowTokens/pruneThresholdTokens configure the ask lane; '
       + 'without askGrammar there is no table to fire, so the trigger would be inert');
   }
-  const askTimeoutMs = options.askTimeoutMs ?? OPENCODE_ASK_TIMEOUT_MS;
+  /**
+   * Refuse a wrong-typed value here too, not only through
+   * `mountOptionsFromHost`: a JSON config arrives as `unknown` and a
+   * programmatic JS caller can pass anything, and a silently ignored deadline
+   * is the defect ISSUE-446 removes. The range checks below still apply to a
+   * number.
+   */
+  const askTimeoutMs = askTimeoutMsOf(options.askTimeoutMs) ?? OPENCODE_ASK_TIMEOUT_MS;
   if (!Number.isFinite(askTimeoutMs) || askTimeoutMs < 0) {
     throw new Error('cremator: askTimeoutMs must be a non-negative millisecond count');
+  }
+  if (askTimeoutMs > MAX_PLATFORM_TIMER_MS) {
+    // A larger delay is clamped to 1 ms by the platform timer, which would make
+    // a long deadline fire immediately and terminate the lane (ISSUE-425).
+    throw new Error('cremator: askTimeoutMs must not exceed the platform timer range '
+      + `(${String(MAX_PLATFORM_TIMER_MS)} ms); a larger delay would fire at 1 ms`);
   }
   const clock: Clock = { nowMs: options.nowMs ?? (() => Date.now()) };
   const emit: OpencodeJournalSink = options.journal
@@ -1238,6 +1721,18 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   // Resolved once, at mount: an unusable root is a refusal now, not at a user's
   // first request. A relative root and a durable pair are typed refusals (C3).
   const selection = resolveStorage(options.storage);
+  /**
+   * ISSUE-424 / ADR-0066: one live mount per durable root. The check runs here,
+   * before any session is opened, so a second mount can never construct a second
+   * ledger for the same session. A memory mount has no durable identity and is
+   * not tracked.
+   */
+  const registryKey = mountRegistryKey(selection);
+  if (registryKey !== null && activeMounts.has(registryKey)) {
+    // The refusal names the root this caller passed, not its normalized form.
+    throw new OpencodeDuplicateMountError(
+      selection.kind === 'durable' ? selection.root : registryKey);
+  }
   const sessions = new Map<string, OpencodeSessionEntry>();
   /**
    * Set once `close()` starts (ISSUE-393). The per-session release awaits
@@ -1251,17 +1746,43 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    */
   let closing = false;
   /**
+   * True once `close()` has finished its release loop (ISSUE-407). A refused
+   * cremate/idle is journalled only while teardown is in progress; after dispose
+   * the ISSUE-420 contract (post-dispose calls write no journal line) stands.
+   */
+  let disposeComplete = false;
+  /**
+   * The close signal (ISSUE-425). With the ask deadline off (`0`) the lane
+   * waits for the host with no timer of its own, so `close()` needs a named
+   * event to stop that wait. The promise resolves once, when close starts. It
+   * is an event, not a deadline: no value, no cap (standing rule 7 /
+   * ADR-0060). A never-closed mount leaves it pending, which holds nothing.
+   */
+  let signalClose: () => void = () => {};
+  const closed = new Promise<void>((resolve) => { signalClose = resolve; });
+  /**
    * In-flight mount work (ISSUE-356): every transform, event, tool call and
    * cremate the host started and has not finished. `close()` drains these
    * before closing the ledgers, so an ask that resolves after dispose never
    * writes a closed ledger and the event loop never operates on closed state.
-   * An ask is already bounded by the declared ask timeout, so the drain cannot
-   * hang beyond it; no new cap, bound or timeout is added here.
+   * An ask is bounded by the declared ask timeout, or, with the deadline off,
+   * by the close signal: teardown stops waiting on it (ISSUE-425). No new cap,
+   * bound or timeout is added here.
    */
   const inFlight = new Set<Promise<unknown>>();
-  function track<T>(work: Promise<T>): Promise<T> {
+  /**
+   * The session each tracked promise belongs to (ISSUE-408). An eviction drains
+   * only the deleted session's work; `close()` still drains the whole set. A
+   * mount-wide event that names no session is tagged `null`.
+   */
+  const inFlightSession = new Map<Promise<unknown>, string | null>();
+  function track<T>(work: Promise<T>, sessionId: string | null = null): Promise<T> {
     inFlight.add(work);
-    const settled = (): void => { inFlight.delete(work); };
+    inFlightSession.set(work, sessionId);
+    const settled = (): void => {
+      inFlight.delete(work);
+      inFlightSession.delete(work);
+    };
     void work.then(settled, settled);
     return work;
   }
@@ -1269,8 +1790,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * The ISSUE-356 drain: every tracked transform, event, tool call and cremate
    * settles before a ledger closes, so a post-dispose ask resolution never
    * writes a closed ledger. The loop re-checks because a settling item can hand
-   * off to another tracked call; asks carry the declared ask timeout, so the
-   * drain is bounded by the host's own declared deadline, not a new cap.
+   * off to another tracked call; asks carry the declared ask timeout, and a
+   * deadline-free ask is released by the close signal (ISSUE-425), so the
+   * drain is bounded by the host's own declared deadline or by teardown, never
+   * by a new cap.
    * `except` is the caller's own tracked promise — the `session.deleted`
    * eviction runs inside one — so the drain never awaits itself.
    */
@@ -1281,6 +1804,38 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       await Promise.allSettled(pending);
     }
   }
+  /**
+   * The per-session drain (ISSUE-408): settle only the tracked work belonging to
+   * one session. `session.deleted` for A must not wait on B's ask, so deleting an
+   * unrelated session no longer stalls the event consumer. The loop re-checks
+   * because a settling item can hand off to new work for the same session.
+   */
+  async function drainSessionInFlight(
+    sessionId: string, except?: Promise<unknown>,
+  ): Promise<void> {
+    for (;;) {
+      const pending = [...inFlight].filter(work => work !== except
+        && inFlightSession.get(work) === sessionId);
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  }
+  /**
+   * Sessions this mount has released (ISSUE-407). Eviction used to leave no
+   * tombstone, so a late event, tool, idle or cremate naming the released id
+   * could open a fresh ledger after eviction, with no owner. A released id is
+   * refused by every lane except the host's own context hook (the genuine
+   * lifecycle opener, which may reopen it and clears the tombstone).
+   */
+  const released = new Set<string>();
+  /**
+   * The install boundary survives an in-mount eviction/reopen (ISSUE-445).
+   * Keyed by session id for the mount's life: `'pending'` until the first
+   * transform captures the set, then the captured pre-install node ids. A
+   * genuine process restart starts with an empty map, so today's restart
+   * behavior is unchanged.
+   */
+  const installBoundaries = new Map<string, Set<NodeId> | 'pending'>();
   /**
    * Release one session's open state — the same path `close()` uses per entry
    * (ISSUE-379): the entry leaves the open map and, when this mount opened the
@@ -1293,6 +1848,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     const entry = sessions.get(sessionId);
     if (entry === undefined) return false;
     sessions.delete(sessionId);
+    // ISSUE-407: a released id is a tombstone for the rest of the mount's life.
+    released.add(sessionId);
     if (entry.ownedLedger) await entry.ledger.close().catch(() => {});
     return true;
   }
@@ -1341,12 +1898,74 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     });
   }
 
-  async function sessionFor(sessionId: string): Promise<OpencodeSessionEntry | null> {
+  /**
+   * ISSUE-448 / ADR-0064: seed the durable receipts before judging a prepared
+   * row. A row the seeded receipts can resolve is left to recovery; a row that
+   * still has no provable receipt after seeding is closed exactly once with a
+   * named abandoned outcome, at the same boundary as an `applied` row, so it
+   * cannot stand every later pass down in `recovery-pending`. Runs when a
+   * session opens, so a row a pass writes mid-flight is never mistaken for a
+   * crash-window orphan. A read or append failure is named and left fail-open.
+   */
+  async function settlePreparedIntents(params: {
+    readonly ledger: Ledger;
+    readonly receipts: readonly ApplyReceipt[];
+    readonly sessionId: string;
+  }): Promise<void> {
+    const { ledger, receipts, sessionId } = params;
+    const prepared = new Map<string, number>();
+    const finished = new Set<string>();
+    try {
+      for await (const row of ledger.events(sessionId)) {
+        const event = row.event;
+        if (event.kind === 'prepared') {
+          if (!prepared.has(event.intentId)) prepared.set(event.intentId, event.atMs);
+        } else if (event.kind === 'applied') {
+          finished.add(event.receipt.intentId);
+        } else if (event.kind === 'abandoned') {
+          finished.add(event.intentId);
+        }
+      }
+    } catch (error) {
+      journal('mount-state-error', { sessionId, fact: 'prepared-read',
+        message: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    const seeded = new Set(receipts.map(receipt => receipt.intentId));
+    for (const [intentId, atMs] of prepared) {
+      if (finished.has(intentId) || seeded.has(intentId)) continue;
+      try {
+        await ledger.append({ kind: 'abandoned', sessionId, intentId, atMs,
+          eventKey: `adapter-abandoned:${intentId}`,
+          reason: 'A prepared intent had no durable receipt after remount seeding; '
+            + 'closed once as abandoned' });
+        journal('intent-abandoned', { sessionId, intentId, reason: 'no-durable-receipt' });
+      } catch (error) {
+        journal('mount-state-error', { sessionId, fact: 'abandoned-write', intentId,
+          message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+
+  /**
+   * The one open/lookup a lane uses.
+   * `allowReopen` is the host's genuine lifecycle opener (ISSUE-407): the
+   * `context` hook is the only caller that passes `true`, because the host may
+   * present a brand-new request for an id it released; every other lane
+   * (event, tool, idle, cremate, recall) leaves it false and is refused when the
+   * id is a released tombstone.
+   */
+  async function sessionFor(
+    sessionId: string, allowReopen = false,
+  ): Promise<OpencodeSessionEntry | null> {
     // ISSUE-393: once close() starts, no new session work — a still-mapped
     // entry's ledger close may be next, and a released session must not re-open.
     if (closing) return null;
     const existing = sessions.get(sessionId);
     if (existing !== undefined) return existing;
+    // ISSUE-407: a released id is not reopened by late event/tool/idle/cremate
+    // traffic; only a genuine context hook may revive it.
+    if (!allowReopen && released.has(sessionId)) return null;
     let target: StorageTarget;
     try {
       target = sessionStorage(selection, sessionId);
@@ -1354,6 +1973,25 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       refuseStorage(sessionId, error);
       return null;
     }
+    /**
+     * ISSUE-419: the durable ledger file is the per-session record that this
+     * session was mounted before. Its absence at this open means a fresh
+     * install, so the first transform's nodes are the pre-install boundary. A
+     * `':memory:'` ledger has no durable identity and keeps today's behavior.
+     * Read before `open` — the open creates the file.
+     */
+    const freshInstall = target.kind === 'durable' && !existsSync(target.databasePath);
+    /**
+     * ISSUE-445: a boundary captured earlier in this mount outlives the entry
+     * that held it. A reopen of an id this mount evicted restores the same
+     * pre-install set instead of recomputing it from file existence (the file
+     * now exists, so the recompute would wrongly call it a restart).
+     */
+    const priorBoundary = installBoundaries.get(sessionId);
+    if (priorBoundary === undefined && freshInstall) installBoundaries.set(sessionId, 'pending');
+    const retainedBoundary = priorBoundary instanceof Set ? priorBoundary : null;
+    const boundaryPending = priorBoundary === 'pending'
+      || (priorBoundary === undefined && freshInstall);
     const open = options.openLedger ?? openLedger;
     let ledger: Ledger;
     try {
@@ -1365,8 +2003,39 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       return null;
     }
     unavailable.delete(sessionId);
+    // ISSUE-407: a context-hook reopen makes the id live again; the tombstone goes.
+    released.delete(sessionId);
     journal('storage-plan', { sessionId, databasePath: target.databasePath,
       blobRoot: target.blobRoot, node: process.version });
+    /**
+     * ISSUE-422: the host exposes no fork/clone event in the seam this mount
+     * reads. A child id's storage is its own (fresh install → the first
+     * transform's boundary excludes the inherited history). The one shape the
+     * adapter cannot resolve is a durable file that exists but holds NO events
+     * for this session: that is either a parent's copied ledger or a state-less
+     * earlier mount of this id. It is NAMED on the install line as
+     * `fork: 'unidentified'` and this mount keeps the shipped restart rule —
+     * the adapter records that it cannot identify the fork instead of guessing.
+     */
+    const forkUnidentified = target.kind === 'durable' && !freshInstall
+      && !(await ledgerHasAnyEvent(ledger, sessionId));
+    const installState: OpencodeSessionEntry['installState'] = freshInstall ? 'fresh'
+      : target.kind === 'durable' ? 'restart' : 'no-durable-state';
+    journal('install', { sessionId, state: installState, mountedAtMs: clock.nowMs(),
+      ...(forkUnidentified
+        ? { fork: 'unidentified',
+          reason: 'the durable ledger holds no events for this session; a fork/clone cannot be '
+            + 'told apart from a reopen, so the restart rule is kept and no boundary is claimed' }
+        : {}) });
+    // ISSUE-445: a reopen after an in-mount eviction restores the captured
+    // boundary and names that state, so the journal distinguishes it from a
+    // genuine process restart (which starts with an empty map).
+    if (retainedBoundary !== null) {
+      journal('install', { sessionId, state: 'boundary', reopened: true,
+        preInstallNodes: retainedBoundary.size, installState,
+        reason: 'the install boundary is retained by this mount across eviction; the reopened '
+          + 'entry keeps pre-install nodes out of the ask/L1/dedupe lanes' });
+    }
     /**
      * A restart loses the port's in-process applied-plan index, so the durable
      * ledger is read once here: an `applied` row joined to its prepared event's
@@ -1378,6 +2047,42 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     try {
       seededAppliedPlans = await opencodeAppliedPlansFromLedger(ledger, sessionId);
     } catch { /* the request proceeds without a seed; nothing is claimed */ }
+    /**
+     * ISSUE-448: the durable receipts a previous process wrote at the host
+     * write. The ledger read above seeds what was *applied*; these seed what
+     * was *landed*, so a prepared row whose `applied` row never arrived can be
+     * resolved instead of standing down in `recovery-pending` forever. A
+     * `':memory:'` target has no durable store.
+     */
+    let receiptsRefused = false;
+    const durableReceipts = target.kind === 'durable'
+      ? readDurableReceipts(target, message => {
+        receiptsRefused = true;
+        journal('mount-state-error', { sessionId, fact: 'receipts', message });
+      })
+      : [];
+    if (durableReceipts.length > 0) {
+      journal('receipts-resumed', { sessionId, count: durableReceipts.length });
+    }
+    /**
+     * ISSUE-448 / ADR-0064: seed before judging. A prepared row the seeded
+     * receipts resolve is left to recovery; one that still has no provable
+     * receipt is closed once with a named abandoned outcome. This runs at open,
+     * never per event, so a row a pass writes mid-flight is not a crash orphan.
+     *
+     * ISSUE-485: a refused or malformed receipts read is not "no receipt". The
+     * empty list it returns would abandon every prepared row permanently, so
+     * the judgement is skipped for this open and the skip is named.
+     */
+    if (target.kind === 'durable') {
+      if (receiptsRefused) {
+        journal('mount-state-error', { sessionId, fact: 'prepared-seed',
+          message: 'the durable receipts record was refused; prepared intents are not judged '
+            + 'against it on this open' });
+      } else {
+        await settlePreparedIntents({ ledger, receipts: durableReceipts, sessionId });
+      }
+    }
     // The declared flags, not a caller's wish: the mount passes the pair it
     // declares, `{wireRevert: true}` beside `deriveOpencodeRevert`, and the port
     // refuses either half without the other (C4; plan §7 C7).
@@ -1393,6 +2098,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     let mountedEntry: OpencodeSessionEntry | null = null;
     const port = (options.createPort ?? createOpencodePort)({
       sessionId, clock, capabilities, appliedPlans: seededAppliedPlans,
+      ...(durableReceipts.length === 0 ? {} : { receipts: durableReceipts }),
+      persistReceipt: (receipt) => {
+        if (target.kind !== 'durable') return;
+        const written = writeDurableReceipt(target, receipt);
+        if (!written.ok) {
+          journal('mount-state-error', { sessionId, fact: 'receipt',
+            intentId: receipt.intentId, message: written.message ?? 'unknown write failure' });
+        }
+      },
       deriveRevert: (request, messages, index) => {
         if (mountedEntry !== null) mountedEntry.appliedPlans = index;
         return deriveOpencodeRevert(request, messages, index,
@@ -1421,25 +2135,117 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         : { ask: { grammar: askGrammar, transientModelCalls: 'one per fire',
           applied: false, floorBytes: OPENCODE_ASK_FLOOR_BYTES,
           retry: OPENCODE_ASK_RETRY,
-          reload: 'the asked set and the fire count live in this process; a plugin reload '
-            + 'starts fresh' } }) });
+          // ADR-0063: the asked set, the revision claims and an unapplied
+          // verdict are durable; a reload restores them instead of starting
+          // fresh, so a claimed unit is not re-asked.
+          reload: 'the ask identity (revision claims, unit claims and unapplied verdicts) is '
+            + 'written to durable state; a reload restores it' } }) });
+    /**
+     * ISSUE-409 / ADR-0063: the ask identity a previous process claimed or
+     * answered but did not settle. Restoring it before the entry exists stops
+     * the first transform from re-asking a claimed revision or losing an
+     * unapplied verdict.
+     */
+    const durableAsk = target.kind === 'durable'
+      ? readDurableAskState(target, message => journal('mount-state-error',
+        { sessionId, fact: 'ask', message }))
+      : null;
+    /**
+     * ISSUE-467 / ADR-0063 clause 3: the drop is a durable write, not a
+     * read-time filter. An ask-off mount clears the record it would otherwise
+     * leave for a later ask-on mount to resurrect, and loads no verdict or
+     * claim of its own, so `ask-state-dropped` is true.
+     */
+    const seededAsk = askGrammar === undefined ? null : durableAsk;
+    if (askGrammar === undefined && durableAsk !== null) {
+      const cleared = writeDurableAskState(target, {
+        revisions: [], askedUnitIds: [], retriedUnitIds: [], refusedRetriedUnitIds: [],
+        verdicts: [], deferredApply: false, deferredFailures: 0,
+      });
+      if (!cleared.ok) {
+        // ISSUE-483: a failed clear has its own line; claiming the drop would
+        // report an intent the durable record still carries.
+        journal('mount-state-error', { sessionId, fact: 'ask',
+          message: cleared.message ?? 'unknown write failure' });
+      } else {
+        const claims = durableAsk.askedUnitIds.length;
+        const revisions = durableAsk.revisions.length;
+        const verdicts = durableAsk.verdicts.length;
+        const retries = durableAsk.retriedUnitIds.length
+          + durableAsk.refusedRetriedUnitIds.length;
+        if (claims + revisions + verdicts + retries > 0
+          || durableAsk.deferredApply || durableAsk.deferredFailures > 0) {
+          journal('ask-state-dropped', { sessionId, count: verdicts, claims, revisions,
+            reason: 'the ask lane is off at this mount, so the restored ask identity '
+              + '(verdicts and claims) is erased' });
+        }
+      }
+    }
+    const restoredVerdicts = seededAsk?.verdicts ?? [];
+    const durableAskVerdicts = new Map<UnitId, DurableAskVerdict>(
+      restoredVerdicts.map(verdict => [verdict.unitId as UnitId, verdict] as const));
+    const restoredSeen = new Set<NodeId>(
+      restoredVerdicts.map(verdict => verdict.nodeId as NodeId));
+    if (restoredVerdicts.length > 0) {
+      journal('ask-state-resumed', { sessionId,
+        revisions: seededAsk?.revisions.length ?? 0,
+        claims: seededAsk?.askedUnitIds.length ?? 0,
+        verdicts: restoredVerdicts.length });
+    }
     const entry: OpencodeSessionEntry = {
       sessionId, ledger, port,
       appliedPlans: port.appliedPlanIndex?.()
         ?? new Map(seededAppliedPlans.map(plan => [plan.intentId, plan] as const)),
       engine, meter,
       pruneTrigger: new PruneWindowTrigger(contextWindowTokens, pruneThresholdTokens),
+      parametersDerivedFrom: null, observedModel: null,
       dedupeClasses: options.dedupeClasses ?? {},
       ownedLedger: options.openLedger === undefined,
       lastMessages: null, pendingEstimates: [], droppedEstimates: 0,
       usageSeen: new Set<string>(),
-      askedUnitIds: new Set<UnitId>(), askedRevisions: new Set<string>(),
-      retriedUnitIds: new Set<UnitId>(), refusedRetriedUnitIds: new Set<UnitId>(),
-      askVerdicts: new Map<UnitId, WireAnswer>(),
-      seenNodeIds: new Set<NodeId>(), pendingSeenNodeIds: new Set<NodeId>(),
-      stepAskFired: false, askInFlight: false, abandonedAsks: 0, askStepRowsSeen: false,
-      askFires: 0, passRound: 0, passRemovalsApplied: false, deferredApply: false,
-      deferredFailures: 0,
+      askedUnitIds: new Set<UnitId>(
+        (seededAsk?.askedUnitIds ?? []) as readonly UnitId[]),
+      askedRevisions: new Set<string>(seededAsk?.revisions ?? []),
+      retriedUnitIds: new Set<UnitId>(
+        (seededAsk?.retriedUnitIds ?? []) as readonly UnitId[]),
+      refusedRetriedUnitIds: new Set<UnitId>(
+        (seededAsk?.refusedRetriedUnitIds ?? []) as readonly UnitId[]),
+      askVerdicts: new Map<UnitId, WireAnswer>(
+        restoredVerdicts.map(verdict => [verdict.unitId as UnitId, verdict.answer] as const)),
+      durableAskVerdicts,
+      persistAskState: () => {
+        if (target.kind !== 'durable') return;
+        // A verdict an apply or a guard settled is no longer owed. It may stay
+        // in `askVerdicts` so a rebuilt host request re-applies the banked
+        // removal, but the ledger's applied row owns it from here (ISSUE-409).
+        for (const unitId of entry.durableAskVerdicts.keys()) {
+          if (!entry.askVerdicts.has(unitId)) entry.durableAskVerdicts.delete(unitId);
+        }
+        const written = writeDurableAskState(target, {
+          revisions: [...entry.askedRevisions],
+          askedUnitIds: [...entry.askedUnitIds],
+          retriedUnitIds: [...entry.retriedUnitIds],
+          refusedRetriedUnitIds: [...entry.refusedRetriedUnitIds],
+          verdicts: [...entry.durableAskVerdicts.values()],
+          deferredApply: entry.deferredApply,
+          deferredFailures: entry.deferredFailures,
+        } satisfies DurableAskState);
+        if (!written.ok) {
+          journal('mount-state-error', { sessionId, fact: 'ask',
+            message: written.message ?? 'unknown write failure' });
+        }
+      },
+      seenNodeIds: restoredSeen, pendingSeenNodeIds: new Set<NodeId>(),
+      preInstallNodes: retainedBoundary, installBoundaryPending: boundaryPending,
+      installState,
+      compactionGeneration: 0, askGeneration: 0, verdictGeneration: null,
+      applyInFlight: false, compactionRearmDeferred: false,
+      stepAskFired: false, askInFlight: false, abandonedAsks: 0, abandonedAsksConsumed: 0,
+      askInterrupts: new Set(), askStepRowsSeen: false,
+      abandonedAskPromptDigests: new Set<string>(),
+      askFires: 0, passRound: 0, passRemovalsApplied: false,
+      deferredApply: (seededAsk?.deferredApply ?? false) || restoredVerdicts.length > 0,
+      deferredFailures: seededAsk?.deferredFailures ?? 0,
       completedThroughTurnOrdinal: null,
       applyingClosedEpisodeNodes: null,
       pendingForgets: [], lastPrefix: null,
@@ -1488,7 +2294,14 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       && requestKind === 'unstated') {
       // ISSUE-396: the abandoned generate's late row, on a host that emits ask
       // step rows. Unmeasured in the ask lane; the main queue keeps its place.
-      if (!entry.usageSeen.has(row.messageId)) entry.usageSeen.add(row.messageId);
+      // ISSUE-410: the row consumes one abandoned-ask obligation, so a call
+      // that never settles cannot freeze classification forever. Settlement
+      // takes the consumed token instead of decrementing a second time.
+      if (!entry.usageSeen.has(row.messageId)) {
+        entry.usageSeen.add(row.messageId);
+        entry.abandonedAsks -= 1;
+        entry.abandonedAsksConsumed += 1;
+      }
       journal('usage-missing', { sessionId, messageId: row.messageId, reason: 'ask-request',
         requestKind });
       return;
@@ -1557,7 +2370,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * is why a first-request-only turn asks nothing.
    */
   function promoteShippedNodes(entry: OpencodeSessionEntry): void {
-    for (const nodeId of entry.pendingSeenNodeIds) entry.seenNodeIds.add(nodeId);
+    for (const nodeId of entry.pendingSeenNodeIds) {
+      /**
+       * ISSUE-419: a node on the install boundary was present before the plugin
+       * mounted. It never enters the seen set, so `isSeenUnit` keeps it out of
+       * every ask table and ask apply for the life of the mount.
+       */
+      if (entry.preInstallNodes?.has(nodeId) === true) continue;
+      entry.seenNodeIds.add(nodeId);
+    }
     entry.pendingSeenNodeIds.clear();
   }
 
@@ -1625,9 +2446,64 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       bar: entry.pruneTrigger.threshold,
       skipAt: entry.pruneTrigger.skipThreshold,
       window: contextWindowTokens,
+      // ISSUE-432: the model these numbers describe, so a switch is visible on
+      // every reading and not only on the one line that first named it.
+      derivedFrom: entry.parametersDerivedFrom,
       crossed,
     });
     return crossed;
+  }
+
+  /**
+   * The provider/model one request was built for, when the host names it
+   * (ISSUE-432). The window and bar are mount options chosen for a model; the
+   * first hook that names one stamps them. A later hook naming a different
+   * provider/model files one `model-change` line naming every value that did not
+   * follow and the model it came from. Nothing is re-derived: the configured
+   * window is authoritative, and the host's model catalog is consulted only to
+   * name the window the new model declares.
+   */
+  function observeModel(entry: OpencodeSessionEntry, model: unknown): void {
+    const ref = modelProvenanceOf(model);
+    if (ref === null) return;
+    const previous = entry.observedModel;
+    if (previous !== null && sameModelRef(previous, ref)) return;
+    entry.observedModel = ref;
+    const derivedFrom = entry.parametersDerivedFrom;
+    if (derivedFrom === null) {
+      entry.parametersDerivedFrom = ref;
+      return;
+    }
+    if (sameModelRef(derivedFrom, ref)) return;
+    const derivedBar = pruneThresholdTokens === null;
+    const stale = contextWindowTokens === null ? []
+      : [...(derivedBar ? ['bar'] : []), 'window'];
+    const hostWindow = options.resolveModelWindow === undefined
+      || ref.provider === null || ref.model === null
+      ? null : options.resolveModelWindow(ref);
+    journal('model-change', {
+      sessionId: entry.sessionId, from: previous, to: ref,
+      /**
+       * `session.generate` takes no model (`{sessionID, prompt}`): the host
+       * resolves the session's active model, so the binding follows a switch
+       * with no value of its own to refresh.
+       */
+      generate: 'host-resolved',
+      stale,
+      derivedFrom,
+      parameters: {
+        window: { value: contextWindowTokens, derivedFrom },
+        // An explicit bar is the operator's absolute count, not model-derived.
+        bar: { value: entry.pruneTrigger.threshold,
+          derivedFrom: derivedBar ? derivedFrom : null },
+        skipAt: { value: entry.pruneTrigger.skipThreshold, derivedFrom },
+      },
+      reason: contextWindowTokens === null
+        ? 'no-window-configured'
+        : (hostWindow === null ? 'no-host-window-declared' : 'window-not-re-derived'),
+      hostSeam: options.resolveModelWindow === undefined ? 'absent' : 'model-catalog',
+      ...(hostWindow === null ? {} : { hostWindow }),
+    });
   }
 
   /**
@@ -1646,14 +2522,21 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    */
   async function transformStep(
     sessionId: string, messages: readonly OpencodeMessage[],
-    context: Pick<OpencodeSessionContext, 'system' | 'tools'> | null = null,
+    context: Pick<OpencodeSessionContext, 'system' | 'tools' | 'model'> | null = null,
   ): Promise<void> {
+    // ISSUE-420: a callback the host kept after cleanup does nothing.
+    if (closing) return;
     if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
       journal('transform', { reason: 'no-session' });
       return;
     }
-    const entry = await sessionFor(sessionId);
+    // ISSUE-407: the host's own context hook is the one genuine lifecycle
+    // opener, so it may reopen an id it released; every other lane is refused.
+    const entry = await sessionFor(sessionId, true);
     if (entry === null) return;
+    // ISSUE-432: observe the request's model before any early return, so a
+    // switch is named even when this hook is otherwise skipped.
+    observeModel(entry, context?.model);
     /**
      * A host whose transient `session.generate` request re-enters this hook
      * must not run an at-rest or prune pass over the generate request's array:
@@ -1663,6 +2546,20 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
      */
     if (entry.askInFlight) {
       journal('transform', { sessionId, reason: 'ask-in-flight' });
+      return;
+    }
+    /**
+     * ISSUE-421: the timeout cleared `askInFlight` while the host call still
+     * lives, so the abandoned request's own context hook can reach here. Its
+     * identity is the ask prompt, which survives the timeout: a hook that is
+     * exactly one user message carrying that prompt is the generate request,
+     * never the turn's context. It is skipped before `lastMessages` is
+     * overwritten, so no at-rest pass runs and no second ask can fire over it.
+     */
+    const abandonedPrompt = abandonedAskPrompt(entry, messages);
+    if (abandonedPrompt !== null) {
+      journal('ask-abandoned', { sessionId, promptSha256: abandonedPrompt,
+        messageCount: messages.length, reason: 'ask-request' });
       return;
     }
     activeSessionId = sessionId;
@@ -1687,6 +2584,29 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         ? {} : { completedThroughTurnOrdinal: entry.completedThroughTurnOrdinal });
     try {
       let observed = observeRequest(messages);
+      /**
+       * ISSUE-419: the fresh install's first transform is the earliest
+       * observation of the host's stored history, so its nodes are the install
+       * boundary. Recorded once, before any pass runs; from here on "first
+       * observed after mount" is decidable per node.
+       */
+      if (entry.installBoundaryPending) {
+        entry.installBoundaryPending = false;
+        entry.preInstallNodes = new Set(observed.nodes.map(node => node.id));
+        // ISSUE-445: keep the boundary for the mount's life, so an eviction and
+        // reopen of this id restores it instead of recomputing from file existence.
+        installBoundaries.set(sessionId, entry.preInstallNodes);
+        // ISSUE-422: nodes already on the first transform's array were never
+        // seen by this mount. They are excluded from every later lane; when
+        // there are any, the line names them as inherited history, because a
+        // fork/clone and a fresh install into history are the same shape here.
+        journal('install', { sessionId, state: 'boundary',
+          preInstallNodes: entry.preInstallNodes.size,
+          observedNodes: observed.nodes.length, revision: observed.revision,
+          installState: entry.installState,
+          inheritedHistory: entry.preInstallNodes.size > 0,
+          ...(entry.preInstallNodes.size > 0 ? { fork: 'unidentified' } : {}) });
+      }
       // The event id names the request's content and how many times that content
       // has already been rewritten. This host rebuilds every request from its own
       // store (`rewriteHistory: false`), so the ledger's applied count at that
@@ -1729,6 +2649,30 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
        */
       if (askGrammar !== undefined) {
         /**
+         * ISSUE-423: a host compaction landed between the ask that stored these
+         * verdicts and this apply. The array they describe was rewritten, so
+         * applying them would record receipts for the pre-ask array. They are
+         * dropped by name and their units released; the banked ledger index
+         * still re-applies any removal an earlier apply already landed.
+         */
+        if (entry.askVerdicts.size > 0 && entry.verdictGeneration !== null
+          && entry.verdictGeneration !== entry.compactionGeneration) {
+          const droppedUnits = [...entry.askVerdicts.keys()];
+          const verdictGeneration = entry.verdictGeneration;
+          for (const unitId of droppedUnits) {
+            entry.askVerdicts.delete(unitId);
+            entry.askedUnitIds.delete(unitId);
+            entry.retriedUnitIds.delete(unitId);
+            entry.refusedRetriedUnitIds.delete(unitId);
+          }
+          entry.verdictGeneration = null;
+          journal('compaction-stale', { sessionId,
+            generation: entry.compactionGeneration, verdictGeneration,
+            unitIds: droppedUnits, count: droppedUnits.length,
+            reason: 'a host compaction landed between the ask and its apply, so the stored '
+              + 'verdicts name an array that no longer exists; no receipt is recorded for it' });
+        }
+        /**
          * A stored `forgetall` from an idle or `/cremate` fire applies in this
          * transform. That pass is not complete until the apply, and the array
          * observed here still carries the bytes it will remove, so this
@@ -1766,6 +2710,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               round: entry.passRound,
               classes: entry.dedupeClasses,
               appliedPlans: entry.appliedPlans,
+              ...(entry.preInstallNodes === null
+                ? {} : { excludeNodeIds: entry.preInstallNodes }),
             });
           } catch (error) {
             buildThrew = true;
@@ -1775,12 +2721,45 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         }
         let answers: ReadonlyMap<UnitId, WireAnswer> = new Map();
         if (crossed) {
+          // ISSUE-447: read the same health the prune apply checks, before the
+          // host is paid. A standdown is not a pass: it is named, sends
+          // nothing, and leaves the crossing live for a healthier later read.
+          // With the ask off there is no send to gate, so no read is made.
+          const standdown = askGrammar === undefined
+            ? null : await opencodeAskStanddown(entry.ledger, entry.sessionId);
           let outcome: AskOutcome = 'no-table';
-          if (batch !== null && batch.prompt !== null) {
+          if (standdown !== null) {
+            journalAskStanddown(entry, 'step', standdown);
+          } else if (batch !== null && batch.prompt !== null) {
             const sent = await askPass(entry, 'step', batch);
             outcome = sent.outcome;
             answers = sent.answers;
             entry.stepAskFired = outcome === 'fired';
+          } else if (unitClaimSuppressed(batch)) {
+            outcome = 'claimed-unit';
+          }
+          // ISSUE-431: a crossing with nothing tableable is named as its own
+          // outcome, so "fired with nothing eligible" is not indistinguishable
+          // from an ask the mount suppressed. ISSUE-468: a refusal by the claim
+          // guard is named as the suppression it is, not as an empty crossing.
+          // A build that threw already has its own ask-error line.
+          if (standdown === null && !buildThrew) {
+            if (outcome === 'no-table') {
+              journal('prune-outcome', { sessionId, origin: 'step', outcome: 'no-eligible',
+                reason: 'the depth crossing held no tableable unit; no ask was sent and none '
+                  + 'was suppressed' });
+            } else if (outcome === 'claimed-unit') {
+              journal('prune-outcome', { sessionId, origin: 'step', outcome,
+                claims: batch?.dropped.asked ?? 0,
+                reason: 'the depth crossing held a tableable unit, but no row survived the '
+                  + 'durable unit claim' });
+            } else if (outcome === 'claimed-revision' || outcome === 'ask-in-flight') {
+              journal('prune-outcome', { sessionId, origin: 'step', outcome,
+                reason: 'the depth crossing held a tableable unit, but the ask was suppressed '
+                  + (outcome === 'claimed-revision'
+                    ? 'by a durable revision claim'
+                    : 'by an ask already in flight for this session') });
+            }
           }
           /**
            * A pass DID something when it sent a table (whether the reply was
@@ -1793,7 +2772,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
            * (ISSUE-359).
            */
           if (entry.pruneTrigger.enabled) {
-            if (outcome === 'no-table' && (entry.seenNodeIds.size === 0 || buildThrew)) {
+            // ISSUE-447: a standdown paid nothing and applied nothing, so it is
+            // skipped like a zero-eligible crossing; the next above-bar reading
+            // must still fire once the ledger is healthy. ISSUE-468: a named
+            // claim or in-flight refusal takes the same latch path `no-table`
+            // took before it was named, so this fix changes no timing.
+            const noSend = outcome === 'no-table' || outcome === 'claimed-revision'
+              || outcome === 'claimed-unit' || outcome === 'ask-in-flight';
+            if (noSend
+              && (entry.seenNodeIds.size === 0 || buildThrew || standdown !== null)) {
               entry.pruneTrigger.notePassSkipped();
             } else {
               entry.pruneTrigger.notePassCompleted();
@@ -1803,6 +2790,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         let deferredRemoved = false;
         if (batch !== null) {
           const snap = observeRequest(messages);
+          // ISSUE-423: the apply window. A compaction that ends while this
+          // apply runs defers its latch re-arm instead of clearing the baseline
+          // the apply is still measuring against.
+          entry.applyInFlight = true;
           try {
             deferredRemoved = await applyOpencodeAskVerdicts({
               entry, messages, snapshot: snap, plan: batch.plan, answers,
@@ -1810,12 +2801,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               window: contextWindowTokens
                 ?? Math.max(1, estimateRequestTokens(estimateMeter, snap, prefix)),
               hostWindow: contextWindowTokens,
+              ...(entry.preInstallNodes === null
+                ? {} : { excludeNodeIds: entry.preInstallNodes }),
               journal,
             });
             committed = deferredRemoved || committed;
           } catch (error) {
             journal('ask-error', { sessionId, origin: 'step', stage: 'apply',
               message: error instanceof Error ? error.message : String(error) });
+          } finally {
+            entry.applyInFlight = false;
+            settleCompactionRearm(entry);
           }
         }
         /**
@@ -1881,7 +2877,41 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           if (!dropped && entry.pruneTrigger.enabled && (deferredRemoved || committed)) {
             entry.pruneTrigger.notePassCompleted();
           }
+        } else if (batch !== null) {
+          /**
+           * ISSUE-431: a step-origin fire's apply follows the same
+           * one-retry-then-drop policy as the deferred paths. Without this a
+           * permanently failing apply keeps the verdicts stored, and every
+           * later transform retries the same removal forever.
+           */
+          const verdictsRemain = entry.askVerdicts.size > 0;
+          if (verdictsRemain && !deferredRemoved) {
+            entry.deferredFailures += 1;
+            if (entry.deferredFailures >= 2) {
+              const droppedUnits = [...entry.askVerdicts.keys()];
+              for (const unitId of droppedUnits) {
+                entry.askVerdicts.delete(unitId);
+                entry.askedUnitIds.delete(unitId);
+                entry.retriedUnitIds.delete(unitId);
+                entry.refusedRetriedUnitIds.delete(unitId);
+              }
+              entry.deferredFailures = 0;
+              journal('ask-error', {
+                sessionId, origin: 'step', stage: 'deferred-drop',
+                unitIds: droppedUnits,
+                reason: 'two consecutive step applies failed; the stored verdicts are '
+                  + 'dropped and their units released so they are not retried on every '
+                  + 'later transform; a verdict an earlier apply already landed stays '
+                  + 'banked in the ledger and re-applies from there',
+              });
+            }
+          } else {
+            entry.deferredFailures = 0;
+          }
         }
+        // ISSUE-409: any drop this pass made (a stale compaction, a deferred
+        // give-up) is durable, so the next mount neither replays nor blocks.
+        entry.persistAskState();
       }
       // The estimate belongs to the array that will actually ship: a commit
       // changed it, so re-derive instead of describing the pre-commit bytes.
@@ -1961,8 +2991,65 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     return createHash('sha256').update(text, 'utf8').digest('hex');
   }
 
-  /** What one ask attempt did: a readable fire, an attempted send, or no table. */
-  type AskOutcome = 'fired' | 'attempted' | 'no-table';
+  /**
+   * The prompt digest when this context hook IS a timed-out ask re-entering
+   * (ISSUE-421), null otherwise. The transient `session.generate` request is
+   * one user message whose text is the ask prompt; the turn's own request
+   * carries a conversation, so the shape is the second half of the identity
+   * and a main request that merely holds the table as history never matches.
+   */
+  function abandonedAskPrompt(
+    entry: OpencodeSessionEntry, messages: readonly OpencodeMessage[],
+  ): string | null {
+    if (entry.abandonedAskPromptDigests.size === 0) return null;
+    if (messages.length !== 1) return null;
+    const only = messages[0];
+    if (only === undefined || only.role !== 'user') return null;
+    const text = only.content
+      .filter((part): part is OpencodeTextPart => part.type === 'text'
+        && typeof part['text'] === 'string')
+      .map(part => part.text)
+      .join('');
+    const digest = sha256Of(text);
+    return entry.abandonedAskPromptDigests.has(digest) ? digest : null;
+  }
+
+  /** One named line for an ask the durable ledger refuses (ISSUE-447). */
+  function journalAskStanddown(
+    entry: OpencodeSessionEntry, origin: 'step' | 'idle' | 'command',
+    reason: OpencodeAskStanddownReason,
+  ): void {
+    journal('ask-standdown', {
+      sessionId: entry.sessionId, origin, reason,
+      message: reason === 'ledger-unavailable'
+        ? 'the ledger read failed; standing down rather than paying for a table the '
+          + 'engine cannot apply'
+        : reason === 'recovery-pending'
+          ? 'an unfinished prepared intent is waiting for recovery; the engine would '
+            + 'answer recovery-pending'
+          : 'the breaker is disabled; the engine would answer breaker-open',
+    });
+  }
+
+  /**
+   * What one ask attempt did: a readable fire, an attempted send, no table, or
+   * a named guard refusal (ISSUE-468). A claim refusal is not the same fact as
+   * "nothing was tableable": the batch held rows and the ask was suppressed.
+   * ISSUE-486: a unit claim lives in the batch builder, so the refusal it
+   * causes is returned here as `claimed-unit`, a sibling of the revision claim,
+   * instead of being reported as an empty crossing.
+   */
+  type AskOutcome = 'fired' | 'attempted' | 'no-table' | 'claimed-revision'
+    | 'claimed-unit' | 'ask-in-flight';
+
+  /**
+   * ISSUE-486: the batch held tableable rows and every one was dropped by a
+   * durable unit claim, so no prompt was built. That is a named suppression,
+   * not an empty crossing, and the three lanes journal it as `claimed-unit`.
+   */
+  function unitClaimSuppressed(batch: OpencodeAskBatch | null): boolean {
+    return batch !== null && batch.rows.length === 0 && batch.dropped.asked > 0;
+  }
 
   /**
    * The prune table ask. One `session.generate` per depth crossing (or per
@@ -2014,16 +3101,28 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     // One ask at a time per session, and one ask per revision however the claim
     // moved. A host whose generate request re-enters this hook is stopped at
     // `transformStep`; this is the second lock.
-    if (entry.askInFlight) return { outcome: 'no-table', answers: new Map() };
+    if (entry.askInFlight) return { outcome: 'ask-in-flight', answers: new Map() };
     if (entry.askedRevisions.has(batch.revision)) {
-      return { outcome: 'no-table', answers: new Map() };
+      return { outcome: 'claimed-revision', answers: new Map() };
     }
     entry.askInFlight = true;
     try {
       return await askOnce(entry, origin, generate, batch);
     } finally {
       entry.askInFlight = false;
+      settleCompactionRearm(entry);
     }
+  }
+
+  /**
+   * Take a compaction's deferred latch re-arm once no ask and no apply is
+   * running (ISSUE-423). Safe to call on every window close: it does nothing
+   * when nothing was deferred or another window still holds the latch.
+   */
+  function settleCompactionRearm(entry: OpencodeSessionEntry): void {
+    if (!entry.compactionRearmDeferred || entry.askInFlight || entry.applyInFlight) return;
+    entry.compactionRearmDeferred = false;
+    if (entry.pruneTrigger.enabled) entry.pruneTrigger.noteNativeCompaction();
   }
 
   async function askOnce(
@@ -2037,6 +3136,14 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     // second delivery for the same array reaches neither a row nor a send.
     entry.askedRevisions.add(batch.revision);
     for (const unitId of batch.unitIds) entry.askedUnitIds.add(unitId);
+    // ISSUE-409: the claim is durable BEFORE the paid request leaves. A process
+    // death during the call then restores the revision and unit claims, so the
+    // unit is never generated a second time for a revision already asked.
+    entry.persistAskState();
+    // ISSUE-423: the ask carries the compaction generation it was built under.
+    // A compaction observed on the event lane while it runs bumps the entry's
+    // generation, and the reply is then refused by name instead of stored.
+    entry.askGeneration = entry.compactionGeneration;
     /**
      * The unit each TABLE row addresses, keyed by the pass index the row
      * carries. The table can leave gaps (a settled or unseen row is filtered),
@@ -2063,6 +3170,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     const startedAtMs = clock.nowMs();
     const claimed = {
       sessionId: entry.sessionId, origin, revision: batch.revision, grammar: askGrammar,
+      generation: entry.askGeneration,
       /** The pass round the answers are stamped with, not a separate fire count. */
       round: batch.round,
       cadence: entry.pruneTrigger.enabled ? 'depth' : 'per-revision',
@@ -2085,13 +3193,13 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       }
     };
     /**
-     * `terminal` is the timeout's policy. The host call is abandoned, not
-     * cancelled (`OpencodeGenerateInput` carries no AbortSignal), so releasing
-     * the units would let a later revision table and generate the same unit
-     * while the first call may still be running: two live ask requests and a
-     * spend that is either double-counted or unmeasured. A timeout therefore
-     * keeps the permanent claim and journals `retry: 'none'`, `terminal: true`.
-     * Every other ask-error stage keeps its one retry.
+     * `terminal` is the timeout's and the interrupt's policy. The host call is
+     * abandoned, not cancelled (`OpencodeGenerateInput` carries no AbortSignal),
+     * so releasing the units would let a later revision table and generate the
+     * same unit while the first call may still be running: two live ask requests
+     * and a spend that is either double-counted or unmeasured. Both a timeout
+     * and an interrupt therefore keep the permanent claim and journal `retry:
+     * 'none'`, `terminal: true`. Every other ask-error stage keeps its one retry.
      */
     const fail = (stage: string, message: string, extra: Record<string, unknown> = {},
       terminal = false): {
@@ -2104,31 +3212,101 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         ...(terminal ? { retry: 'none', terminal: true } : {}),
         ...extra,
       });
+      // ISSUE-409: a failed ask moved units into the retry record (or kept the
+      // terminal claim), so the durable identity follows it.
+      entry.persistAskState();
       return { outcome: 'attempted', answers: new Map() };
     };
     let text = '';
     let usage: OpencodeUsageRow | null = null;
     try {
       const call = generate({ sessionID: entry.sessionId, prompt: batch.prompt ?? '' });
-      const raced = await askWithinDeadline(call, askTimeoutMs);
-      if (raced.status === 'timeout') {
+      /**
+       * One abandoned call's obligation (ISSUE-396, ISSUE-410). Settlement
+       * releases it unless a late step row already consumed it: the counter is
+       * decremented by whichever arrives first, never twice.
+       */
+      const abandon = (): void => {
+        entry.abandonedAsks += 1;
+        const settled = (): void => {
+          if (entry.abandonedAsksConsumed > 0) entry.abandonedAsksConsumed -= 1;
+          else entry.abandonedAsks -= 1;
+        };
+        void call.then(settled, settled);
+      };
+      const raced = await (async () => {
+        /**
+         * ISSUE-413: the host's generate takes no `AbortSignal`, but the event
+         * stream reports `session.execution.interrupted` for this session. The
+         * waiter is registered only while the call runs; the event lane resolves
+         * it with the host's reason, so the ask stops waiting now instead of at
+         * the deadline.
+         */
+        let interruptReason = '';
+        let signalInterrupt: () => void = () => {};
+        const interrupted = new Promise<void>(resolve => { signalInterrupt = resolve; });
+        const onInterrupt = (reason: string): void => {
+          interruptReason = reason;
+          signalInterrupt();
+        };
+        entry.askInterrupts.add(onInterrupt);
+        try {
+          const race = await askWithinDeadline(call, askTimeoutMs, closed, interrupted);
+          return { race, interruptReason };
+        } finally {
+          entry.askInterrupts.delete(onInterrupt);
+        }
+      })();
+      if (raced.race.status === 'interrupted') {
+        /**
+         * A user (or shutdown/superseded) interrupt ended the turn. The host
+         * call cannot be cancelled, so it is abandoned exactly like a timeout:
+         * the units keep their permanent claim and no retry is offered, but the
+         * lane stops waiting and names the interrupt now.
+         */
+        entry.abandonedAskPromptDigests.add(promptSha256);
+        abandon();
+        return fail('interrupt',
+          `the session was interrupted (${raced.interruptReason || 'host'}) before the ask `
+          + 'replied; the host call cannot be cancelled, so the units stay claimed with no '
+          + 'retry',
+          { interruptReason: raced.interruptReason || 'host' }, true);
+      }
+      const race = raced.race;
+      if (race.status === 'closed') {
+        /**
+         * ISSUE-425: the mount closed while this ask was waiting with its
+         * deadline off. The host call is not cancelled (no `AbortSignal`), so
+         * it is abandoned like a timed-out one; teardown no longer waits on it.
+         */
+        abandon();
+        journal('ask-close', {
+          ...claimed, stage: 'close', durationMs: clock.nowMs() - startedAtMs,
+          applied: false, requestKind: 'ask',
+          abandonedPromptSha256: promptSha256,
+        });
+        return { outcome: 'attempted', answers: new Map() };
+      }
+      if (race.status === 'timeout') {
         /**
          * ISSUE-396: the abandoned call is not cancelled — it can still end a
          * step after the lock cleared. Count it until it truly settles so its
          * late unstated row stays in the ask lane and never pairs a main
          * estimate. The lane itself does not wait.
+         *
+         * ISSUE-421: the prompt digest survives the timeout and identifies the
+         * abandoned request if the host still delivers its context hook.
          */
-        entry.abandonedAsks += 1;
-        const settled = (): void => { entry.abandonedAsks -= 1; };
-        void call.then(settled, settled);
+        entry.abandonedAskPromptDigests.add(promptSha256);
+        abandon();
         return fail('timeout',
           `the ask produced no reply within ${String(askTimeoutMs)} ms; the request may still `
           + 'be running in the host, and this lane does not wait for it. The units stay claimed '
           + 'with no retry: a second generate for them could run beside the abandoned one',
           {}, true);
       }
-      if (raced.status === 'rejected') throw raced.error;
-      const answer = raced.value;
+      if (race.status === 'rejected') throw race.error;
+      const answer = race.value;
       text = typeof answer?.text === 'string' ? answer.text : '';
       if (answer?.usage !== undefined && answer.usage !== null) {
         const read = tokenUsageOf(answer.usage);
@@ -2169,8 +3347,41 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         { answerSha256: sha256Of(text), answerChars: text.length, answered, refused,
           codes: [...new Set(parsed.flatMap(row => (row.status === 'refused' ? [row.code] : [])))] });
     }
+    /**
+     * ISSUE-423: the host compacted while this ask was in flight. The reply
+     * describes rows of an array that no longer exists, so it is refused by
+     * name: no verdict is stored (no receipt can be recorded for the pre-ask
+     * array), no fire is counted, and the units are released so a later
+     * revision may table them again. The revision stays claimed, so the same
+     * array is not asked twice.
+     */
+    if (entry.compactionGeneration !== entry.askGeneration) {
+      for (const unitId of batch.unitIds) {
+        entry.askedUnitIds.delete(unitId);
+        entry.retriedUnitIds.delete(unitId);
+        entry.refusedRetriedUnitIds.delete(unitId);
+      }
+      journal('ask-error', {
+        ...claimed, stage: 'compaction',
+        generation: entry.compactionGeneration, askGeneration: entry.askGeneration,
+        answerSha256: sha256Of(text), answerChars: text.length,
+        durationMs: clock.nowMs() - startedAtMs,
+        applied: false, requestKind: 'ask',
+        message: 'the host compacted while this ask was in flight; the reply names an array '
+          + 'that no longer exists, so no verdict is stored and the units are released',
+      });
+      entry.persistAskState();
+      return { outcome: 'attempted', answers: new Map() };
+    }
     entry.askFires += 1;
     const outcome = bookkeepAnswers(entry, batch, parsed);
+    // ISSUE-423: the generation these verdicts were read under. A compaction
+    // before the apply makes them name a rewritten array, so the next transform
+    // drops them by name rather than recording receipts for the pre-ask array.
+    if (entry.askVerdicts.size > 0) entry.verdictGeneration = entry.askGeneration;
+    // ISSUE-409: a readable verdict is durable before this ask returns, so a
+    // process death between the reply and its apply loses nothing.
+    entry.persistAskState();
     const answers = new Map<UnitId, WireAnswer>();
     for (const row of parsed) {
       if (row.status !== 'answered') continue;
@@ -2241,6 +3452,13 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         return unitId === undefined ? [] : [[row.index, unitId] as const];
       }),
     );
+    /** The node each row addresses, so a restored verdict can be marked seen. */
+    const nodeByIndex = new Map<number, NodeId>(
+      batch.rows.flatMap((row, position) => {
+        const unitId = batch.unitIds[position];
+        return unitId === undefined ? [] : [[row.index, row.unit.nodeId] as const];
+      }),
+    );
     for (const row of parsed) {
       const unitId = unitByIndex.get(row.index);
       if (unitId === undefined) continue;
@@ -2249,6 +3467,12 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         if (row.answer.verdict.action === 'forgetall') {
           entry.askedUnitIds.add(unitId);
           entry.askVerdicts.set(unitId, row.answer);
+          // ISSUE-409: an unapplied verdict is durable from the moment it is
+          // read; a restart applies it instead of losing it.
+          const nodeId = nodeByIndex.get(row.index);
+          if (nodeId !== undefined) {
+            entry.durableAskVerdicts.set(unitId, { unitId, nodeId, answer: row.answer });
+          }
         } else {
           // `keepall`: tableable again at a later crossing; this revision is
           // still guarded by `askedRevisions`.
@@ -2277,31 +3501,58 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     return { kept, carried, excluded, terminal };
   }
 
+  /** One ask race's outcome: answered, interrupted, timed out, closed, or rejected. */
+  type AskRace<T> =
+    | { readonly status: 'answered'; readonly value: T }
+    | { readonly status: 'interrupted' }
+    | { readonly status: 'timeout' }
+    | { readonly status: 'closed' }
+    | { readonly status: 'rejected'; readonly error: unknown };
+
   /**
-   * Races one `session.generate` promise against the ask deadline. This host's
+   * Races one `session.generate` promise against the ask deadline, the mount's
+   * close signal, and the host's interrupt event (ISSUE-413). This host's
    * generate takes no `AbortSignal` (`host.ts` `OpencodeGenerateInput` is
    * `{sessionID, prompt}`), so the mount cannot cancel the host call; it stops
-   * WAITING for it, journals the timeout as an ask error, and never counts it as
-   * a fire. The timed-out promise is left to settle unobserved. The ask's units
-   * stay claimed (terminal): the abandoned call may still be running, so a
-   * later revision must not generate them a second time.
+   * WAITING for it, journals the timeout or interrupt as an ask error, and never
+   * counts it as a fire. The abandoned promise is left to settle unobserved. The
+   * ask's units stay claimed (terminal): the abandoned call may still be
+   * running, so a later revision must not generate them a second time.
+   *
+   * With the deadline off (`0`, ISSUE-425) no timer is built and the lane waits
+   * for the host; the close signal and the interrupt still end that wait, so
+   * teardown never hangs on a deadline-free ask. The signal is an event, not a
+   * cap. A declared deadline keeps its own bound and close drains it as before
+   * (ISSUE-356).
    */
   function askWithinDeadline<T>(
-    value: Promise<T>, timeoutMs: number,
-  ): Promise<{ readonly status: 'answered'; readonly value: T }
-    | { readonly status: 'timeout' }
-    | { readonly status: 'rejected'; readonly error: unknown }> {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      return value.then(resolved => ({ status: 'answered' as const, value: resolved }),
-        error => ({ status: 'rejected' as const, error }));
+    value: Promise<T>, timeoutMs: number, closeSignal: Promise<void>,
+    interruptSignal?: Promise<void>,
+  ): Promise<AskRace<T>> {
+    const settled: Promise<AskRace<T>> = value.then(
+      resolved => ({ status: 'answered' as const, value: resolved }),
+      error => ({ status: 'rejected' as const, error }));
+    const racers: Promise<AskRace<T>>[] = [settled];
+    /**
+     * ISSUE-413: the host's event stream is the reachable cancellation seam.
+     * When it reports an interrupt, the race ends as `interrupted`; the caller
+     * settles the ask then and there instead of waiting for the deadline.
+     */
+    if (interruptSignal !== undefined) {
+      racers.push(interruptSignal.then(() => ({ status: 'interrupted' as const })));
     }
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve({ status: 'timeout' }), Math.floor(timeoutMs));
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      racers.push(closeSignal.then(() => ({ status: 'closed' as const })));
+      return Promise.race(racers);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<AskRace<T>>((resolve) => {
+      timer = setTimeout(() => resolve({ status: 'timeout' }), Math.floor(timeoutMs));
       timer.unref?.();
-      value.then(
-        resolved => { clearTimeout(timer); resolve({ status: 'answered', value: resolved }); },
-        error => { clearTimeout(timer); resolve({ status: 'rejected', error }); },
-      );
+    });
+    racers.push(deadline);
+    return Promise.race(racers).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
     });
   }
   /**
@@ -2314,9 +3565,21 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    *
    * Returns `true` only when a readable table was journalled. With the ask off
    * there is no table to run; the command is still registered when the host
-   * exposes the seam and the journal says why it did nothing.
+   * exposes the seam and the journal says why it did nothing. A pass refused
+   * by the ask lock is named `ask-in-flight` and leaves the depth latch
+   * unchanged: it never completes a pass it did not run (ISSUE-412). A pass the
+   * durable ledger refuses is named `ask-standdown` for the same reason, before
+   * any host call is paid (ISSUE-447).
    */
   async function cremate(sessionId: string): Promise<boolean> {
+    // ISSUE-420 / ISSUE-407: no effect after cleanup, named so a journal says
+    // the command was refused because dispose had begun.
+    if (closing) {
+      if (!disposeComplete) {
+        journal('cremate', { sessionId: sessionId || null, fired: false, reason: 'closing' });
+      }
+      return false;
+    }
     const entry = sessions.get(sessionId);
     if (entry === undefined || entry.lastMessages === null) {
       journal('cremate', { sessionId: sessionId || null, fired: false,
@@ -2329,7 +3592,28 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     }
     let deferred = false;
     let buildThrew = false;
+    let skipped = false;
     try {
+      /**
+       * ISSUE-412: an ask already holds the lane, so this manual pass cannot
+       * run. It is NOT a completed pass: `askPass` would return `no-table`, and
+       * the old `finally` recorded that as a completion, re-arming the depth
+       * latch against a pass that never happened. The skip is named and the
+       * latch is left exactly where the in-flight ask's own pass put it.
+       */
+      if (entry.askInFlight) {
+        skipped = true;
+        journal('cremate', { sessionId, fired: false, reason: 'ask-in-flight' });
+        return false;
+      }
+      // ISSUE-447: a durable session the engine cannot apply a table to gets no
+      // paid host call. The standdown line is the command lane's named reason.
+      const standdown = await opencodeAskStanddown(entry.ledger, entry.sessionId);
+      if (standdown !== null) {
+        skipped = true;
+        journalAskStanddown(entry, 'command', standdown);
+        return false;
+      }
       entry.passRound += 1;
       /**
        * A unit first carried by the last sent request is eligible here: the
@@ -2346,6 +3630,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
           round: entry.passRound, classes: entry.dedupeClasses,
           appliedPlans: entry.appliedPlans,
+          ...(entry.preInstallNodes === null
+            ? {} : { excludeNodeIds: entry.preInstallNodes }),
         });
       } catch (error) {
         buildThrew = true;
@@ -2353,7 +3639,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           message: error instanceof Error ? error.message : String(error) });
       }
       if (batch === null || batch.prompt === null) {
-        journal('cremate', { sessionId, fired: false, reason: 'no-rows' });
+        // ISSUE-486: rows the durable unit claim dropped are a named
+        // suppression, not an empty request; `no-rows` stays for a pass that
+        // really carried none.
+        if (unitClaimSuppressed(batch)) {
+          journal('cremate', { sessionId, fired: false, reason: 'claimed-unit',
+            claims: batch?.dropped.asked ?? 0 });
+        } else {
+          journal('cremate', { sessionId, fired: false, reason: 'no-rows' });
+        }
         return false;
       }
       const sent = await askPass(entry, 'command', batch);
@@ -2364,7 +3658,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
        * pre-apply reading the baseline (audit 1).
        */
       deferred = fired && sent.answers.size > 0;
-      journal('cremate', { sessionId, fired, reason: fired ? 'table' : 'no-fire' });
+      // ISSUE-468: a claim or in-flight refusal is named; `no-fire` stays the
+      // reason a table pass ran and the model answered without a removal.
+      const refused = sent.outcome === 'claimed-revision' || sent.outcome === 'ask-in-flight';
+      journal('cremate', { sessionId, fired, reason: fired ? 'table' : refused ? sent.outcome : 'no-fire' });
       return fired;
     } catch (error) {
       journal('ask-error', { sessionId, origin: 'command', stage: 'command',
@@ -2375,7 +3672,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (deferred) {
         entry.deferredApply = true;
         entry.deferredFailures = 0;
-      } else if (entry.pruneTrigger.enabled && !buildThrew) {
+      } else if (!skipped && entry.pruneTrigger.enabled && !buildThrew) {
         // A pass that stored no removal still re-arms like any completed pass
         // (ADR-0050 decision 3): nothing will change the surface later. A build
         // that THREW is not a pass at all (ISSUE-359): the latch stays exactly
@@ -2416,27 +3713,62 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     let sent: { readonly outcome: AskOutcome;
       readonly answers: ReadonlyMap<UnitId, WireAnswer> } | null = null;
     let buildThrew = false;
+    let standdown: OpencodeAskStanddownReason | null = null;
     try {
       idleSnapshot = entry.port.observe(entry.lastMessages);
       crossed = entry.pruneTrigger.enabled
         ? observeDepth(entry, idleSnapshot, entry.lastPrefix) : true;
       if (crossed) {
-        entry.passRound += 1;
-        let batch: OpencodeAskBatch | null = null;
-        try {
-          batch = buildOpencodeAskBatch({
-            sessionId, messages: entry.lastMessages, port: entry.port,
-            seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
-            round: entry.passRound, classes: entry.dedupeClasses,
-            appliedPlans: entry.appliedPlans,
-          });
-        } catch (error) {
-          buildThrew = true;
-          journal('ask-error', { sessionId, origin: 'idle', stage: 'rows',
-            message: error instanceof Error ? error.message : String(error) });
-        }
-        if (batch !== null && batch.prompt !== null) {
-          sent = await askPass(entry, 'idle', batch);
+        // ISSUE-447: the same durable-health read the step lane makes, before
+        // the host is paid. A standdown is named, sends nothing, and leaves the
+        // crossing live for a later read.
+        standdown = await opencodeAskStanddown(entry.ledger, entry.sessionId);
+        if (standdown !== null) {
+          journalAskStanddown(entry, 'idle', standdown);
+        } else {
+          entry.passRound += 1;
+          let batch: OpencodeAskBatch | null = null;
+          try {
+            batch = buildOpencodeAskBatch({
+              sessionId, messages: entry.lastMessages, port: entry.port,
+              seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
+              round: entry.passRound, classes: entry.dedupeClasses,
+              appliedPlans: entry.appliedPlans,
+              ...(entry.preInstallNodes === null
+                ? {} : { excludeNodeIds: entry.preInstallNodes }),
+            });
+          } catch (error) {
+            buildThrew = true;
+            journal('ask-error', { sessionId, origin: 'idle', stage: 'rows',
+              message: error instanceof Error ? error.message : String(error) });
+          }
+          if (batch !== null && batch.prompt !== null) {
+            sent = await askPass(entry, 'idle', batch);
+          } else if (unitClaimSuppressed(batch)) {
+            // ISSUE-486: the rows the claim dropped are a named suppression.
+            sent = { outcome: 'claimed-unit', answers: new Map() };
+          }
+          // ISSUE-431: name a crossing that had nothing tableable, distinct from
+          // a suppressed ask; a build throw already journals its own ask-error.
+          // ISSUE-468: a claim or in-flight refusal is the suppression, by name.
+          if (sent === null) {
+            if (!buildThrew) {
+              journal('prune-outcome', { sessionId, origin: 'idle', outcome: 'no-eligible',
+                reason: 'the depth crossing held no tableable unit; no ask was sent and none '
+                  + 'was suppressed' });
+            }
+          } else if (sent.outcome === 'claimed-unit') {
+            journal('prune-outcome', { sessionId, origin: 'idle', outcome: sent.outcome,
+              claims: batch?.dropped.asked ?? 0,
+              reason: 'the depth crossing held a tableable unit, but no row survived the '
+                + 'durable unit claim' });
+          } else if (sent.outcome === 'claimed-revision' || sent.outcome === 'ask-in-flight') {
+            journal('prune-outcome', { sessionId, origin: 'idle', outcome: sent.outcome,
+              reason: 'the depth crossing held a tableable unit, but the ask was suppressed '
+                + (sent.outcome === 'claimed-revision'
+                  ? 'by a durable revision claim'
+                  : 'by an ask already in flight for this session') });
+          }
         }
       }
     } catch (error) {
@@ -2458,9 +3790,11 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
            */
           entry.deferredApply = true;
           entry.deferredFailures = 0;
-        } else if (sent === null && (entry.seenNodeIds.size === 0 || buildThrew)) {
-          // Nothing eligible, or the build threw (ISSUE-359): no pass ran,
-          // so the crossing stays live for the next above-bar reading.
+        } else if (sent === null
+          && (entry.seenNodeIds.size === 0 || buildThrew || standdown !== null)) {
+          // Nothing eligible, a build throw (ISSUE-359), or a durable-health
+          // standdown (ISSUE-447): no pass ran, so the crossing stays live for
+          // the next above-bar reading.
           entry.pruneTrigger.notePassSkipped();
         } else {
           entry.pruneTrigger.notePassCompleted();
@@ -2472,6 +3806,13 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
 
   /** One turn-end observation. The turn is complete, and no array can be committed. */
   async function idlePass(sessionId: string): Promise<void> {
+    // ISSUE-407: refuse once close() has started, with a named reason.
+    if (closing) {
+      if (!disposeComplete) {
+        journal('at-rest', { sessionId, reason: 'closing', status: 'skipped' });
+      }
+      return;
+    }
     const entry = sessions.get(sessionId);
     // A session this mount never transformed has no array and no estimate; the
     // idle is a fact about a session the adapter has not met yet.
@@ -2529,6 +3870,13 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * path, where the ISSUE-353 turn-ordinal guard reads it.
    */
   async function idleHookAsk(sessionId: string): Promise<void> {
+    // ISSUE-407: refuse once close() has started, with a named reason.
+    if (closing) {
+      if (!disposeComplete) {
+        journal('at-rest', { sessionId, reason: 'closing', status: 'skipped' });
+      }
+      return;
+    }
     const entry = sessions.get(sessionId);
     if (entry === undefined || entry.lastMessages === null) return;
     // A nested ask's own idle hook firing is not a second pass: the ask that
@@ -2537,6 +3885,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     await idleAsk(entry, sessionId);
   }
   async function event(value: OpencodeHostEvent): Promise<void> {
+    // ISSUE-420: a delivered event after cleanup has no effect.
+    if (closing) return;
     const type = typeof value?.type === 'string' ? value.type : '';
     const data = isRecord(value?.data) ? value.data : {};
     const sessionId = typeof data['sessionID'] === 'string' ? data['sessionID'] : null;
@@ -2545,6 +3895,21 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       return;
     }
     if (sessionId === null) return;
+    if (type === 'session.execution.interrupted') {
+      /**
+       * ISSUE-413: the host names a turn interrupt on its event stream. Resolve
+       * every ask waiting on this session so it settles as a typed refusal now,
+       * not at the deadline. The host call itself is abandoned like a timeout
+       * because `generate` takes no `AbortSignal`.
+       */
+      const entry = sessions.get(sessionId);
+      if (entry !== undefined && entry.askInterrupts.size > 0) {
+        const reason = typeof data['reason'] === 'string' ? data['reason'] : 'user';
+        for (const interrupt of entry.askInterrupts) interrupt(reason);
+        entry.askInterrupts.clear();
+      }
+      return;
+    }
     if (type === 'session.idle') {
       await idlePass(sessionId);
       return;
@@ -2553,19 +3918,37 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       || type === 'session.compaction.ended' || type === 'session.compaction.failed') {
       const phase = type.slice('session.compaction.'.length);
       const text = data['text'];
-      journal('compacted', { sessionId, phase,
-        ...(data['reason'] === undefined ? {} : { reason: data['reason'] }),
-        ...(data['cost'] === undefined ? {} : { costUsd: costOf(data['cost']) }),
-        ...(data['tokens'] === undefined ? {} : { tokens: data['tokens'] }),
-        ...(typeof text === 'string' ? { textLength: text.length } : {}),
-        ...(data['error'] === undefined ? {} : { error: data['error'] }),
-      });
-      // A native compaction rewrote the surface. Re-arm the depth latch as a
-      // fresh session (ADR-0050 decision 3 / Issue-022 DoD): the next above-bar
-      // reading fires, exactly like a first trigger on a new session.
-      if (phase === 'ended') {
-        const entry = sessions.get(sessionId);
-        if (entry !== undefined) {
+      const entry = sessions.get(sessionId);
+      /**
+       * ISSUE-423: `started` and `ended` each bump the compaction generation — a
+       * reply read after either describes an array the host may have rewritten.
+       * `delta`/`failed` do not: a failed or partial compaction leaves the
+       * recorded fact alone. The re-arm on `ended` is the shipped backstop
+       * (ADR-0050 decision 3 / ISSUE-022 DoD); when an ask or its deferred apply
+       * is running it is DEFERRED to that window's end, so a second above-bar
+       * ask is never armed from inside the first one's ask/apply.
+       */
+      if (entry !== undefined && (phase === 'started' || phase === 'ended')) {
+        entry.compactionGeneration += 1;
+      }
+      /**
+       * A native compaction rewrote the surface. Re-arm the depth latch as a
+       * fresh session (ADR-0050 decision 3 / Issue-022 DoD): the next above-bar
+       * reading fires, exactly like a first trigger on a new session. When an
+       * ask or its deferred apply is running the re-arm is DEFERRED to that
+       * window's end (ISSUE-423) and named on the same line.
+       */
+      let deferred = false;
+      if (phase === 'ended' && entry !== undefined) {
+        if (entry.askInFlight || entry.applyInFlight) {
+          entry.compactionRearmDeferred = true;
+          deferred = true;
+          journal('compaction-deferred', { sessionId,
+            generation: entry.compactionGeneration,
+            window: entry.askInFlight ? 'ask' : 'apply',
+            reason: 'a compaction ended while an ask or apply was running; the latch re-arms '
+              + 'at that window\'s end, never mid-flight' });
+        } else {
           entry.pruneTrigger.noteNativeCompaction();
           /**
            * The compaction rewrote the surface, so the last idle's turn fact may
@@ -2583,6 +3966,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           entry.port.clearCompletedTurnFact?.();
         }
       }
+      journal('compacted', { sessionId, phase,
+        ...(entry === undefined ? {} : { generation: entry.compactionGeneration }),
+        ...(phase === 'ended' ? { rearmed: !deferred, ...(deferred ? { deferred: true } : {}) } : {}),
+        ...(data['reason'] === undefined ? {} : { reason: data['reason'] }),
+        ...(data['cost'] === undefined ? {} : { costUsd: costOf(data['cost']) }),
+        ...(data['tokens'] === undefined ? {} : { tokens: data['tokens'] }),
+        ...(typeof text === 'string' ? { textLength: text.length } : {}),
+        ...(data['error'] === undefined ? {} : { error: data['error'] }),
+      });
     }
     // Unknown event types are ignored, never guessed at. `session.deleted` is
     // handled by the tracked wrapper below: its eviction drains the mount's
@@ -2596,6 +3988,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * ships.
    */
   async function afterTool(input: OpencodeAfterToolInput): Promise<void> {
+    if (closing) return;
     const sessionId = typeof input.sessionID === 'string' ? input.sessionID : '';
     const callId = typeof input.id === 'string' ? input.id : '';
     const tool = typeof input.tool === 'string' ? input.tool : '';
@@ -2645,9 +4038,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   }
 
   const baseTool = createOpencodeTool({ recall: recallRecord });
+  /**
+   * The disposed answer a tool gives after cleanup (ISSUE-420): a plain tool
+   * result, so a stale recall never throws outward and never touches state.
+   */
+  const disposedToolResult = Object.freeze({
+    content: 'cremator: this mount has been disposed; no ledger is open',
+  });
   const tool: OpencodeToolDefinition = Object.freeze({
     ...baseTool,
     execute: async (input: unknown, context: Parameters<OpencodeToolDefinition['execute']>[1]) => {
+      if (closing) return disposedToolResult;
       if (typeof context?.sessionID === 'string' && context.sessionID.length > 0) {
         activeSessionId = context.sessionID;
       }
@@ -2663,6 +4064,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       ...forgetBase,
       execute: async (input: unknown,
         context: Parameters<OpencodeToolDefinition['execute']>[1]) => {
+        if (closing) return disposedToolResult;
         if (typeof context?.sessionID === 'string' && context.sessionID.length > 0) {
           activeSessionId = context.sessionID;
         }
@@ -2693,13 +4095,16 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     }),
     revertHistory: declared.revertHistory === true, node: process.version });
 
-  return {
+  const mount: OpencodeMount = {
     sessions,
     tool,
     forgetTool,
-    transform: (sessionId, messages, context) => track(transformStep(sessionId, messages, context)),
-    forget: (sessionId, args) => track(forgetRequest(sessionId, args)),
+    transform: (sessionId, messages, context) => track(
+      transformStep(sessionId, messages, context), sessionId),
+    forget: (sessionId, args) => track(forgetRequest(sessionId, args), sessionId),
     event: value => {
+      // ISSUE-420: a delivered event after cleanup has no effect.
+      if (closing) return Promise.resolve();
       /**
        * `session.deleted` (ISSUE-379) is handled here, around the tracked
        * event, because the eviction must drain the mount's in-flight work
@@ -2708,24 +4113,33 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
        * against the installed @opencode SDK).
        */
       let work: Promise<void> | undefined;
+      /**
+       * ISSUE-408: the event is tagged with the session its payload names, so a
+       * `session.deleted` drains only that session's in-flight work.
+       */
+      const eventData = isRecord(value?.data) ? value.data : {};
+      const eventSessionId = typeof eventData['sessionID'] === 'string'
+        ? eventData['sessionID'] : null;
       work = track((async () => {
         await event(value);
         if (value?.type !== 'session.deleted') return;
         const data = isRecord(value.data) ? value.data : {};
         const sessionId = typeof data['sessionID'] === 'string' ? data['sessionID'] : null;
         if (sessionId === null) return;
-        await drainInFlight(work);
+        await drainSessionInFlight(sessionId, work);
         if (await releaseSession(sessionId)) {
           journal('session-evicted', { sessionId, reason: 'session.deleted' });
         }
-      })());
+      })(), eventSessionId);
       return work;
     },
-    afterTool: input => track(afterTool(input)),
-    cremate: sessionId => track(cremate(sessionId)),
-    idle: sessionId => track(idleHookAsk(sessionId)),
+    afterTool: input => track(afterTool(input),
+      typeof input?.sessionID === 'string' ? input.sessionID : null),
+    cremate: sessionId => track(cremate(sessionId), sessionId),
+    idle: sessionId => track(idleHookAsk(sessionId), sessionId),
     get idleAskOnEvent(): boolean { return idleAskOnEvent; },
     set idleAskOnEvent(value: boolean) { idleAskOnEvent = value; },
+    get disposed(): boolean { return closing; },
     close: async () => {
       // Drain in-flight transforms and asks before closing the ledgers
       // (ISSUE-356): a post-dispose ask resolution must not write a closed
@@ -2735,10 +4149,25 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       // a ledger-close await neither transforms a closing entry nor re-opens a
       // released one.
       closing = true;
+      // ISSUE-425: stop waiting on a deadline-free ask before draining, so
+      // teardown terminates even when the host's generate never settles.
+      signalClose();
       await drainInFlight();
       for (const sessionId of [...sessions.keys()]) await releaseSession(sessionId);
+      // ISSUE-420: cleanup clears the session pointer, so no later callback can
+      // name a released session and no post-dispose call can reopen one.
+      activeSessionId = null;
+      // ISSUE-424: the durable configuration is free again once the mount closes.
+      if (registryKey !== null && activeMounts.get(registryKey) === mount) {
+        activeMounts.delete(registryKey);
+      }
+      // ISSUE-407: from here on a post-dispose call writes no journal line
+      // (the ISSUE-420 contract); the in-progress refusal lines stop.
+      disposeComplete = true;
     },
   };
+  if (registryKey !== null) activeMounts.set(registryKey, mount);
+  return mount;
 }
 
 /**
@@ -2763,6 +4192,19 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
         throw new TypeError('cremator: crematorAskGrammar is on but this host exposes no '
           + 'session.generate; the bench-only ask cannot be mounted');
       }
+      // ISSUE-432: the host's model catalog names the window a newly selected
+      // model declares, so a mid-session switch can be journalled with it. The
+      // operator's configured window is still authoritative and is not replaced.
+      const catalog = context.model;
+      const resolveModelWindow = merged.resolveModelWindow
+        ?? (typeof catalog?.get === 'function'
+          ? (ref: OpencodeModelRef): number | null => {
+            if (ref.provider === null || ref.model === null) return null;
+            const declared = catalog.get(ref.provider, ref.model)?.limit?.context;
+            return typeof declared === 'number' && Number.isSafeInteger(declared) && declared > 0
+              ? declared : null;
+          }
+          : undefined);
       // One sink for every line this mount writes, including the two the plugin
       // itself emits when a seam fails to register or its event stream throws.
       const emit = merged.journal
@@ -2770,113 +4212,172 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
       const mount = createOpencodeMount({
         ...merged, journal: emit,
         ...(askGenerate === undefined ? {} : { askGenerate }),
-      });
-      await context.session.hook('context', async (input: OpencodeSessionContext) => {
-        if (merged.excludeTools !== undefined && input.tools !== undefined) {
-          for (const name of merged.excludeTools) delete input.tools[name];
-        }
-        const prefix = input.system === undefined && input.tools === undefined
-          ? null
-          : {
-            ...(input.system === undefined ? {} : { system: input.system }),
-            ...(input.tools === undefined ? {} : { tools: input.tools }),
-          };
-        await mount.transform(input.sessionID, input.messages, prefix);
+        ...(resolveModelWindow === undefined ? {} : { resolveModelWindow }),
       });
       /**
-       * The awaited idle seam (ADR-0062 D2, ISSUE-373): the host awaits this
-       * hook inside its single drain, so the idle-origin ask blocks queued
-       * prompts the way the step ask blocks inside the context hook. A host
-       * that predates the hook refuses the registration; the mount then keeps
-       * the `session.idle` event-path fallback, and the refusal is journalled.
+       * ISSUE-420: setup is one transaction. Every registration below runs
+       * inside this try; a throw from a required seam stops the consumer, closes
+       * the mount — which makes every already-registered callback inert — and
+       * rethrows. The context hook registers after every required seam and
+       * before the tolerated idle registration, so a failure in a required step
+       * leaves no context hook behind and a host retry registers exactly one.
        */
-      try {
-        await context.session.hook('experimental.idle', async (input: OpencodeIdleHookInput) => {
-          await mount.idle(typeof input?.sessionID === 'string' ? input.sessionID : '');
-        });
-        mount.idleAskOnEvent = false;
-      } catch (error) {
-        try {
-          emit(Object.freeze({ kind: 'idle-hook-error', atMs: Date.now(),
-            reason: 'register-failed',
-            message: error instanceof Error ? error.message : String(error) }));
-        } catch { /* a journal sink must never change an outcome */ }
-      }
-      await context.tool.hook('execute.after', input => mount.afterTool(input));
-      try {
-        await context.tool.transform((editor) => {
-          editor.add(mount.tool);
-          if (mount.forgetTool !== null) editor.add(mount.forgetTool);
-        });
-      } catch (error) {
-        // The passive seams still work without the tool; say so instead of
-        // failing the whole mount.
-        try {
-          emit(Object.freeze({ kind: 'tool-error', atMs: Date.now(),
-            reason: 'register-failed',
-            message: error instanceof Error ? error.message : String(error) }));
-        } catch { /* a journal sink must never change an outcome */ }
-      }
-      /**
-       * The manual `/cremate` command (2.2.5's `Context.command`, the seam the
-       * audit named as unused). It runs the mount's same table pass on demand.
-       * A host without the seam still mounts; a throwing registration is
-       * journalled and leaves the hooks working.
-       */
-      if (context.command !== undefined) {
-        try {
-          await context.command.transform((editor) => {
-            editor.add({
-              name: OPENCODE_PRUNE_COMMAND,
-              description: 'Run one CREMATOR table pass now.',
-              execute: async (input) => {
-                const id = typeof input?.sessionID === 'string' ? input.sessionID : '';
-                await mount.cremate(id);
-              },
-            });
-          });
-        } catch (error) {
-          try {
-            emit(Object.freeze({ kind: 'command-error', atMs: Date.now(),
-              reason: 'register-failed',
-              message: error instanceof Error ? error.message : String(error) }));
-          } catch { /* a journal sink must never change an outcome */ }
-        }
-      }
-      const types = [
-        'session.idle',
-        'session.deleted',
-        'session.step.ended',
-        'session.compaction.started',
-        'session.compaction.delta',
-        'session.compaction.ended',
-        'session.compaction.failed',
-      ];
-      const iterator = context.event.subscribe({ types })[Symbol.asyncIterator]();
+      let iterator: AsyncIterator<OpencodeHostEvent> | null = null;
       let stopped = false;
-      const loop = (async () => {
-        try {
-          while (!stopped) {
-            const next = await iterator.next();
-            if (next.done) break;
-            await mount.event(next.value);
-          }
-        } catch (error) {
-          try {
-            emit(Object.freeze({ kind: 'event-error', atMs: Date.now(),
-              message: error instanceof Error ? error.message : String(error) }));
-          } catch { /* a journal sink must never change an outcome */ }
-        }
-      })();
-      return async () => {
+      let loop: Promise<void> | null = null;
+      const stopLoop = async (): Promise<void> => {
         stopped = true;
-        try { await iterator.return?.(); } catch { /* already closed */ }
+        try { await iterator?.return?.(); } catch { /* already closed */ }
+        if (loop === null) return;
         // A host iterable that does not answer `return()` may leave `next()`
-        // waiting; cleanup must still finish and close the ledger.
+        // waiting; teardown must still finish and close the ledger.
         await Promise.race([
           loop.catch(() => {}),
           new Promise<void>(resolve => { setTimeout(resolve, 250); }),
         ]);
+      };
+      try {
+        await context.tool.hook('execute.after', async (input) => {
+          if (mount.disposed) return;
+          await mount.afterTool(input);
+        });
+        try {
+          await context.tool.transform((editor) => {
+            editor.add(mount.tool);
+            if (mount.forgetTool !== null) editor.add(mount.forgetTool);
+          });
+        } catch (error) {
+          // The passive seams still work without the tool; say so instead of
+          // failing the whole mount.
+          try {
+            emit(Object.freeze({ kind: 'tool-error', atMs: Date.now(),
+              reason: 'register-failed',
+              message: error instanceof Error ? error.message : String(error) }));
+          } catch { /* a journal sink must never change an outcome */ }
+        }
+        /**
+         * The manual `/cremate` command (2.2.5's `Context.command`, the seam the
+         * audit named as unused). It runs the mount's same table pass on demand.
+         * A host without the seam still mounts; a throwing registration is
+         * journalled and leaves the hooks working.
+         */
+        if (context.command !== undefined) {
+          try {
+            await context.command.transform((editor) => {
+              editor.add({
+                name: OPENCODE_PRUNE_COMMAND,
+                description: 'Run one CREMATOR table pass now.',
+                execute: async (input) => {
+                  if (mount.disposed) return;
+                  const id = typeof input?.sessionID === 'string' ? input.sessionID : '';
+                  await mount.cremate(id);
+                },
+              });
+            });
+          } catch (error) {
+            try {
+              emit(Object.freeze({ kind: 'command-error', atMs: Date.now(),
+                reason: 'register-failed',
+                message: error instanceof Error ? error.message : String(error) }));
+            } catch { /* a journal sink must never change an outcome */ }
+          }
+        }
+        /**
+         * ISSUE-411: subscribe and start the consumer BEFORE the idle hook
+         * registers and `idleAskOnEvent` flips. A `session.idle` delivered
+         * during registration is then consumed by the event path (which still
+         * owns the ask) instead of being lost between the two host calls.
+         */
+        const types = [
+          'session.idle',
+          'session.deleted',
+          'session.step.ended',
+          // ISSUE-413: the host's interrupt notice is the ask's cancellation
+          // seam (the generate call itself takes no AbortSignal).
+          'session.execution.interrupted',
+          'session.compaction.started',
+          'session.compaction.delta',
+          'session.compaction.ended',
+          'session.compaction.failed',
+        ];
+        const source = context.event.subscribe({ types })[Symbol.asyncIterator]();
+        iterator = source;
+        loop = (async () => {
+          try {
+            while (!stopped) {
+              const next = await source.next();
+              if (next.done) break;
+              if (mount.disposed) return;
+              await mount.event(next.value);
+            }
+          } catch (error) {
+            try {
+              emit(Object.freeze({ kind: 'event-error', atMs: Date.now(),
+                message: error instanceof Error ? error.message : String(error) }));
+            } catch { /* a journal sink must never change an outcome */ }
+          }
+        })();
+        /**
+         * The context hook registers after every required step succeeded, so a
+         * retried setup after an earlier failure registers exactly one, and an
+         * already-registered hook checks `disposed` so cleanup leaves it inert.
+         * ISSUE-482: it registers BEFORE the tolerated idle registration below,
+         * so a request the host serves while `experimental.idle` is still
+         * registering reaches a live mount and the `idleAskOnEvent` window owns
+         * a real session, not a mount that never saw a request.
+         */
+        await context.session.hook('context', async (input: OpencodeSessionContext) => {
+          if (mount.disposed) return;
+          if (merged.excludeTools !== undefined && input.tools !== undefined) {
+            for (const name of merged.excludeTools) delete input.tools[name];
+          }
+          const requestContext = input.system === undefined
+            && input.tools === undefined && input.model === undefined
+            ? null
+            : {
+              ...(input.system === undefined ? {} : { system: input.system }),
+              ...(input.tools === undefined ? {} : { tools: input.tools }),
+              // ISSUE-432: the model this request is built for, so a
+              // provider/model switch mid-session is observable.
+              ...(input.model === undefined ? {} : { model: input.model }),
+            };
+          await mount.transform(input.sessionID, input.messages, requestContext);
+        });
+        /**
+         * The awaited idle seam (ADR-0062 D2, ISSUE-373): the host awaits this
+         * hook inside its single drain, so the idle-origin ask blocks queued
+         * prompts the way the step ask blocks inside the context hook. A host
+         * that predates the hook refuses the registration; the mount then keeps
+         * the `session.idle` event-path fallback, and the refusal is journalled.
+         */
+        try {
+          await context.session.hook('experimental.idle', async (input: OpencodeIdleHookInput) => {
+            if (mount.disposed) return;
+            await mount.idle(typeof input?.sessionID === 'string' ? input.sessionID : '');
+          });
+          mount.idleAskOnEvent = false;
+          // ISSUE-411: mark the hook as registered, so a journal can tell a
+          // host that accepted it from one that never called it.
+          try {
+            emit(Object.freeze({ kind: 'idle-hook', atMs: Date.now(),
+              registered: true, askPath: 'hook' }));
+          } catch { /* a journal sink must never change an outcome */ }
+        } catch (error) {
+          try {
+            emit(Object.freeze({ kind: 'idle-hook-error', atMs: Date.now(),
+              reason: 'register-failed',
+              message: error instanceof Error ? error.message : String(error) }));
+          } catch { /* a journal sink must never change an outcome */ }
+        }
+      } catch (error) {
+        // A required seam failed: stop the consumer, close the mount so every
+        // registered callback is inert, then let the host see the failure.
+        await stopLoop();
+        await mount.close().catch(() => {});
+        throw error;
+      }
+      return async () => {
+        await stopLoop();
         await mount.close();
       };
     },

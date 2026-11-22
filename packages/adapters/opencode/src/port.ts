@@ -158,6 +158,20 @@ export interface OpencodePortOptions extends OpencodePortSnapshotOptions {
    * takes.
    */
   readonly appliedPlans?: readonly OpencodeAppliedPlan[];
+  /**
+   * The host receipts a previous process minted for this session, read back
+   * from the mount's durable state (ISSUE-448; ADR-0064). They let `lookupReceipt`
+   * resolve a prepared ledger row the previous process landed instead of
+   * answering `unknown` and blocking recovery forever.
+   */
+  readonly receipts?: readonly ApplyReceipt[];
+  /**
+   * Called once per receipt this port mints, at the host write (`commit()`)
+   * and before the engine's own `applied` ledger row (ISSUE-448). A death
+   * between the two therefore leaves a durable receipt the remount can answer
+   * from. Fail-open: a throwing callback never changes the apply's outcome.
+   */
+  readonly persistReceipt?: (receipt: ApplyReceipt) => void;
 }
 
 interface StagedCommit {
@@ -310,6 +324,14 @@ export class OpencodeApplicationPort implements ApplicationPort {
   /** The caller's array, by reference: `commit()` mutates this object in place. */
   private messages: OpencodeMessage[];
   private readonly receipts = new Map<IntentId, ApplyReceipt>();
+  /**
+   * The receipts a previous process minted, read back from the mount's durable
+   * state (ISSUE-448; ADR-0064). Kept apart from `this.receipts`: a durable
+   * receipt names a host write the previous process landed, so it answers
+   * `applied` without this process's `committedIntents` guard.
+   */
+  private readonly durableReceipts = new Map<IntentId, ApplyReceipt>();
+  private readonly persistReceipt: OpencodePortOptions['persistReceipt'];
   /** Intents whose staged array `commit()` actually spliced onto the caller's array. */
   private readonly committedIntents = new Set<IntentId>();
   /** The applied-plan index (plan §4): a read cache seeded from the ledger at open. */
@@ -361,6 +383,11 @@ export class OpencodeApplicationPort implements ApplicationPort {
       const applicationSha256 = seededApplicationShaOf(plan);
       if (applicationSha256 !== null) this.seededApplications.set(plan.intentId, applicationSha256);
     }
+    // Durable receipts answer a prepared row a prior process landed (ISSUE-448).
+    for (const receipt of options.receipts ?? []) {
+      this.durableReceipts.set(receipt.intentId, receipt);
+    }
+    this.persistReceipt = options.persistReceipt;
     // Fail at construction, not at the first request: an array the projection
     // cannot read (a duplicate id, a bad session id) is a mount bug worth naming.
     this.derive(this.messages);
@@ -671,6 +698,10 @@ export class OpencodeApplicationPort implements ApplicationPort {
     if (staged.receipt !== null) {
       this.committedIntents.add(staged.intentId);
       if (staged.plan !== null) this.applied.set(staged.intentId, staged.plan);
+      // The host write is the boundary the durable receipt must survive: a
+      // process death before the engine records `applied` leaves a receipt the
+      // remount resolves the prepared row with (ISSUE-448; ADR-0064).
+      try { this.persistReceipt?.(staged.receipt); } catch { /* the mount names its own failure */ }
     }
     return true;
   }
@@ -700,10 +731,15 @@ export class OpencodeApplicationPort implements ApplicationPort {
     // array it was derived from has not been handed to the host, so the lookup
     // answers `unknown` until the splice lands.
     const receipt = this.receipts.get(intentId);
-    if (receipt === undefined || !this.committedIntents.has(intentId)) {
-      return { status: 'unknown' };
+    if (receipt !== undefined && this.committedIntents.has(intentId)) {
+      return { status: 'applied', receipt };
     }
-    return { status: 'applied', receipt };
+    // A receipt a previous process minted is a host record already, so the
+    // durable set answers it for a remount's recovery instead of leaving the
+    // prepared row blocked forever (ISSUE-448; ADR-0064).
+    const durable = this.durableReceipts.get(intentId);
+    if (durable !== undefined) return { status: 'applied', receipt: durable };
+    return { status: 'unknown' };
   }
 }
 

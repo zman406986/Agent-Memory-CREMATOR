@@ -52,6 +52,28 @@ export interface CapturedMainRequest {
   readonly systemFromMessage: boolean;
   readonly droppedMessages: number;
   readonly droppedBlocks: number;
+  /**
+   * The route this request was dispatched under, when the host names one
+   * (ISSUE-432). The seed is a message list, but a mid-session model switch
+   * makes a captured prefix belong to the old model; both ask lanes compare
+   * these against the live route and refuse a stale seed by name instead of
+   * serving it silently (ISSUE-432, ISSUE-470). `null` means the request stated
+   * no provider/model.
+   */
+  readonly provider: string | null;
+  readonly model: string | null;
+}
+
+/**
+ * True when a capture names a route the live route contradicts (ISSUE-432,
+ * ISSUE-470). One rule for both ask lanes: a capture that states no route (an
+ * older host) stays usable, because absence is not evidence.
+ */
+export function seedRouteStale(captured: CapturedMainRequest,
+  route: { readonly provider: string; readonly model: string } | null): boolean {
+  if (route === null) return false;
+  return (captured.provider !== null && captured.provider !== route.provider)
+    || (captured.model !== null && captured.model !== route.model);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -136,7 +158,9 @@ export function captureMainRequest(options: unknown): CapturedMainRequest | null
   }
   const wire: WireRequest = { system, tools, messages: turns };
   return { wire, seedHash: wireRequestHash(wire), systemFromMessage: false,
-    droppedMessages, droppedBlocks };
+    droppedMessages, droppedBlocks,
+    provider: typeof options['provider'] === 'string' ? options['provider'] : null,
+    model: typeof options['model'] === 'string' ? options['model'] : null };
 }
 
 /** The per-session store of the last request main dispatched. */
@@ -152,6 +176,12 @@ export interface MainWireCapture {
    * is a no-op.
    */
   evict(sessionId: string): void;
+  /**
+   * Every session id the store holds a capture for (ISSUE-455). The mount's
+   * shutdown enumerates its per-session maps, and a request seen before any
+   * `session/event` exists only here; without this the id escaped eviction.
+   */
+  sessionIds(): string[];
 }
 
 /**
@@ -176,6 +206,9 @@ export function createMainWireCapture(): MainWireCapture {
     },
     evict(sessionId) {
       bySession.delete(sessionId);
+    },
+    sessionIds() {
+      return [...bySession.keys()];
     },
   };
 }

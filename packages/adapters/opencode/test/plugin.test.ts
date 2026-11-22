@@ -12,7 +12,7 @@
 // Every assertion names its row, so a red run says which seam broke.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -20,7 +20,9 @@ import {
   DEFAULT_CONFIG, PRUNE_ASK_FINAL_LINE, PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT,
   CharHeuristicTokenMeter, Meter, UnitTracker, revertBytes, sha256Sync, toBytes,
 } from '@cremator/core';
-import type { ApplyRequest, ApplyResult, ValidatedRevert, WireAnswer } from '@cremator/core';
+import type {
+  ApplyRequest, ApplyResult, Ledger, LedgerEvent, ValidatedRevert, WireAnswer,
+} from '@cremator/core';
 import {
   OPENCODE_FORGOTTEN_NODE_FIELD, OPENCODE_RECEIPT_OF_FIELD, deriveOpencodeRevert,
   opencodeReceiptEntryId, opencodeReceiptTextWithPass,
@@ -36,7 +38,7 @@ import type {
 import {
   OPENCODE_PRUNE_COMMAND, OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
   appliedRewritesAt, applyOpencodeAskVerdicts, createOpencodeMount, createOpencodePlugin,
-  mountOptionsFromHost, releaseCancelledUnits,
+  mountOptionsFromHost, opencodeAskStanddown, releaseCancelledUnits,
 } from '../src/plugin.js';
 import type {
   OpencodeJournalKind, OpencodeJournalRecord, OpencodeMountPort,
@@ -3006,6 +3008,84 @@ test('a permanently failing deferred apply drops once and unfreezes the depth tr
     } finally { await mount.close(); }
   });
 
+test('ISSUE-431: a permanently failing step-origin apply retries once and drops',
+  async () => {
+    /*
+     * A step fire (not an idle or `/cremate` deferred pass) whose apply keeps
+     * failing must follow the same one-retry-then-drop rule: otherwise the
+     * stored verdicts remain and every later transform retries forever.
+     */
+    const lines = journalLines();
+    const calls: OpencodeGenerateInput[] = [];
+    const mount = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      contextWindowTokens: 600_000,
+      pruneThresholdTokens: 60_000,
+      askGrammar: 'prune-two-option',
+      askGenerate: async (input) => {
+        calls.push(input);
+        const prompt = String(input.prompt ?? '');
+        return { text: /^2\. \[/mu.test(prompt)
+          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+      },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      const { messages } = await rearmSetup(mount);
+      const entry = mount.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the context hook built the session');
+      const engine = entry.engine;
+      const original = engine.process.bind(engine);
+      let pruneCalls = 0;
+      engine.process = async (input, control) => {
+        if (input.kind === 'prune') {
+          pruneCalls += 1;
+          throw new Error(`injected step prune failure ${String(pruneCalls)}`);
+        }
+        return original(input, control);
+      };
+      // The step transform itself fires and its apply fails.
+      await mount.transform(sessionId, messages);
+      assert.equal(calls.length, 1, 'the step pass sent its ask');
+      assert.equal(entry.deferredApply, false, 'a step fire is never a deferred pass');
+      assert.equal(entry.deferredFailures, 1, 'the first failure is the one retry');
+      assert.equal(entry.askVerdicts.size, 1, 'the verdict survives the first failure');
+      // The retry fails too: drop the verdicts and stop retrying.
+      await mount.transform(sessionId, messages);
+      assert.equal(entry.deferredFailures, 0, 'the drop resets the failure counter');
+      assert.equal(entry.askVerdicts.size, 0, 'the stored verdicts are dropped');
+      const drop = lines.of('ask-error').find(line => line['stage'] === 'deferred-drop');
+      assert.ok(drop !== undefined, 'the drop is a named ask-error');
+      assert.match(String(drop['reason']), /two consecutive step applies failed/u);
+      assert.equal(pruneCalls, 2, 'the second failure drops instead of retrying');
+      await mount.transform(sessionId, messages);
+      assert.equal(pruneCalls, 2, 'a later transform does not retry the dropped verdict');
+    } finally { await mount.close(); }
+  });
+
+test('ISSUE-431: a crossing with no tableable unit journals no-eligible', async () => {
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    contextWindowTokens: 400_000,
+    pruneThresholdTokens: 100,
+    askGrammar: 'prune-two-option',
+    askGenerate: async () => ({ text: '{}' }),
+    journal: record => lines.records.push(record),
+  });
+  try {
+    // The first request crosses the tiny bar but nothing has been seen yet, so
+    // the pass has zero tableable rows.
+    await mount.transform(sessionId, largeHostMessages());
+    const line = lines.of('prune-outcome').at(-1);
+    assert.ok(line !== undefined, 'a zero-eligible crossing is named');
+    assert.equal(line['outcome'], 'no-eligible');
+    assert.equal(line['origin'], 'step');
+    assert.match(String(line['reason']), /no tableable unit/u);
+    assert.equal(lines.of('ask').length, 0, 'no ask was sent');
+  } finally { await mount.close(); }
+});
+
 test('a deferred pass whose bytes the forget lane removed re-arms from the host reading',
   async () => {
     /*
@@ -3984,12 +4064,15 @@ test('the /cremate command runs the table pass on demand, below the bar', async 
       'the command journals its fire');
     assert.equal(lines.of('cremate').at(-1)?.['reason'], 'table');
     // The same-revision guard still holds: one table per revision, however it
-    // was requested.
+    // was requested. ISSUE-486: the carried unit is dropped by its durable
+    // claim, so the refusal is named `claimed-unit`, not an empty `no-rows`.
     await command?.execute({ sessionID: sessionId });
     assert.equal(host.generateCalls.length, 1,
       'a second /cremate at the same revision is guarded');
-    assert.equal(lines.of('cremate').at(-1)?.['reason'], 'no-rows',
-      'the only unit was removed by the first fire, so no row is left to ask');
+    assert.equal(lines.of('cremate').at(-1)?.['reason'], 'claimed-unit',
+      'the only unit is still in the array, dropped by its durable unit claim');
+    assert.equal(lines.of('cremate').at(-1)?.['claims'], 1,
+      'the command line names the claimed row it suppressed');
   } finally { await cleanup(); }
 
   // With the ask off there is no table to run; the command says so instead of
@@ -4005,6 +4088,136 @@ test('the /cremate command runs the table pass on demand, below the bar', async 
     assert.equal(offLines.of('cremate').at(-1)?.['reason'], 'ask-off',
       'the journal names the missing ask');
   } finally { await offMount.close(); }
+});
+
+test('ISSUE-412: /cremate under the ask lock does not consume the depth latch', async () => {
+  /*
+   * A manual pass refused by the in-flight ask lock did not run, so recording
+   * it as completed would re-arm the latch against a pass that never happened.
+   * The skip is named `ask-in-flight` and the latch state is byte-for-byte what
+   * the in-flight ask's own pass left.
+   */
+  const lines = journalLines();
+  let started: () => void = () => {};
+  const startedAt = new Promise<void>(resolve => { started = resolve; });
+  let release: (answer: { text: string }) => void = () => {};
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    contextWindowTokens: 400_000,
+    pruneThresholdTokens: 100,
+    askGrammar: 'prune-two-option',
+    askGenerate: () => {
+      started();
+      return new Promise<{ text: string }>(resolve => { release = resolve; });
+    },
+    journal: record => lines.records.push(record),
+  });
+  let step: Promise<void> | undefined;
+  try {
+    // The first request ships the units; the second crosses the bar and asks.
+    // Its generate hangs, so the lane lock is held while /cremate is invoked.
+    await mount.transform(sessionId, largeHostMessages());
+    step = mount.transform(sessionId, largeHostMessages());
+    await startedAt;
+    const entry = mount.sessions.get(sessionId);
+    assert.ok(entry !== undefined, 'the context hook built the session');
+    assert.equal(entry.askInFlight, true, 'the step ask holds the lane');
+    const before = entry.pruneTrigger.snapshot();
+
+    assert.equal(await mount.cremate(sessionId), false, 'the manual pass cannot run');
+    assert.deepEqual(entry.pruneTrigger.snapshot(), before,
+      'the refused manual pass leaves the depth latch exactly as it was');
+    const skip = lines.of('cremate').at(-1);
+    assert.equal(skip?.['fired'], false, 'the skip fired nothing');
+    assert.equal(skip?.['reason'], 'ask-in-flight',
+      'the skip is named, distinct from deferral and failure');
+    assert.equal(lines.of('ask').length, 0, 'no fire was recorded for the skipped pass');
+  } finally {
+    release({ text: '{}' });
+    await step;
+    await mount.close();
+  }
+});
+
+test('ISSUE-447: a prepared-only ledger stands every ask lane down before generate',
+  async () => {
+    /*
+     * Core answers `recovery-pending` before planning a prune while a prepared
+     * intent has no applied/abandoned row. The step, idle and `/cremate` lanes
+     * must read that health before paying the host, journal one named reason,
+     * and send nothing.
+     */
+    const lines = journalLines();
+    const calls: OpencodeGenerateInput[] = [];
+    const mount = createOpencodeMount({
+      storage: { databasePath: ':memory:' }, contextWindowTokens: 400_000,
+      pruneThresholdTokens: 100, askGrammar: 'prune-two-option',
+      askGenerate: async (input) => { calls.push(input); return { text: '{}' }; },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      // The first request ships the units; with nothing yet seen it asks nothing.
+      await mount.transform(sessionId, largeHostMessages());
+      const entry = mount.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the context hook built the session');
+      await entry.ledger.prepare({
+        sessionId, eventId: 'evt-447', baseRevision: 'rev-447', phase: 'entry',
+        applicationSha256: sha256Sync(toBytes('guard-verified application')),
+        archives: [], appendRecords: [], sealedEpisodeIds: [],
+      });
+      // The step crossing reads the prepared-only ledger and stands down.
+      await mount.transform(sessionId, [...largeHostMessages(),
+        userMessage('msg_447', [text('Continue.')])]);
+      // The idle lane reads the same health.
+      await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
+      // The manual command reads it too, and is not gated by the latch.
+      assert.equal(await mount.cremate(sessionId), false,
+        'the command runs no pass against an unhealthy ledger');
+      assert.equal(calls.length, 0, 'no ask lane paid the host');
+      const standdowns = lines.of('ask-standdown');
+      assert.deepEqual(standdowns.map(line => line['origin']), ['step', 'idle', 'command'],
+        'each lane journals exactly one stand-down');
+      for (const line of standdowns) {
+        assert.equal(line['reason'], 'recovery-pending', 'the reason names the standdown');
+      }
+    } finally { await mount.close(); }
+  });
+
+test('ISSUE-447: a disabled breaker stands the ask lane down before generate', async () => {
+  const lines = journalLines();
+  const calls: OpencodeGenerateInput[] = [];
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' }, contextWindowTokens: 400_000,
+    pruneThresholdTokens: 100, askGrammar: 'prune-two-option',
+    askGenerate: async (input) => { calls.push(input); return { text: '{}' }; },
+    journal: record => lines.records.push(record),
+  });
+  try {
+    await mount.transform(sessionId, largeHostMessages());
+    const entry = mount.sessions.get(sessionId);
+    assert.ok(entry !== undefined, 'the context hook built the session');
+    await entry.ledger.append({
+      kind: 'validation', sessionId, eventKey: 'disabled-447', atMs: 1,
+      eventId: 'evt-447', ok: false, issues: [],
+      breaker: { consecutiveValidationFailures: 2, disabled: true },
+    } as unknown as LedgerEvent);
+    await mount.transform(sessionId, [...largeHostMessages(),
+      userMessage('msg_447_disabled', [text('Continue.')])]);
+    assert.equal(calls.length, 0, 'the host was not paid');
+    const line = lines.of('ask-standdown').at(-1);
+    assert.equal(line?.['reason'], 'breaker-open');
+    assert.equal(line?.['origin'], 'step');
+  } finally { await mount.close(); }
+});
+
+test('ISSUE-447: a refusing ledger read stands down by name, never throws', async () => {
+  const refusing = {
+    events: async function* refusingEvents(): AsyncGenerator<never> {
+      throw new Error('disk gone');
+    },
+  } as unknown as Ledger;
+  assert.equal(await opencodeAskStanddown(refusing, sessionId), 'ledger-unavailable',
+    'a throwing read is the named fail-open standdown');
 });
 
 test('the /cremate command tables a unit first carried by the last sent request', async () => {
@@ -4505,18 +4718,778 @@ test('a throwing commit is fail-open: untouched array, one line, no claim, retry
         'the receipt for the removed read rides in the array');
       assert.deepEqual(await idsOf('applied'), [],
         'the durable claim follows the wire write; recovery has not reconciled yet');
-
-      // The next process reconciles the landed stage: the prepared intent's
-      // receipt now answers applied, so recovery records the durable applied row.
-      await mount.transform(sessionId, messages);
-      assert.equal(lines.of('transform-error').length, 1, 'reconciliation does not fail');
-      assert.deepEqual(await idsOf('applied'), pending,
-        'recovery reconciles the landed retry into the durable applied claim');
     } finally { await mount.close(); }
+  });
+
+test('ISSUE-448: a fresh mount resolves the prior process landed receipt and claims applied',
+  async () => {
+    /*
+     * The old "next process" phase re-entered the SAME mount, so its
+     * `receipts`/`committedIntents` maps were still populated and the assertion
+     * proved nothing about durable state. This test kills the first mount after
+     * the commit landed and rebuilds a mount and port on the same root.
+     */
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const control = { throws: true };
+      const first = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        createPort: (options) => {
+          const inner = createOpencodePort(options);
+          return {
+            snapshot: () => inner.snapshot(),
+            apply: request => inner.apply(request),
+            lookupReceipt: intentId => inner.lookupReceipt(intentId),
+            observe: (messages, observeOptions) => inner.observe(messages, observeOptions),
+            commit: () => {
+              if (control.throws) throw new Error('the host splice refused');
+              return inner.commit();
+            },
+            lastCommitKind: () => inner.lastCommitKind(),
+            refusal: () => inner.refusal(),
+            appliedPlanIndex: () => inner.appliedPlanIndex(),
+          };
+        },
+        journal: () => {},
+      });
+      const messages = staleReadMessages();
+      const pendingIds = new Set<string>();
+      try {
+        // The first pass files the prepared row but its commit throws.
+        await first.transform(sessionId, messages);
+        const entry = first.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the first mount built the session');
+        // The retry splices the kept stage, minting and persisting the receipt.
+        control.throws = false;
+        await first.transform(sessionId, messages);
+        for await (const { event } of entry.ledger.events(sessionId)) {
+          if (event.kind === 'prepared') pendingIds.add(event.intentId);
+          if (event.kind === 'applied') pendingIds.delete(event.receipt.intentId);
+        }
+        assert.equal(pendingIds.size, 1,
+          'the landed stage leaves one prepared intent the first process never reconciled');
+        assert.ok(receiptLines(messages).length > 0, 'the landed receipt rides in the array');
+      } finally {
+        await first.close();
+      }
+      const pending = [...pendingIds];
+      const line = receiptLines(messages)[0];
+      assert.ok(line !== undefined, 'the committed pass wrote its receipt line');
+
+      // A NEW mount and port on the same durable root: no in-process memory.
+      const lines = journalLines();
+      const second = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        journal: record => lines.records.push(record),
+      });
+      try {
+        const rebuilt = rebuiltStaleRead(line);
+        await second.transform(sessionId, rebuilt.messages);
+        const entry = second.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the fresh mount built the session');
+        const lookup = await entry.port.lookupReceipt(pending[0] as never);
+        assert.equal(lookup.status, 'applied',
+          'the remounted port resolves the durable receipt without the old process map');
+        const applied: string[] = [];
+        for await (const { event } of entry.ledger.events(sessionId)) {
+          if (event.kind === 'applied') applied.push(event.receipt.intentId);
+        }
+        assert.ok(applied.includes(pending[0] as string),
+          'recovery reconciled the prepared row into the durable applied claim');
+        assert.equal(lines.of('intent-abandoned').length, 0,
+          'a row the durable receipt proves is never abandoned');
+      } finally {
+        const entry = second.sessions.get(sessionId);
+        if (entry !== undefined) await entry.ledger.close().catch(() => {});
+        await second.close();
+      }
+
+      // The reconciled `applied` row is now the seed a healthy remount reads:
+      // the applied-plan index names the unit the recovered receipt removed.
+      const third = createOpencodeMount({
+        storage: { crematorStorageRoot: root }, journal: () => {},
+      });
+      try {
+        await third.transform(sessionId, rebuiltStaleRead(line).messages);
+        const thirdEntry = third.sessions.get(sessionId);
+        assert.ok(thirdEntry !== undefined, 'the third mount built the session');
+        assert.equal([...thirdEntry.appliedPlans.values()].some(plan =>
+          (plan.forgotten ?? []).includes(opencodeToolNodeId(sessionId, 'call_read'))), true,
+        'the reconciled applied row seeds the plan index for the next mount');
+      } finally {
+        await third.close();
+      }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-448: a prepared row with no durable receipt is abandoned once on remount',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const first = createOpencodeMount({
+        storage: { crematorStorageRoot: root }, journal: () => {},
+      });
+      let intentId = '';
+      try {
+        await first.transform(sessionId, staleReadMessages());
+        const entry = first.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the first mount built the session');
+        intentId = 'intent-448-orphan';
+        await entry.ledger.prepare({
+          sessionId, eventId: 'evt-448', baseRevision: 'rev-448', phase: 'entry',
+          applicationSha256: sha256Sync(toBytes('orphan prepared row')),
+          archives: [], appendRecords: [], sealedEpisodeIds: [],
+        });
+        // The ledger's prepare() mints its own intent id; read it back so the
+        // assertion names the row the remount must close.
+        for await (const { event } of entry.ledger.events(sessionId)) {
+          if (event.kind === 'prepared') intentId = event.intentId;
+        }
+      } finally {
+        await first.close();
+      }
+      const lines = journalLines();
+      const second = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await second.transform(sessionId, staleReadMessages());
+        const abandoned = lines.of('intent-abandoned');
+        assert.equal(abandoned.length, 1, 'the unprovable row is closed exactly once');
+        assert.equal(abandoned[0]?.['intentId'], intentId, 'the line names the row');
+        assert.equal(abandoned[0]?.['reason'], 'no-durable-receipt', 'the reason is named');
+        const entry = second.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the remount built the session');
+        const rows: string[] = [];
+        for await (const { event } of entry.ledger.events(sessionId)) {
+          if (event.kind === 'abandoned') rows.push(event.intentId as string);
+        }
+        assert.ok(rows.includes(intentId), 'the abandoned outcome is durable');
+        // A later pass is not blocked: no recovery-pending stand-down.
+        const standdowns = lines.of('ask-standdown')
+          .filter(row => row['reason'] === 'recovery-pending');
+        assert.equal(standdowns.length, 0, 'the closed row no longer stands the session down');
+      } finally {
+        await second.close();
+      }
+    } finally {
+      cleanup(dir);
+    }
   });
 
 test('the step-ended reconciliation: every bucket, and nothing invented', async () => {
   await runRows(ACCOUNTING_ROWS);
+});
+
+test('ISSUE-409: an unapplied verdict survives a restart and applies without re-asking',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    const calls: string[] = [];
+    try {
+      const first = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => {
+          calls.push('first');
+          return { text: '{"1":{"forgetall":"stale note"}}' };
+        },
+        journal: () => {},
+      });
+      try {
+        // The install boundary keeps pre-existing history out of every ask
+        // lane. The install array carries no tool node, so the unit a later
+        // request brings is eligible (ISSUE-419).
+        await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+        const messages = largeHostMessages();
+        await first.transform(sessionId, messages);
+        assert.equal(calls.length, 0, 'the carrying request tables nothing');
+        assert.equal(await first.cremate(sessionId), true, 'the command fires the table pass');
+        const entry = first.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the first mount built the session');
+        assert.equal(calls.length, 1, 'the command asked once');
+        assert.equal(entry.askVerdicts.size, 1, 'the verdict is stored, not yet applied');
+        assert.equal(entry.deferredApply, true, 'the next boundary owes the apply');
+      } finally { await first.close(); }
+
+      // A new mount and port: the verdict exists only in durable state now.
+      const lines = journalLines();
+      const second = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => {
+          calls.push('second');
+          return { text: '{}' };
+        },
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await second.transform(sessionId, largeHostMessages());
+        const resumed = lines.of('ask-state-resumed');
+        assert.equal(resumed.length, 1, 'the mount names the restored ask state');
+        assert.equal(resumed[0]?.['verdicts'], 1, 'the line names one restored verdict');
+        assert.equal(calls.length, 1, 'the restored verdict is applied, not re-asked');
+        assert.equal(lines.of('ask').length, 0, 'no ask left the fresh process');
+        assert.equal(lines.of('ask-apply').length, 1, 'the restored verdict applied');
+      } finally { await second.close(); }
+
+      // Applied means settled: a third mount restores no verdict to replay.
+      const thirdLines = journalLines();
+      const third = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => { calls.push('third'); return { text: '{}' }; },
+        journal: record => thirdLines.records.push(record),
+      });
+      try {
+        await third.transform(sessionId, largeHostMessages());
+        assert.equal(thirdLines.of('ask-state-resumed').length, 0,
+          'an applied verdict is cleared from durable state, so a reopen does not replay it');
+      } finally { await third.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-409: a claimed revision is not re-asked after a restart', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const calls: string[] = [];
+  try {
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => {
+        calls.push('first');
+        return { text: '{}' };
+      },
+      journal: () => {},
+    });
+    try {
+      // Install boundary first (no tool node), then the unit arrives later.
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      const messages = largeHostMessages();
+      await first.transform(sessionId, messages);
+      assert.equal(calls.length, 0, 'the carrying request tables nothing');
+      await first.transform(sessionId, messages);
+      const entry = first.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first mount built the session');
+      assert.equal(calls.length, 1, 'the step ask claimed the revision once');
+      assert.ok(entry.askedRevisions.size > 0, 'the claim is held in memory');
+      assert.equal(entry.askVerdicts.size, 0, 'the empty reply stored no verdict');
+      assert.equal(entry.lastMessages?.length, messages.length,
+        'the untouched array keeps the same revision');
+    } finally { await first.close(); }
+
+    const lines = journalLines();
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => {
+        calls.push('second');
+        return { text: '{}' };
+      },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      // The first transform promotes the carried unit; the second is the one
+      // that would ask. The restored revision claim must stop it.
+      await second.transform(sessionId, largeHostMessages());
+      await second.transform(sessionId, largeHostMessages());
+      assert.equal(calls.length, 1,
+        'the restored revision claim stops the same revision being asked again');
+      assert.equal(lines.of('ask').length, 0, 'the fresh process sent no second table');
+      assert.equal(lines.of('ask-state-resumed').length, 0,
+        'a claim-only record restores without verdict journal noise');
+    } finally { await second.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-467: an ask-off mount durably drops the verdicts and claims it names',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    const calls: string[] = [];
+    try {
+      const first = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => {
+          calls.push('first');
+          return { text: '{"1":{"forgetall":"stale note"}}' };
+        },
+        journal: () => {},
+      });
+      try {
+        await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+        await first.transform(sessionId, largeHostMessages());
+        assert.equal(await first.cremate(sessionId), true, 'the command fires the table pass');
+        const entry = first.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the first mount built the session');
+        assert.equal(entry.askVerdicts.size, 1, 'the verdict is stored durably');
+        assert.ok(entry.askedRevisions.size > 0, 'the revision claim is stored durably');
+      } finally { await first.close(); }
+
+      // Reopen with the ask off: the drop must be a durable write, not a filter.
+      const offLines = journalLines();
+      const off = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        journal: record => offLines.records.push(record),
+      });
+      try {
+        await off.transform(sessionId, largeHostMessages());
+        const dropped = offLines.of('ask-state-dropped');
+        assert.equal(dropped.length, 1, 'the ask-off mount journals the drop');
+        assert.equal(dropped[0]?.['count'], 1, 'the line names the dropped verdict');
+        const offEntry = off.sessions.get(sessionId);
+        assert.equal(offEntry?.askVerdicts.size, 0, 'no verdict is loaded ask-off');
+        assert.equal(offEntry?.askedRevisions.size, 0, 'no claim is loaded ask-off');
+      } finally { await off.close(); }
+
+      // Reopen with the ask on: nothing was left to resurrect.
+      const onLines = journalLines();
+      const on = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => { calls.push('third'); return { text: '{}' }; },
+        journal: record => onLines.records.push(record),
+      });
+      try {
+        await on.transform(sessionId, largeHostMessages());
+        await on.transform(sessionId, largeHostMessages());
+        assert.equal(onLines.of('ask-state-resumed').length, 0,
+          'the dropped record restores no verdict and no claim');
+        assert.equal(onLines.of('ask-apply').length, 0, 'the dropped verdict is never applied');
+        assert.equal(onLines.of('ask-state-dropped').length, 0,
+          'nothing durable was left for the next mount to drop');
+        assert.ok(calls.includes('third'),
+          'the cleared revision claim no longer suppresses a new ask');
+      } finally { await on.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-468: a durable revision claim is named, not no-eligible', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const calls: string[] = [];
+  try {
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => { calls.push('first'); return { text: '{}' }; },
+      journal: () => {},
+    });
+    try {
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, largeHostMessages());
+      await first.transform(sessionId, largeHostMessages());
+      assert.equal(calls.length, 1, 'the first mount claimed the revision once');
+    } finally { await first.close(); }
+
+    // A restart's first crossing is refused by the restored revision claim.
+    const lines = journalLines();
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => { calls.push('second'); return { text: '{}' }; },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      await second.transform(sessionId, largeHostMessages());
+      await second.transform(sessionId, largeHostMessages());
+      assert.equal(calls.length, 1, 'the restored claim suppresses the second ask');
+      const named = lines.of('prune-outcome').at(-1);
+      assert.ok(named !== undefined, 'the refused crossing is named');
+      assert.equal(named['outcome'], 'claimed-revision',
+        'the journal names the claim, not an empty crossing');
+      assert.equal(named['origin'], 'step');
+      assert.match(String(named['reason']), /durable revision claim/u);
+    } finally { await second.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-472: an unknown mount-state version is named, not read as empty',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const sessionDir = join(root, 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, 'mount-state.json'), `${JSON.stringify({
+        version: 999,
+        ask: {
+          revisions: ['revision-claimed'], askedUnitIds: ['unit:sha256:claimed'],
+          retriedUnitIds: [], refusedRetriedUnitIds: [], verdicts: [],
+          deferredApply: false, deferredFailures: 0,
+        },
+      })}\n`, 'utf8');
+      const lines = journalLines();
+      const mount = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => ({ text: '{}' }),
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await mount.transform(sessionId, largeHostMessages());
+        const refused = lines.of('mount-state-error')
+          .filter(line => /version/u.test(String(line['message'])));
+        assert.ok(refused.length > 0, 'the unknown version is journalled by name');
+        assert.ok(refused.some(line => line['fact'] === 'ask'),
+          'the ask record refusal is named with its fact');
+        assert.ok(refused.some(line => line['fact'] === 'receipts'),
+          'the receipts record refusal is named with its fact');
+        const entry = mount.sessions.get(sessionId);
+        assert.equal(entry?.askedRevisions.size, 0,
+          'the skew claim is not silently restored from a refused record');
+        assert.equal(lines.of('ask-state-resumed').length, 0,
+          'a refused record is not reported as resumed state');
+      } finally { await mount.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-483: an ask-off drop never reports a clear that failed', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const stateFile = join(root, 'sessions', sessionId, 'mount-state.json');
+  try {
+    // Ask on: claim the unit and store one `forgetall` verdict durably.
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+      journal: () => {},
+    });
+    try {
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, largeHostMessages());
+      assert.equal(await first.cremate(sessionId), true, 'the command stores the verdict');
+    } finally { await first.close(); }
+
+    /**
+     * A read-only state file makes `publishDoc`'s rename fail (EPERM), so the
+     * clear cannot land while the read still restores the verdict.
+     */
+    chmodSync(stateFile, 0o444);
+    const offLines = journalLines();
+    const off = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      journal: record => offLines.records.push(record),
+    });
+    try {
+      await off.transform(sessionId, largeHostMessages());
+      const failed = offLines.of('mount-state-error').filter(line => line['fact'] === 'ask');
+      assert.ok(failed.length > 0, 'the failed clear is named');
+      assert.match(String(failed.at(-1)?.['message']), /mount-state\.json/u,
+        'the failure names the file it could not write');
+      assert.equal(offLines.of('ask-state-dropped').length, 0,
+        'a failed clear is never reported as a drop');
+    } finally { await off.close(); }
+
+    // The record survived the failed clear: an ask-on reopen restores it.
+    const onLines = journalLines();
+    const on = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({ text: '{}' }),
+      journal: record => onLines.records.push(record),
+    });
+    try {
+      await on.transform(sessionId, largeHostMessages());
+      const resumed = onLines.of('ask-state-resumed');
+      assert.equal(resumed.length, 1, 'the restored verdict is named on the ask-on reopen');
+      assert.equal(resumed[0]?.['verdicts'], 1, 'the restored record still carries the verdict');
+    } finally { await on.close(); }
+  } finally {
+    try { chmodSync(stateFile, 0o666); } catch { /* the file may never exist */ }
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-483: a claims-only ask-off drop names the erased claim count', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  try {
+    const sessionDir = join(root, 'sessions', sessionId);
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(join(sessionDir, 'mount-state.json'), `${JSON.stringify({
+      version: 1,
+      ask: {
+        revisions: ['rev-a', 'rev-b'],
+        askedUnitIds: [`unit:sha256:${'a'.repeat(64)}`],
+        retriedUnitIds: [], refusedRetriedUnitIds: [], verdicts: [],
+        deferredApply: false, deferredFailures: 0,
+      },
+    })}\n`, 'utf8');
+    const lines = journalLines();
+    const mount = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      await mount.transform(sessionId, largeHostMessages());
+      const dropped = lines.of('ask-state-dropped');
+      assert.equal(dropped.length, 1, 'a claims-only record is dropped by name');
+      assert.equal(dropped[0]?.['claims'], 1, 'the line names the erased claim count');
+      assert.equal(dropped[0]?.['revisions'], 2, 'the line names the erased revisions');
+      assert.equal(dropped[0]?.['count'], 0, 'no verdict was erased');
+    } finally { await mount.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-484: a refused mount-state file is never overwritten by a write',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const sessionDir = join(root, 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const stateFile = join(sessionDir, 'mount-state.json');
+      const foreignReceipt = {
+        intentId: 'intent-999', sessionId, baseRevision: 'rev-999',
+        resultRevision: 'rev-998', applicationSha256: 'a'.repeat(64), appliedAtMs: 1,
+      };
+      writeFileSync(stateFile, `${JSON.stringify({
+        version: 999, receipts: [foreignReceipt],
+      })}\n`, 'utf8');
+      const lines = journalLines();
+      const mount = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await mount.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+        await mount.transform(sessionId, largeHostMessages());
+        await mount.cremate(sessionId);
+        const named = lines.of('mount-state-error')
+          .filter(line => /mount-state\.json/u.test(String(line['message'])));
+        assert.ok(named.length > 0, 'the refused write names the file');
+        const after = JSON.parse(readFileSync(stateFile, 'utf8')) as {
+          version?: number; receipts?: readonly unknown[];
+        };
+        assert.equal(after.version, 999, 'the foreign file keeps its unknown version');
+        assert.equal(after.receipts?.length, 1, 'the foreign receipt is preserved');
+      } finally { await mount.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-484: a version-absent document is read as v1 when its shape validates',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const sessionDir = join(root, 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, 'mount-state.json'), `${JSON.stringify({
+        ask: {
+          revisions: ['legacy-rev'],
+          askedUnitIds: [`unit:sha256:${'b'.repeat(64)}`],
+          retriedUnitIds: [], refusedRetriedUnitIds: [], verdicts: [],
+          deferredApply: false, deferredFailures: 0,
+        },
+      })}\n`, 'utf8');
+      const lines = journalLines();
+      const mount = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => ({ text: '{}' }),
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await mount.transform(sessionId, largeHostMessages());
+        const entry = mount.sessions.get(sessionId);
+        assert.equal(entry?.askedRevisions.has('legacy-rev'), true,
+          'the legacy claim is restored from the untagged document');
+        assert.equal(lines.of('mount-state-error')
+          .filter(line => /version/u.test(String(line['message']))).length, 0,
+        'a valid legacy shape is not refused as an unknown version');
+      } finally { await mount.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-485: a refused receipts read never abandons prepared intents', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  try {
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root }, journal: () => {},
+    });
+    try {
+      await first.transform(sessionId, staleReadMessages());
+      const entry = first.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first mount built the session');
+      await entry.ledger.prepare({
+        sessionId, eventId: 'evt-485', baseRevision: 'rev-485', phase: 'entry',
+        applicationSha256: sha256Sync(toBytes('orphan prepared row')),
+        archives: [], appendRecords: [], sealedEpisodeIds: [],
+      });
+    } finally { await first.close(); }
+
+    const stateFile = join(root, 'sessions', sessionId, 'mount-state.json');
+    writeFileSync(stateFile, `${JSON.stringify({ version: 999, receipts: [] })}\n`, 'utf8');
+    const lines = journalLines();
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      await second.transform(sessionId, staleReadMessages());
+      assert.ok(lines.of('mount-state-error').some(line => line['fact'] === 'receipts'),
+        'the refused receipts read is named');
+      assert.equal(lines.of('intent-abandoned').length, 0,
+        'a refused read never closes a prepared intent');
+      const entry = second.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the second mount built the session');
+      let abandoned = 0;
+      for await (const { event } of entry.ledger.events(sessionId)) {
+        if (event.kind === 'abandoned') abandoned += 1;
+      }
+      assert.equal(abandoned, 0, 'no abandoned row is appended');
+    } finally { await second.close(); }
+
+    // A readable empty document: the same orphan is closed exactly once.
+    writeFileSync(stateFile, `${JSON.stringify({ version: 1 })}\n`, 'utf8');
+    const healthy = journalLines();
+    const third = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      journal: record => healthy.records.push(record),
+    });
+    try {
+      await third.transform(sessionId, staleReadMessages());
+      assert.equal(healthy.of('intent-abandoned').length, 1,
+        'a readable empty record closes the orphan once');
+    } finally { await third.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-485: a non-array receipts record is a named structural refusal',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    try {
+      const sessionDir = join(root, 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, 'mount-state.json'),
+        `${JSON.stringify({ version: 1, receipts: {} })}\n`, 'utf8');
+      const lines = journalLines();
+      const mount = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        journal: record => lines.records.push(record),
+      });
+      try {
+        await mount.transform(sessionId, staleReadMessages());
+        const line = lines.of('mount-state-error')
+          .find(candidate => candidate['fact'] === 'receipts');
+        assert.ok(line !== undefined, 'the malformed receipts record is named');
+        assert.match(String(line['message']), /receipts/u,
+          'the message names the receipts record');
+        assert.equal(lines.of('intent-abandoned').length, 0,
+          'a structural refusal never judges abandonment');
+      } finally { await mount.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-486: a restored durable unit claim is named, not no-eligible', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const calls: string[] = [];
+  try {
+    // A timeout keeps the unit permanently claimed and writes that claim durably.
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option', askTimeoutMs: 20,
+      askGenerate: () => {
+        calls.push('first');
+        return new Promise<{ text: string }>(() => {});
+      },
+      journal: () => {},
+    });
+    try {
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, largeHostMessages());
+      await first.transform(sessionId, largeHostMessages());
+      const entry = first.sessions.get(sessionId);
+      assert.equal(calls.length, 1, 'the crossing asked once');
+      assert.ok((entry?.askedUnitIds.size ?? 0) > 0, 'the timeout keeps the unit claim');
+    } finally { await first.close(); }
+
+    const lines = journalLines();
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      contextWindowTokens: 400_000, pruneThresholdTokens: 100,
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => { calls.push('second'); return { text: '{}' }; },
+      journal: record => lines.records.push(record),
+    });
+    try {
+      // The first restart transform promotes the carried unit into the seen set.
+      await second.transform(sessionId, largeHostMessages());
+      const before = lines.records.length;
+      // One extra tool result changes the revision; the unit claim survives it.
+      await second.transform(sessionId, [...largeHostMessages(),
+        assistantMessage('msg_486_a', [
+          text('Reading SMALL2.md.'),
+          toolCall('call_486', 'read', { filePath: 'SMALL2.md' }),
+        ]),
+        toolMessage('msg_486_t', [toolResult('call_486', 'read', textResult('tiny'))]),
+        assistantMessage('msg_486_end', [text('Done.')])]);
+      assert.equal(calls.length, 1, 'the restored unit claim suppresses the ask');
+      const named = lines.of('prune-outcome').at(-1);
+      assert.equal(named?.['outcome'], 'claimed-unit',
+        'the step lane names the unit claim, not an empty crossing');
+      assert.equal(named?.['origin'], 'step');
+      assert.equal(named?.['claims'], 1, 'the line names the claimed row');
+      assert.ok(lines.records.slice(before)
+        .every(record => !/none was suppressed/u.test(String(record['reason'] ?? ''))),
+      'the crossing writes no empty-crossing reason');
+      // The command lane names the same suppression.
+      assert.equal(await second.cremate(sessionId), false, 'the command fires nothing');
+      assert.equal(lines.of('cremate').at(-1)?.['reason'], 'claimed-unit',
+        'the command reason is the unit claim, not no-rows');
+    } finally { await second.close(); }
+  } finally {
+    cleanup(dir);
+  }
 });
 
 test('the tool surface and the test harness exclusions', async () => {

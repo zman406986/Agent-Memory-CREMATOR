@@ -68,6 +68,11 @@ export const CREMATOR_JOURNAL_KINDS = [
   // or unable to quote two lines is not tabled and writes none (ADR-0042
   // Decision 5).
   'entry-ask', 'entry-ask-refused', 'entry-ask-off',
+  // `appendAskTurns` failed partway (ISSUE-403): `appended` counts the ask/
+  // answer turns the call wrote before the host threw, `collapse` is the
+  // prefix's rewind status, `code` names a refused rewind, and `message` is the
+  // host's own error. The mount fails open and writes no `entry-ask`.
+  'entry-ask-append-failed',
   // a batch whose NO row answered (ISSUE-185): the ask pair is collapsed as a
   // keep-all collapses it, because a refused exchange is not a record and both
   // turns are user messages the next model turn would answer instead of the
@@ -110,6 +115,137 @@ export const CREMATOR_JOURNAL_KINDS = [
   // result stands whole. Additive: the three ask kinds above keep their
   // meanings, so a reader of the earlier lines sees the same vocabulary.
   'entry-apply', 'entry-apply-refused',
+  // an invalid fixed `judgeRoute` (ISSUE-427): one line at mount naming the
+  // field whose runtime type was not a string. The pass and both ask lanes
+  // then run as if no route were configured, never as if one were guessed.
+  'route-invalid',
+  // the native status card could not be opened or closed (ISSUE-429). `phase`
+  // is `open` or `close`, `commandId` pairs the attempt, `cardKind` names the
+  // outcome the close tried to write, and `message` is the host seam's own
+  // error. The ask still runs and settles: the card is presentation, never a
+  // product outcome.
+  'ask-card-error',
+  // the host refused the tool registration at mount (ISSUE-443). Registration
+  // is all-or-nothing, so `registered` is 0 and `offered` names the inventory
+  // the mount tried to advertise; `message` is the host `register` error. The
+  // apply still completes (fail-open): a mount with no tools is a named state,
+  // never silent.
+  'tool-registration-error',
+  // the tool outcome when registration did NOT throw (ISSUE-454): `status` is
+  // `registered` or `absent`, `registered` counts the tools advertised (0 for
+  // `absent`), `offered` names the inventory the mount tried to advertise, and
+  // an absent service adds `reason: 'no-tools-service'`. One line per mount,
+  // so "no tools offered" is never byte-identical to "both offered".
+  'tool-registration',
+  // an entry replacement the port committed could not be published to the host
+  // surface (ISSUE-441; ADR-0065). `callId` and `eventId` name the node, and
+  // `pending` counts the applications still queued. A transient (host append)
+  // failure is NOT dropped: the next boundary republishes it, so the ledger's
+  // `applied` claim and the surface cannot silently diverge.
+  'entry-publish-failed',
+  // an entry replacement whose node the host surface no longer holds
+  // (ISSUE-449): `callId`/`eventId` name it and `reason` is `no-live-result`
+  // or `no-host-event`. A missing node can never be republished, so the
+  // request is taken out of the queue head after this one line instead of
+  // blocking every later application behind it.
+  'entry-publish-dropped',
+  // an entry publish was still queued when its session was released (ISSUE-450):
+  // `callId`/`eventId` name the head, `pending` counts the queue, and `reason`
+  // is `session/end` or `close`. `durable: true` means the queue is on disk and
+  // the next entry for this session id replays it; `false` means an in-memory
+  // session lost the replacement, named here instead of vanishing silently.
+  'entry-publish-abandoned',
+  // the durable pending entry-publish intent could not be written (ISSUE-450):
+  // `pending` counts the records the write carried and `message` names the
+  // storage error. Fail-open: the in-memory queue still serves this process.
+  'entry-publish-persist-error',
+  // a pending-append intent this session's round file carries is malformed
+  // (ISSUE-430): on a fresh process the corrupt record is dropped fail-open,
+  // and this line names the position and the defect instead of reading as an
+  // empty queue. `fact` is `entry-publishes` when the malformed fact is the
+  // entry-publish intent ISSUE-450 added; absent means the append intent.
+  'pending-append-corrupt',
+  // the install boundary (ISSUE-414): one line per mount of a durable session,
+  // naming the mount generation and whether this mount recorded the first one
+  // (`fresh: true`) or resumed state this session already owned. A fresh mount
+  // over a session with pre-install history never replays or asks about that
+  // history; the count of the node ids it excluded rides beside it.
+  'install-boundary',
+  // a durable mount-state write (install identity, pending forgets, receipts)
+  // failed: the in-memory state still serves this process, only its restart
+  // durability is lost. Fail-open, like every other mount seam.
+  'mount-state-error',
+  // the durable install identity could not be written (ISSUE-439). The mount
+  // never journals a boundary it did not record: `state` names the boundary the
+  // failed write was for, and the next boundary retries the same identity until
+  // it lands (ADR-0065).
+  'install-persist-error',
+  // a mount with no readable install record found its own rows in the durable
+  // ledger (ISSUE-460) and classified itself `restart` instead of `inherited`:
+  // `reason` is `ledger-rows`, `source` names where the pre-install set came
+  // from (`preinstall-record` when the mount's own durable proof answers,
+  // `surface-unsafe` when no proof exists and every surface result must stay
+  // excluded), and `preInstall` counts that set (ISSUE-477). Rows under this
+  // session id are its own past; a fork's copied rows carry the parent's id and
+  // do not count.
+  'install-fallback',
+  // a fork mount dropped the parent's owed durable work from the child's copy
+  // (ISSUE-437): `parentSessionId` names the session the copied state belongs
+  // to, and `forgets`/`appends`/`entryPublishes` count the facts cleared, with
+  // `round`/`latch`/`entryAskFired` naming the parent's header facts when one
+  // was dropped (ISSUE-476). Skipping a durable fact is not removing it, and a
+  // later child mount would replay it as its own.
+  'fork-state-dropped',
+  // a fork's clear of an inherited fact failed (ISSUE-456): `file` names the
+  // sibling file (`mount-state.json` for a forget, `prune-round.json` for an
+  // append or entry-publish queue), `fact` names the inherited fact and `count`
+  // how many copies remain. The drop line never claims a fact whose write
+  // returned false, and the fork keeps the parent's install identity so the
+  // next mount re-forks and retries.
+  'fork-clear-failed',
+  // a fork mount still owed the parent's fact clear (ISSUE-478): the durable
+  // preinstall record carries `pendingClear`, the withheld install identity is
+  // not the marker, and `ids` counts the pre-install set the fork keeps so a
+  // child's own results are never reclassified as inherited history.
+  'fork-clear-pending',
+  // the durable preinstall record could not be written (ISSUE-477/ISSUE-478):
+  // `preInstall` counts the ids it carried and `pendingClear` says whether it
+  // was the fork's pending-clear marker. Fail-open: the in-memory state still
+  // serves this process, only the proof across a restart is lost.
+  'preinstall-persist-error',
+  // recovery (ISSUE-428) did not finish at this boundary: `step` names the leg
+  // that threw (`collapse`, `surface-read`, `marks`, `appends`, `sync`), the
+  // entry keeps owing its recovery and the next boundary retries it.
+  'entry-recovery-retry',
+  // the ledger-derived kept marks could not be read during recovery
+  // (ISSUE-428): the surface recovery still stands, and this line names the
+  // failure instead of a bare host warning.
+  'entry-recovery-mark-error',
+  // a queued manual forget came back from the durable mount state on mount
+  // (ISSUE-417): `count` names how many were re-queued for the boundary drain.
+  'forget-recovered',
+  // the durable pending-forget write failed (ISSUE-417). The mount refuses the
+  // tool's "scheduled" answer rather than promise an unload-durable removal;
+  // `message` names the storage error.
+  'forget-persist-error',
+  // applied receipts came back from the durable mount state on mount
+  // (ISSUE-417): a prepared ledger row the previous process landed can now be
+  // resolved by the port's `lookupReceipt` instead of blocking recovery.
+  'receipts-resumed',
+  // ISSUE-423: a host compaction landed while an ask/apply window was open, so
+  // the depth latch was NOT re-armed mid-flight. `phase` and `generation` name
+  // the compaction; `window` is `entry` or `prune`. The window's own end re-arms
+  // the latch once no apply is running (ADR-0050's native-compaction backstop).
+  'native-compaction-deferred',
+  // ISSUE-432: the live host route changed under this session id, so the
+  // per-entry floor was re-derived and stamped with its provider/model. `from`
+  // and `to` name the old and new route/floor; `window` names what is not
+  // model-derived (a mount option) instead of pretending it refreshed.
+  'model-refresh',
+  // ISSUE-432: the main-wire capture names a different provider/model from the
+  // live route, so the seed is invalidated by name instead of serving a prefix
+  // that belongs to the old model.
+  'seed-model-stale',
 ] as const;
 
 /** One journal record's kind. */

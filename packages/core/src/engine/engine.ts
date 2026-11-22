@@ -95,7 +95,7 @@ const passInvalidation = (invalidation: Invalidation): PassInvalidation | null =
 
 export class RacoonsEngine {
   private readonly telemetry: TranscriptTelemetry;
-  private readonly options: EngineOptions;
+  private options: EngineOptions;
   private queue: Promise<void> = Promise.resolve();
   private readonly unchangedEvents = new Set<string>();
   private readonly seenRefetches = new Set<string>();
@@ -112,6 +112,16 @@ export class RacoonsEngine {
   static async open(options: EngineOptions): Promise<RacoonsEngine> {
     return new RacoonsEngine({ ...options, capabilities: structuredClone(options.capabilities),
       config: structuredClone(options.config), rules: [...options.rules] });
+  }
+
+  /**
+   * Re-derive the per-session config after the mount's route changed mid-session
+   * (ISSUE-469). The guard reads `config.floorBytes` on every pass, so the ask
+   * gate's refreshed floor and the enforced floor are one value. No cap, retry
+   * count or timeout is introduced (ADR-0060; standing rule 7).
+   */
+  updateConfig(config: EngineOptions['config']): void {
+    this.options = { ...this.options, config: structuredClone(config) };
   }
 
   process(input: EngineInput, control?: ProcessControlInput): Promise<EngineResult> {

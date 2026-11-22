@@ -734,8 +734,15 @@ test('a restart on the shared ledger re-applies the removal and never re-asks it
     },
   });
   try {
+    /**
+     * ISSUE-419: a fresh install's first transform is the install boundary, so
+     * model a live session — the session starts with the user prompt alone, the
+     * tool result arrives on the next request, and it is table-eligible one
+     * request after that.
+     */
+    await first.transform(sessionId, [structuredClone(original[0])] as OpencodeMessage[]);
+    await first.transform(sessionId, structuredClone(original) as OpencodeMessage[]);
     const messages = structuredClone(original) as OpencodeMessage[];
-    await first.transform(sessionId, messages);
     await first.transform(sessionId, messages);
     assert.equal(firstAsks, 1, 'the first process asked once');
     assert.equal(messages.some(message => message.id === 'msg_t1'), false,

@@ -31,9 +31,11 @@ import type {
   DshLlmChunk, DshLlmStreamOptions, DshMountContext, DshMountEvent, DshMountSession,
   RacoonsJournalRecord,
 } from '../src/plugin.js';
-import { createRacoonsMount, createRacoonsPlugin, resolvePluginConfig } from '../src/plugin.js';
+import { createRacoonsMount, createRacoonsPlugin, resolvePluginConfig,
+  resolveSessionStorage } from '../src/plugin.js';
+import { readDurableReceipts } from '../src/mount-state.js';
+import { RacoonsStorageRetryError, resolveStorage } from '../src/storage.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
-import { resolveStorage } from '../src/storage.js';
 
 const ROUTE = { provider: 'p', model: 'm' };
 /** The one table answer the pass gets: the first row is removed whole. */
@@ -400,12 +402,15 @@ test('a host that confirms not-applied blocks and journals a receipt conflict', 
     assert.equal(typeof intentId, 'string');
     await first.close();
 
-    // 2. A fresh mount on the same root. Its port never saw the intent, so the
-    //    default answer is unknown — the ledger stands.
+    // 2. A fresh mount on the same root. The ledger holds the applied row, so
+    //    this intent's crash-window receipt has been collected (ISSUE-436): the
+    //    durable file tracks only live obligations, and the ledger is the record
+    //    of record (ADR-0015). The crash WINDOW itself (a receipt with no applied
+    //    row) is covered by the recovery-durability suite.
     const session2 = fakeSession('session-conflict');
     const entry = await secondMount.sessionFor('session-conflict', session2);
-    assert.deepEqual(await entry.port.lookupReceipt(intentId as never), { status: 'unknown' },
-      'a fresh mount answers unknown for an intent it never saw');
+    assert.deepEqual(readDurableReceipts(resolveSessionStorage(root, 'session-conflict')), [],
+      'the applied intent\'s crash-window receipt was collected');
     // 3. The variant: a host that actively lost the application confirms
     //    not-applied. That is the one answer that outranks the durable record.
     entry.port.lookupReceipt = async () => ({ status: 'not-applied' });
@@ -513,6 +518,93 @@ test('an unsafe session id is refused through the refusing-ledger path, not thro
       `every engine pass reports recovery-pending: ${JSON.stringify(outcomes)}`);
     assert.equal(existsSync(join(root, 'sessions')), false,
       'nothing was written under the storage root');
+  } finally {
+    await mount.close();
+    cleanup(dir);
+  }
+});
+
+/** A mount over one durable root, journaling to `journal` (ISSUE-434). */
+function durableMount(root: string, journal: JournalLine[]): ReturnType<typeof createRacoonsMount> {
+  return createRacoonsMount({
+    config: resolvePluginConfig({ crematorStorageRoot: root }),
+    storage: resolveStorage({ root }, root),
+    journal: (record) => journal.push(record),
+    warn: () => {},
+  });
+}
+
+test('ISSUE-434: the storage retry budget dies with the ended session', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'racoons-434-budget-'));
+  // A FILE where the storage root expects a directory: every open fails.
+  const blocker = join(dir, 'blocker');
+  writeFileSync(blocker, 'not a directory');
+  const root = join(blocker, 'racoons');
+  const journal: JournalLine[] = [];
+  const mount = durableMount(root, journal);
+  try {
+    const session = fakeSession('session-434-budget');
+    // First life: the open fails once, no entry is ever installed.
+    await assert.rejects(mount.sessionFor(session.id, session),
+      (error: unknown) => error instanceof RacoonsStorageRetryError);
+    await mount.endSession(session);
+
+    // Reopened life starts with a FRESH allowance: the next failure retries
+    // again instead of installing the refusing ledger on its first failure.
+    await assert.rejects(mount.sessionFor(session.id, session),
+      (error: unknown) => error instanceof RacoonsStorageRetryError);
+    // The second failure of this life now refuses (the budget is two), and the
+    // refusing ledger lands on an entry.
+    const refused = await mount.sessionFor(session.id, session);
+    assert.ok(refused !== undefined, 'the second failure installs the refusing ledger');
+    assert.equal(journal.filter((line) => line.kind === 'storage-unavailable').length, 1,
+      'exactly one refusal was ever installed, in the reopened life');
+
+    // The refusal is installed on an entry; release it and reopen once more:
+    // the allowance is fresh again, so this is a retry, not a silent refusal.
+    await mount.endSession(session);
+    const retriesBefore = journal.filter((line) => line.kind === 'storage-retry').length;
+    await assert.rejects(mount.sessionFor(session.id, session),
+      (error: unknown) => error instanceof RacoonsStorageRetryError,
+      'a released entry leaves a fresh retry allowance');
+    const retries = journal.filter((line) => line.kind === 'storage-retry');
+    assert.equal(retries.length, retriesBefore + 1);
+    assert.ok(retries.every((line) => line['attempt'] === 1),
+      'every life starts its retry count at one');
+  } finally {
+    await mount.close();
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-434: a reopened life journals its own plan and recovery lines', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'racoons-434-plan-'));
+  const blocker = join(dir, 'blocker');
+  writeFileSync(blocker, 'not a directory');
+  const root = join(blocker, 'racoons');
+  const journal: JournalLine[] = [];
+  const mount = durableMount(root, journal);
+  try {
+    const session = fakeSession('session-434-plan');
+    await assert.rejects(mount.sessionFor(session.id, session),
+      (error: unknown) => error instanceof RacoonsStorageRetryError);
+    await mount.endSession(session);
+
+    // Reopened life, still blocked: its own `storage-plan` and its own retry.
+    await assert.rejects(mount.sessionFor(session.id, session),
+      (error: unknown) => error instanceof RacoonsStorageRetryError);
+    // The condition clears; the next boundary of the reopened life recovers.
+    rmSync(blocker, { force: true });
+    const entry = await mount.sessionFor(session.id, session);
+    assert.ok(entry !== undefined);
+
+    const plans = journal.filter((line) => line.kind === 'storage-plan');
+    assert.equal(plans.length, 2, 'each life journals its own effective plan');
+    assert.equal(plans.at(-1)?.['sessionId'], session.id);
+    const recovered = journal.filter((line) => line.kind === 'storage-recovered');
+    assert.equal(recovered.length, 1, 'the reopen retry recovered the ledger');
+    assert.equal(recovered[0]?.['attempts'], 1, 'the recovered retry names one failed attempt');
+    await mount.endSession(session);
   } finally {
     await mount.close();
     cleanup(dir);

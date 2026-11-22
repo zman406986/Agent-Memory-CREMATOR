@@ -30,8 +30,9 @@ export type OpencodeServerModule = OpencodePluginDefinition;
 
 /**
  * The default export. `id` is the package name, so a loader log line has one
- * value to record; `setup` is called once per process and its cleanup runs at
- * dispose.
+ * value to record. `setup` is not assumed to run once: the process-level mount
+ * registry in `plugin.ts` refuses a second live mount for the same durable
+ * configuration with `OpencodeDuplicateMountError` (ISSUE-424).
  */
 const module: OpencodeServerModule = Object.freeze({
   id: OPENCODE_PLUGIN_NAME,

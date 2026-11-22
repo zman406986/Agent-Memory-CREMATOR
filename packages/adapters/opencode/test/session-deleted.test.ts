@@ -12,8 +12,8 @@ import type {
 } from '../src/host.js';
 import type { OpencodeJournalRecord } from '../src/plugin.js';
 import { createOpencodeMount, createOpencodePlugin } from '../src/plugin.js';
-import { openLedger } from '../src/storage.js';
-import { assistantMessage, text, userMessage } from './fixtures.js';
+import { assistantMessage, text, textResult, toolCall, toolMessage, toolResult, userMessage }
+  from './fixtures.js';
 
 const SES_A = 'ses_deleted_a';
 const SES_B = 'ses_deleted_b';
@@ -23,6 +23,17 @@ function smallMessages(): OpencodeMessage[] {
   return [
     userMessage('msg_u1', [text('Read the note.')]),
     assistantMessage('msg_a1', [text('The note is short.')]),
+  ];
+}
+
+/** One large, tableable read: the ask fires one request after it first ships. */
+function tableableMessages(): OpencodeMessage[] {
+  const body = `# Note\n\n${'body-'.repeat(180)}\n`;
+  return [
+    userMessage('msg_u1', [text('Read the note.')]),
+    assistantMessage('msg_a1', [toolCall('call_1', 'read', { filePath: 'NOTES.md' })]),
+    toolMessage('msg_t1', [toolResult('call_1', 'read', textResult(body))]),
+    assistantMessage('msg_a2', [text('The note says body.')]),
   ];
 }
 
@@ -82,43 +93,86 @@ test('ISSUE-379: session.deleted closes the deleted ledger and evicts only that 
   }
 });
 
-test('ISSUE-379: eviction drains in-flight work before releasing (ISSUE-356 path)', async () => {
+test('ISSUE-379: eviction drains the deleted session\'s in-flight work before releasing', async () => {
   const lines = journalLines();
-  let opens = 0;
-  let releaseOpen = (): void => {};
-  const openGate = new Promise<void>(resolve => { releaseOpen = resolve; });
+  let markAskStarted = (): void => {};
+  const askStarted = new Promise<void>(resolve => { markAskStarted = resolve; });
+  let releaseAsk = (_answer: { text: string }): void => {};
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
-    // The second session's open suspends, holding its transform in flight.
-    openLedger: async (target, clock) => {
-      opens += 1;
-      if (opens === 2) await openGate;
-      return openLedger(target, clock);
+    askGrammar: 'prune-two-option',
+    askGenerate: () => {
+      markAskStarted();
+      return new Promise<{ text: string }>(resolve => { releaseAsk = resolve; });
+    },
+    journal: record => lines.records.push(record),
+  });
+  try {
+    await mount.transform(SES_A, tableableMessages());
+    await mount.transform(SES_B, smallMessages());
+    // A's second transform promotes the first request's node and fires the ask,
+    // which suspends: A now has its own in-flight work.
+    const pendingA = mount.transform(SES_A, tableableMessages());
+    await askStarted;
+
+    const evicting = mount.event(deletedEvent(SES_A));
+    await tick();
+    assert.equal(mount.sessions.has(SES_A), true,
+      'the eviction waits for the deleted session\'s in-flight ask, it does not race it');
+
+    releaseAsk({ text: '{}' });
+    await pendingA;
+    await evicting;
+    assert.equal(mount.sessions.has(SES_A), false, 'the entry released after the drain');
+    assert.equal(mount.sessions.has(SES_B), true, 'the unrelated session keeps its entry');
+    const evictedAt = lines.records.findIndex(record => record.kind === 'session-evicted');
+    const settledAt = lines.records.findIndex(record =>
+      (record.kind === 'ask' || record.kind === 'ask-error') && record['sessionId'] === SES_A);
+    assert.ok(evictedAt > settledAt && settledAt >= 0,
+      'the in-flight ask settled before the eviction was journalled');
+  } finally {
+    releaseAsk({ text: '{}' });
+    await mount.close();
+  }
+});
+
+test('ISSUE-408: deleting one session does not wait on another session\'s in-flight ask', async () => {
+  const lines = journalLines();
+  let markAskStarted = (): void => {};
+  const askStarted = new Promise<void>(resolve => { markAskStarted = resolve; });
+  let releaseAsk = (_answer: { text: string }): void => {};
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    askGrammar: 'prune-two-option',
+    askGenerate: () => {
+      markAskStarted();
+      return new Promise<{ text: string }>(resolve => { releaseAsk = resolve; });
     },
     journal: record => lines.records.push(record),
   });
   try {
     await mount.transform(SES_A, smallMessages());
-    const pending = mount.transform(SES_B, smallMessages());
-    await waitFor(() => opens === 2);
+    await mount.transform(SES_B, tableableMessages());
+    // B's second transform leaves a suspended ask in flight, tagged to B.
+    const pendingB = mount.transform(SES_B, tableableMessages());
+    await askStarted;
 
+    // Deleting A must settle without B's ask: the event consumer behind it
+    // is not held for the ask's deadline.
     const evicting = mount.event(deletedEvent(SES_A));
+    await waitFor(() => lines.of('session-evicted').length === 1);
+    assert.equal(mount.sessions.has(SES_A), false, 'A was evicted while B asked');
+    let bSettled = false;
+    void pendingB.then(() => { bSettled = true; });
     await tick();
-    assert.equal(mount.sessions.has(SES_A), true,
-      'the eviction waits for the in-flight transform, it does not race it');
+    assert.equal(bSettled, false, 'B\'s ask is still in flight, as it should be');
+    assert.equal(mount.sessions.has(SES_B), true, 'the unrelated session keeps its entry');
 
-    releaseOpen();
-    await pending;
+    releaseAsk({ text: '{}' });
+    await pendingB;
     await evicting;
-    assert.equal(mount.sessions.has(SES_A), false, 'the entry released after the drain');
-    assert.equal(mount.sessions.has(SES_B), true, 'the drained session keeps its entry');
-    const evictedAt = lines.records.findIndex(record => record.kind === 'session-evicted');
-    const settledAt = lines.records.findIndex(record => record.kind === 'at-rest'
-      && record['sessionId'] === SES_B && record['reason'] === 'step');
-    assert.ok(evictedAt > settledAt && settledAt >= 0,
-      'the in-flight transform settled before the eviction was journalled');
   } finally {
-    releaseOpen();
+    releaseAsk({ text: '{}' });
     await mount.close();
   }
 });
@@ -240,6 +294,78 @@ test('ISSUE-393: a hook during close() neither re-opens a released session nor t
     if (closing !== null) await closing;
     // Red leaves a re-opened entry the first close's snapshot never visited;
     // the second close releases it so no handle outlives the test.
+    await mount.close();
+  }
+});
+
+test('ISSUE-407: a released id is not reopened by late event, tool or idle traffic', async () => {
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    journal: record => lines.records.push(record),
+  });
+  const opens = (): number => lines.of('storage-plan').length;
+  try {
+    await mount.transform(SES_A, smallMessages());
+    assert.equal(opens(), 1, 'the session opened once');
+    await mount.event(deletedEvent(SES_A));
+    assert.equal(mount.sessions.has(SES_A), false, 'the session was evicted');
+
+    // Late traffic names the released id; none of these lanes may reopen it.
+    await mount.event({ type: 'session.idle', data: { sessionID: SES_A } });
+    const forgot = await mount.forget(SES_A, { path: 'NOTES.md' });
+    assert.equal(forgot.status, 'refused', 'a tool call for a released id is refused');
+    await mount.idle(SES_A);
+    await mount.cremate(SES_A);
+    assert.equal(opens(), 1, 'no late lane opened a second ledger');
+    assert.equal(mount.sessions.has(SES_A), false, 'the released id stayed released');
+
+    // The host's own context hook is the genuine lifecycle opener.
+    await mount.transform(SES_A, smallMessages());
+    assert.equal(opens(), 2, 'the context hook may reopen a released id');
+    assert.equal(mount.sessions.has(SES_A), true, 'the reopened session is live again');
+  } finally {
+    await mount.close();
+  }
+});
+
+test('ISSUE-407: close refuses cremate and idle with a named journal reason', async () => {
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    askGrammar: 'prune-two-option',
+    askGenerate: async () => ({ text: '{}' }),
+    journal: record => lines.records.push(record),
+  });
+  let releaseClose = (): void => {};
+  let closeCall: Promise<void> | null = null;
+  try {
+    await mount.transform(SES_A, smallMessages());
+    const entryA = mount.sessions.get(SES_A);
+    assert.ok(entryA !== undefined, 'the session opened');
+    let markClosing = (): void => {};
+    const closingStarted = new Promise<void>(resolve => { markClosing = resolve; });
+    const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+    const originalClose = entryA.ledger.close.bind(entryA.ledger);
+    entryA.ledger.close = async () => { markClosing(); await closeGate; await originalClose(); };
+    closeCall = mount.close();
+    await closingStarted;
+
+    // Dispose has begun: neither the command nor the idle hook may start work.
+    assert.equal(await mount.cremate(SES_A), false, 'cremate refuses during close');
+    await mount.idle(SES_A);
+    assert.equal(lines.of('cremate').at(-1)?.['reason'], 'closing',
+      'the command names the refusal reason');
+    assert.equal(lines.of('at-rest').at(-1)?.['reason'], 'closing',
+      'the idle names the refusal reason');
+
+    releaseClose();
+    await closeCall;
+    closeCall = null;
+    assert.equal(mount.sessions.size, 0, 'the session was released');
+  } finally {
+    releaseClose();
+    if (closeCall !== null) await closeCall;
     await mount.close();
   }
 });

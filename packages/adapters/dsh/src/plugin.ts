@@ -30,12 +30,13 @@ import type {
   AnchorMode, Clock, ContentEstimate, EngineResult, EntryAskGrammar, EntryAskTriggerConfig,
   EntryBatchState, FreshZoneConfig, Ledger, MessageProvenance, ProtocolConfig,
   PruneAskGrammar, RacoonsConfig, RecallId, RecallRecord, RequestPrefix, Rule,
-  SessionSnapshot, Thresholds, ToolResultNode, UnitId, WireRequest,
+  SessionSnapshot, Thresholds, ToolResultNode, UnitId, WireRequest, ApplyReceipt, EventId,
+  IntentId, PruneWindowTriggerState,
 } from '@cremator/core';
 import { createDshCapabilities } from './capabilities.js';
 import { createDshAdapter } from './adapter.js';
 import type { DshAdapter } from './adapter.js';
-import { createDshTools } from './tools.js';
+import { DSH_TOOL_SPECS, createDshTools } from './tools.js';
 import type { DshToolHost, DshToolRegistration, DshToolSources } from './tools.js';
 import { forgetAnswerText } from './forget-tool.js';
 import type { DshForgetScheduled } from './forget-tool.js';
@@ -52,16 +53,25 @@ import type { EntryAskTurn } from './entry-ask.js';
 import type { EntryAnswer } from '@cremator/core';
 import { readAssistantUsage, usageRequestId } from './usage.js';
 import { revertSessionFromHost } from './mount-revert.js';
-import { DEFAULT_ASK_TIMEOUT_MS, messageOf } from './llm-ask.js';
-import { judgeRouteOf } from './route.js';
+import { DEFAULT_ASK_TIMEOUT_MS, MAX_ASK_DEADLINE_MS, messageOf } from './llm-ask.js';
+import { JudgeRouteError, judgeRouteOf, normalizeJudgeRoute } from './route.js';
 import type { JudgeRoute } from './route.js';
-import { captureMainRequest, createMainWireCapture } from './main-wire.js';
+import { captureMainRequest, createMainWireCapture, seedRouteStale } from './main-wire.js';
 import type { MainWireCapture } from './main-wire.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
-import { readPendingAppends, readPruneRound, readPruneTriggerState,
-  writePendingAppends, writePruneRound } from './prune-round-store.js';
-import type { DurableAppendRecord } from './prune-round-store.js';
+import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
+  readPendingEntryPublishes, readPruneRound, readPruneTriggerState,
+  writeEntryAskFired, writePendingAppends, writePendingEntryPublishes,
+  writePruneRound } from './prune-round-store.js';
+import type { DurableAppendRecord, DurableEntryPublish } from './prune-round-store.js';
+import { MOUNT_STATE_FILE, readDurableReceipts, readInstall, readPendingForgets,
+  removeDurableReceipt, writeDurableReceipt, writeInstall,
+  writePendingForgets } from './mount-state.js';
+import type { DurableForget, DurableInstall } from './mount-state.js';
+import { PREINSTALL_RECORD_FILE, markPreinstallReconciled, readPreinstallRecord,
+  writePreinstallRecord } from './preinstall-record.js';
+import type { DurablePreinstallRecord } from './preinstall-record.js';
 import { PruneWindowTrigger, resolveContextWindowTokens,
   resolvePruneThresholdTokens } from './prune-trigger.js';
 import { applyPrunePass } from './prune-apply.js';
@@ -102,6 +112,19 @@ const ASK_CARD_NAME = 'Cremating memory trash';
  * fact rather than a later guess.
  */
 export const CREMATOR_PLUGIN_INJECT: readonly string[] = Object.freeze(['llm', 'sessions']);
+
+/**
+ * Refused work after `close()` started (ISSUE-416). Once the mount is unloading,
+ * a boundary that reaches `sessionFor` must neither reopen a released session
+ * nor open a ledger nothing will close. Named so a host or a test can tell this
+ * apart from a storage failure and can silence it without hiding a real one.
+ */
+export class RacoonsClosingError extends Error {
+  constructor(sessionId: string) {
+    super(`cremator: mount is closing; refusing new work for session ${sessionId}`);
+    this.name = 'RacoonsClosingError';
+  }
+}
 
 /** The enforcement values this mount accepts. Absent means `apply` (ADR-0008). */
 export type RacoonsEnforcement = NonNullable<ProtocolConfig['enforcement']>;
@@ -377,7 +400,7 @@ export interface ResolvedRacoonsConfig {
  */
 export { CREMATOR_JOURNAL_KINDS } from './journal-kinds.js';
 export type { RacoonsJournalKind } from './journal-kinds.js';
-import type { RacoonsJournalKind } from './journal-kinds.js';
+import type { MountJournal, RacoonsJournalKind } from './journal-kinds.js';
 
 /** One journal record. The host selects where it goes; this file never writes. */
 export interface RacoonsJournalRecord {
@@ -617,10 +640,18 @@ export interface RacoonsSessionEntry {
    * The size floor this session resolved, in bytes (ADR-0020 Decision 3;
    * ISSUE-058 item 2). The flat knob wins; otherwise the route's model id picks
    * the table entry (`floorForModel`), and no route means the default 512. It
-   * is resolved here because core never sees a model id, and it is held on the
-   * entry so the ask lane reads one number instead of re-deriving it.
+   * is re-derived at every boundary from the live host route (ISSUE-432), so a
+   * mid-session model switch does not leave the old model's floor in force.
    */
-  readonly floorBytes: number;
+  floorBytes: number;
+  /**
+   * The provider/model the current `floorBytes` was derived from (ISSUE-432).
+   * `null` means the floor is model-independent (an explicit `floorBytes`) or
+   * no route was available. The pair makes a stale floor detectable instead of
+   * silent; a change journals `model-refresh`.
+   */
+  floorProvider: string | null;
+  floorModel: string | null;
   /**
    * Results whose entry answer SETTLED (ISSUE-058 chunk P3c-2; ADR-0025
    * §Decision 3–§5). In memory only, keyed by the capture's own result node id:
@@ -690,6 +721,54 @@ export interface RacoonsSessionEntry {
    */
   resumeRecovery: boolean;
   /**
+   * The tool-result node ids this session already held when the mount's durable
+   * state was first recorded (ISSUE-414). They predate this mount, so it never
+   * observed them land: recovery does not re-queue them and the bulk lane does
+   * not table or remove them. Empty for an in-memory session (no durable state
+   * to distinguish a restart from a fresh install) and for a first mount over an
+   * empty surface.
+   */
+  readonly preInstallNodeIds: ReadonlySet<string>;
+  /**
+   * The install generation this mount recorded or resumed (ISSUE-414): 1 on a
+   * fresh install, one more on each later mount of the same durable state, and
+   * null when the session has no durable target. It is a label for the journal,
+   * never a gate; the gate is whether durable state already existed.
+   */
+  readonly installGeneration: number | null;
+  /**
+   * Which install boundary this mount is (ISSUE-422): `fresh` is state written
+   * for an empty surface, `inherited` is a first mount into a session that
+   * already held history (a fork/clone the host did not announce, or a fresh
+   * install into history — the two shapes are indistinguishable from inside the
+   * adapter), `fork` is durable state naming a different session (the host
+   * copied a parent's state to a child id), `restart` is this session's own
+   * state, and `none` is an in-memory session with no durable identity.
+   */
+  readonly installBoundary: 'fresh' | 'inherited' | 'fork' | 'restart' | 'none';
+  /**
+   * Retries the durable install-identity write that failed at mount (ISSUE-439).
+   * The mount never journals a boundary the file does not hold; the next
+   * boundary retries the same identity and journals the deferred line once it
+   * lands. Null when the identity is durable (or the session is in memory).
+   */
+  retryInstallIdentity: (() => void) | null;
+  /**
+   * Bumped once per host compaction observation (ISSUE-423). An ask stamps the
+   * generation it was built under; if a compaction lands before its apply, the
+   * answer describes an array the host rewrote and the apply refuses by name.
+   */
+  compactionGeneration: number;
+  /**
+   * The ask/apply window currently open (ISSUE-423): `entry` while one entry
+   * ask and its applies run, `prune` while one bulk pass runs. A compaction
+   * observed inside a window does not re-arm the depth latch mid-flight; it is
+   * deferred to the window's end.
+   */
+  askWindow: 'none' | 'entry' | 'prune';
+  /** True when a compaction landed inside the open window and owes its re-arm. */
+  compactionRearmDeferred: boolean;
+  /**
    * Append applications the port committed but whose records the host may not
    * hold yet (ISSUE-342). The port's publish callback queues each committed
    * append here; a boundary flushes the queue to the surface and drops a request
@@ -699,6 +778,27 @@ export interface RacoonsSessionEntry {
    * ledger claims applied.
    */
   readonly pendingAppends: RacoonsApplicationRequest[];
+  /**
+   * Entry replacements the port committed but the host surface refused
+   * (ISSUE-441; ADR-0065). The ledger already records each one as applied, so a
+   * transient publish failure is named in the journal and the request stays
+   * queued for the next boundary instead of being dropped. A node-missing
+   * failure can never heal, so it is named once and removed from the head
+   * (ISSUE-449). No cap and no retry count: every boundary retries the head
+   * until it lands (standing rule 7 / ADR-0060).
+   */
+  readonly pendingEntryPublishes: {
+    readonly request: RacoonsApplicationRequest;
+    readonly capture: Capture;
+  }[];
+  /**
+   * Persist the entry-publish queue's current intent to the session's durable
+   * store (ISSUE-450). Present only when the session has a durable target; a
+   * release with a non-empty queue then leaves a replayable record, and a
+   * drained queue leaves none. Fail-open: a failed write journals and the
+   * in-memory queue still serves this process.
+   */
+  readonly persistPendingEntryPublishes?: () => void;
   /**
    * Persist the queue's current intent to the session's durable store
    * (ISSUE-374). Present only when the session has a durable target; the
@@ -728,9 +828,28 @@ export interface TurnEndOutcome {
   readonly appendRequest: RacoonsApplicationRequest | null;
 }
 
+/**
+ * One in-flight `session/end` release and the entry it owns (ISSUE-452): the
+ * entry is what decides coalescing, so a reopened life's end starts its own
+ * release instead of joining the old one. The registry holds a set of these per
+ * id (ISSUE-473), so two ends that do not coalesce are both registered and both
+ * drained; the promise is filled in once the release work exists.
+ */
+interface SessionEnding {
+  readonly entry: RacoonsSessionEntry | undefined;
+  promise: Promise<void>;
+}
+
 export interface RacoonsMount {
   readonly sessions: Map<string, RacoonsSessionEntry>;
   readonly counters: { entries: number; preSteps: number; publications: number; captured: number };
+  /**
+   * Every session id this mount still holds state for, across every per-session
+   * map `close()` releases (ISSUE-433; ISSUE-474). Read-only inspection for a
+   * shutdown that must leave no map holding a dead id. Lifecycle reading only —
+   * no cap, no timeout (ADR-0060).
+   */
+  observedSessionIds(): readonly string[];
   sessionFor(sessionId: string, host?: DshMountSession): Promise<RacoonsSessionEntry>;
   syncTranscript(entry: RacoonsSessionEntry, session: DshMountSession,
     options?: TranscriptSyncOptions): ReturnType<typeof surfaceTranscript>;
@@ -741,7 +860,8 @@ export interface RacoonsMount {
    * package sent itself is ignored, so an ask never becomes a seed.
    */
   observeWire(options: unknown): void;
-  runStep(session: DshMountSession, ordinals: { turn: number; step: number }): Promise<StepOutcome>;
+  runStep(session: DshMountSession, ordinals: { turn: number; step: number },
+    signal?: AbortSignal): Promise<StepOutcome>;
   runTurnEnd(session: DshMountSession, turn: number): Promise<TurnEndOutcome>;
   /**
    * Run one record-only prune pass now (ISSUE-022 chunk 5). The `/cremate`
@@ -749,15 +869,40 @@ export interface RacoonsMount {
    * directly. Nothing is applied or archived; the only appends are the
    * log-only command-card pair that shows the ask's status (ISSUE-372).
    */
-  runPrune(session: DshMountSession): Promise<RecordOnlyPruneOutcome | null>;
+  runPrune(session: DshMountSession, signal?: AbortSignal): Promise<RecordOnlyPruneOutcome | null>;
+  /**
+   * Publish one step's committed entry applications and retry any request an
+   * earlier boundary could not publish (ISSUE-441; ADR-0065). A failed publish
+   * is journaled by name and stays queued for the next boundary; the call never
+   * throws into the host hook. No cap and no retry count (standing rule 7 /
+   * ADR-0060).
+   */
+  publishEntryApplications(session: DshMountSession, entry: RacoonsSessionEntry,
+    applications: readonly { readonly request: RacoonsApplicationRequest;
+      readonly capture: Capture }[]): void;
+  /**
+   * Run one `forget`/`recall` tool call's work as a tracked per-session boundary
+   * (ISSUE-435), so `endSession`/`close()` await it before closing the ledger.
+   * A call that starts once `close()` began is refused with
+   * `RacoonsClosingError`. No cap or timeout (standing rule 7 / ADR-0060).
+   */
+  runToolWork<T>(sessionId: string, work: () => Promise<T>): Promise<T>;
+  /**
+   * Emit one line through the mount's swallowing journal wrapper (ISSUE-430).
+   * The shipped plugin writes its `mounted` line through this seam, so a
+   * throwing sink can never reject the plugin apply; every other mount line
+   * already rides the same wrapper.
+   */
+  emitJournal(kind: RacoonsJournalKind, fields: Record<string, unknown>): void;
   /**
    * The session-end drain+release (ISSUE-377): flush the committed-but-
    * unpublished appends through the ISSUE-342 path, then release the entry
    * through the same per-entry path `close()` uses. `observe` starts it at a
    * `session/end` surface event; a caller may await it to settle the eviction
-   * (a second call coalesces with the in-flight one). Idempotent: an already-
-   * released or never-opened session releases nothing. Lifecycle eviction
-   * only — no cap, no LRU, no timeout (standing rule 7 / ADR-0060).
+   * (a second call for the same open entry coalesces with the in-flight one;
+   * a reopened life's end starts its own release — ISSUE-452). Idempotent: an
+   * already-released or never-opened session releases nothing. Lifecycle
+   * eviction only — no cap, no LRU, no timeout (standing rule 7 / ADR-0060).
    */
   endSession(session: DshMountSession): Promise<void>;
   close(): Promise<void>;
@@ -827,6 +972,19 @@ const ENTRY_ASK_REFUSED_RAW_CHARS = 4000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Whether two depth-latch states are the same fact (ISSUE-475). A fork clears
+ * the inherited latch only while the file still holds the value it captured at
+ * mount; a child that re-armed it keeps its own state.
+ */
+function sameTriggerState(a: PruneWindowTriggerState | null,
+  b: PruneWindowTriggerState | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.lastFireUsage === b.lastFireUsage
+    && a.belowSinceFire === b.belowSinceFire
+    && a.baselinePending === b.baselinePending;
 }
 
 /** Validate the flat knobs and fill the engine's defaults. */
@@ -941,6 +1099,12 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined): Resol
   }
   if (!isCount(judgeTimeoutMs)) {
     throw new Error('cremator: judgeTimeoutMs must be a non-negative safe integer');
+  }
+  if (judgeTimeoutMs > MAX_ASK_DEADLINE_MS) {
+    // ISSUE-425: the platform clamps a delay beyond 2^31-1 ms to 1 ms, so a
+    // huge but valid config would abort almost immediately. Refuse by name.
+    throw new Error('cremator: judgeTimeoutMs must not exceed the platform timer range '
+      + `(${String(MAX_ASK_DEADLINE_MS)} ms); a larger delay would fire at 1 ms`);
   }
   if (typeof crematorStorageRoot !== 'string' || crematorStorageRoot.trim() === '') {
     throw new Error('cremator: crematorStorageRoot must be a non-empty path');
@@ -1512,6 +1676,69 @@ export function createRacoonsMount(options: {
       emit(Object.freeze({ kind, atMs: clock.nowMs(), ...fields }) as RacoonsJournalRecord);
     } catch { /* a journal sink must never alter engine outcomes */ }
   };
+  /**
+   * The host's warning channel, guarded (ISSUE-429): a throwing `warn` sink is
+   * presentation, so it can neither skip the ask nor replace its outcome.
+   */
+  const safeWarn = (message: string): void => {
+    try { options.warn?.(message); } catch { /* a warn sink must never change an outcome */ }
+  };
+  /**
+   * The configured route, validated and normalized ONCE at mount (ISSUE-427).
+   * `routeConfigured` separates "no fixed route" (the host header decides) from
+   * a configured blank pair, which means "off" and must not fall through to the
+   * header. An invalid field is a typed refusal: one `route-invalid` line names
+   * it and the mount runs as if no route were configured, never as if one were
+   * guessed. The value handed to both ask lanes is always a normalized route or
+   * null, so `askEntryBatch` keeps its no-throw contract.
+   */
+  let fixedRoute: JudgeRoute | null = null;
+  const routeConfigured = options.judgeRoute !== undefined;
+  if (routeConfigured) {
+    try {
+      fixedRoute = normalizeJudgeRoute(options.judgeRoute);
+    } catch (error) {
+      if (!(error instanceof JudgeRouteError)) throw error;
+      journal('route-invalid', { field: error.field, code: error.code, message: error.message });
+    }
+  }
+  const resolveRoute = (host: DshMountSession | null | undefined): JudgeRoute | null =>
+    routeConfigured ? fixedRoute : judgeRouteOf(host);
+  /**
+   * ISSUE-432: re-derive every model-derived per-entry parameter from the live
+   * host route. dsh exposes the route by pull (`requestHeader()`), not by a
+   * model-change event, so each boundary re-reads it here instead of trusting a
+   * mount-time snapshot. The floor is refreshed and stamped with the
+   * provider/model it came from; a change is named in `model-refresh`. The
+   * window is a mount option (model-independent), and the main-wire seed is
+   * invalidated at the ask when its own capture names a different model.
+   */
+  function refreshModelParameters(entry: RacoonsSessionEntry): void {
+    const route = resolveRoute(entry.host);
+    const provider = route?.provider ?? null;
+    const model = route?.model ?? null;
+    // An explicit floor wins for every model and carries no model provenance.
+    if (config.floorBytes !== null && config.floorBytes !== undefined) {
+      entry.floorProvider = null;
+      entry.floorModel = null;
+      return;
+    }
+    const next = floorForModel(model ?? undefined);
+    if (provider === entry.floorProvider && model === entry.floorModel
+      && next === entry.floorBytes) return;
+    const from = { provider: entry.floorProvider, model: entry.floorModel,
+      floorBytes: entry.floorBytes };
+    entry.floorProvider = provider;
+    entry.floorModel = model;
+    entry.floorBytes = next;
+    // ISSUE-469: the guard reads the engine's own config, so the refreshed
+    // floor must reach it too. One config, one floor: the ask gate and the
+    // engine cannot disagree about the model the route now names.
+    entry.engine.updateConfig(engineConfig(config, next));
+    journal('model-refresh', { sessionId: entry.sessionId, from,
+      to: { provider, model, floorBytes: next },
+      window: 'mount-option', seed: 'invalidated-on-model-mismatch' });
+  }
   const sessions = new Map<string, RacoonsSessionEntry>();
   const calls = new Map<string, Map<string, CallFacts>>();
   const buffers = new Map<string, Capture[]>();
@@ -1545,21 +1772,37 @@ export function createRacoonsMount(options: {
   const targets = new Map<string, ResolvedRacoonsStorage>();
   /**
    * In-flight session-end evictions (ISSUE-377), so a second `endSession` call
-   * coalesces with the first instead of racing its ledger close. Each entry
-   * removes itself when its eviction settles; this map holds only live work.
+   * for the SAME open entry coalesces with the first instead of racing its
+   * ledger close. Each registration carries the entry its end owns (ISSUE-452):
+   * after a reopen the mapped entry is a new life, so its `session/end` starts
+   * its own release instead of being swallowed by the old end. The registry is
+   * a SET per id (ISSUE-473, as `boundaries` is): two ends that legitimately do
+   * not coalesce are both registered and both drained, so a later registration
+   * can never drop an end that is still parked inside `ledger.close()`. Each
+   * registration removes only itself when its eviction settles; this map holds
+   * only live work.
    */
-  const endings = new Map<string, Promise<void>>();
+  const endings = new Map<string, Set<SessionEnding>>();
   /**
-   * In-flight boundary work per session (ISSUE-397), so `endSession` can wait
-   * out a running `runStep`/`runTurnEnd`/`runPrune` before releasing: a settled
-   * boundary must never requeue buffers for an ended session or reopen its
-   * released entry through the tail prune. Only the outermost boundary
-   * registers — a `runPrune` inside `runStep` rides its caller's promise — and
-   * each entry removes itself when its work settles, the `endings` style.
-   * This tracks work, not permission: reopen-after-end stays free (ISSUE-374).
-   * No cap, no timeout (standing rule 7 / ADR-0060).
+   * In-flight boundary work per session (ISSUE-397, ISSUE-401), so `endSession`
+   * can wait out every running `runStep`/`runTurnEnd`/`runPrune` before
+   * releasing: a settled boundary must never requeue buffers for an ended
+   * session or reopen its released entry through the tail prune. EVERY boundary
+   * registers its own promise, so a second concurrent boundary (a direct
+   * `runPrune` overlapping an in-flight ask) cannot escape the drain; a promise
+   * that settles removes only its own registration, whatever order the
+   * boundaries settle in. This tracks work, not permission: reopen-after-end
+   * stays free (ISSUE-374). No cap, no timeout (standing rule 7 / ADR-0060).
    */
-  const boundaries = new Map<string, Promise<unknown>>();
+  const boundaries = new Map<string, Set<Promise<unknown>>>();
+  /**
+   * Set once `close()` starts (ISSUE-416). The shutdown drains, flushes and
+   * releases, and a pre-step or turn-end delivered during those awaits must
+   * neither transform a still-mapped entry whose ledger close is next nor
+   * re-open a released session's ledger. `sessionFor` refuses from here on;
+   * work already in flight holds its entry and settles through the drain.
+   */
+  let closing = false;
   /**
    * The token estimate every boundary reads (ISSUE-022 chunk 6): the same four
    * bytes-per-token heuristic the engine's own meter uses, kept here as an
@@ -1622,7 +1865,7 @@ export function createRacoonsMount(options: {
         journal('storage-retry', { sessionId, attempt: failures,
           attempts: STORAGE_OPEN_ATTEMPTS, code, path, node: process.version,
           storage: target.databasePath, message });
-        options.warn?.(`storage open failed (${code} at ${path ?? target.databasePath});`
+        safeWarn(`storage open failed (${code} at ${path ?? target.databasePath});`
           + ` retrying at the next step boundary: ${message}`);
         throw new RacoonsStorageRetryError(sessionId, failures, { code, path, message });
       }
@@ -1660,9 +1903,26 @@ export function createRacoonsMount(options: {
 
   /** One engine/adapter/port triple per dsh session, opened on first use. */
   async function sessionFor(sessionId: string, host?: DshMountSession): Promise<RacoonsSessionEntry> {
+    // ISSUE-416: once close() starts, no new session work. A still-mapped entry's
+    // ledger close may be next in the release loop, and a released session must
+    // not re-open. Work already in flight holds its entry and never re-enters
+    // here (the step's tail prune is handed its caller's entry), so the refusal
+    // cannot abandon a drained boundary.
+    if (closing) throw new RacoonsClosingError(sessionId);
     const existing = sessions.get(sessionId);
     if (existing !== undefined) {
-      if (host !== undefined) existing.host = host;
+      if (host !== undefined) {
+        existing.host = host;
+        // ISSUE-432: the seam and the recall boundary were closed over the
+        // entry-opening host. Rebuild both from the host this boundary was
+        // handed, so a later mount/re-registration is not served the old host.
+        const nextSeam = revertSessionFromHost(host);
+        const nextRoot = typeof host.header?.cwd === 'string' && host.header.cwd.length > 0
+          ? host.header.cwd : undefined;
+        existing.port.updateHostSeams(nextSeam, nextRoot);
+      }
+      // ISSUE-432: the route may have changed under the same session id.
+      refreshModelParameters(existing);
       return existing;
     }
     const ownedLedger = options.openLedger === undefined;
@@ -1688,10 +1948,12 @@ export function createRacoonsMount(options: {
     // because the model id reaches this package and never core. An explicit
     // `floorBytes` wins for every model; otherwise the route's model picks its
     // table entry (`floorForModel`), and a mount with no route falls back to the
-    // measured default. The entry carries the number so the ask lane reads one
-    // value instead of re-deriving it.
+    // measured default. The entry carries the number AND the provider/model it
+    // came from (ISSUE-432); `refreshModelParameters` re-derives both at every
+    // boundary, so a mid-session switch is not left on the old model's floor.
+    const openingRoute = resolveRoute(host);
     const floorBytes = config.floorBytes
-      ?? floorForModel(judgeRouteOf(host, options.judgeRoute)?.model);
+      ?? floorForModel(openingRoute?.model);
     const publications: unknown[] = [];
     let latestRequest: RacoonsApplicationRequest | null = null;
     const pendingAppends: RacoonsApplicationRequest[] = [];
@@ -1713,9 +1975,55 @@ export function createRacoonsMount(options: {
     // queue stays in-process, exactly the ISSUE-342 behaviour.
     const durable = 'target' in derived && derived.target.databasePath !== ':memory:'
       ? derived.target : null;
+    // ISSUE-422: a fork/clone is the third case beside fresh and restart. The
+    // host announces no fork event in the seam this mount reads, so the in-repo
+    // identity is the durable state's own install record: state that names a
+    // DIFFERENT session is a parent's copy carried to a child id. The child
+    // inherits history the parent already settled, so it must not replay it,
+    // re-ask it or apply the parent's owed work. State written before the
+    // `sessionId` field existed reads as this session's own (a restart).
+    const priorInstall: DurableInstall | null = durable === null ? null : readInstall(durable);
+    const forkFrom = priorInstall !== null && priorInstall.sessionId !== undefined
+      && priorInstall.sessionId !== sessionId ? priorInstall.sessionId : null;
+    const forked = forkFrom !== null;
+    // ISSUE-477 / ISSUE-478: the pre-install proof and pending-clear marker in
+    // their own file, so they survive the install identity's own failed write.
+    // A record that names another session is the copied parent's and never
+    // answers for this child.
+    const priorPreinstall: DurablePreinstallRecord | null = durable === null
+      ? null : readPreinstallRecord(durable);
+    const ownPreinstall = priorPreinstall !== null && priorPreinstall.sessionId === sessionId
+      ? priorPreinstall : null;
+    // ISSUE-417: applied receipts a previous process minted. They let this
+    // mount's `lookupReceipt` resolve a prepared ledger row the previous process
+    // landed, so recovery does not read `unknown` and block forever. A fork
+    // reads them too (ISSUE-438, ADR-0064): the copied ledger is the child's
+    // record, and these receipts describe host writes on the inherited surface,
+    // so they are valid answers for that ledger.
+    const durableReceipts = durable === null ? [] : readDurableReceipts(durable);
+    // ISSUE-436: a receipt whose intent the ledger already records as `applied`
+    // is superseded crash-window state. Collect it at mount so a file written
+    // before this fix shrinks too; the ledger, not the copy, is the record of
+    // record (ADR-0015).
+    const receiptsInForce = durable === null || durableReceipts.length === 0
+      ? durableReceipts
+      : await collectSettledReceipts(durable, durableReceipts, ledger, journal, sessionId);
+    if (receiptsInForce.length > 0) {
+      journal('receipts-resumed', { sessionId, count: receiptsInForce.length });
+    }
     const port = createDshPort({ sessionId, clock,
       ...(seam === null ? {} : { revert: seam }),
       ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+      // ISSUE-417: a previous process's applied receipts come back from the
+      // mount's durable state, and every receipt this process mints is written
+      // there at the host write, so a prepared ledger row can be resolved after
+      // an unload instead of blocking recovery as `unknown` forever.
+      ...(durable === null ? {} : {
+        receipts: receiptsInForce,
+        persistReceipt: (receipt: ApplyReceipt) => {
+          writeDurableReceipt(durable, receipt, journal, sessionId);
+        },
+      }),
       publish: (request) => {
         const owned = request as unknown as RacoonsApplicationRequest;
         latestRequest = owned;
@@ -1766,15 +2074,354 @@ export function createRacoonsMount(options: {
     // applies at the same seam every other removal does and never from inside a
     // host callback (which forbids appends). The queue is per session and lives
     // on the entry, so a second session can never apply another's request.
-    const pendingForgets: DshForgetScheduled[] = [];
+    // ISSUE-417: a request the tool answered "scheduled" for is written to the
+    // durable mount state BEFORE that answer leaves, and a remount re-queues it
+    // here, so an unload between the answer and the drain can never lose it.
+    const pendingForgets: DshForgetScheduled[] = durable === null || forked ? []
+      : readPendingForgets(durable).map(forgetFromDurable);
+    if (pendingForgets.length > 0) {
+      journal('forget-recovered', { sessionId, count: pendingForgets.length });
+    }
     const adapter = createDshAdapter({ engine, port, clock,
-      onForget: decision => { pendingForgets.push(decision); },
+      onForget: decision => {
+        pendingForgets.push(decision);
+        // The tool answers only after this write lands. A failed write rolls the
+        // in-memory push back and throws, and the adapter refuses by name rather
+        // than accept a request no remount could replay.
+        if (durable !== null
+          && !writePendingForgets(durable, pendingForgets.map(durableForgetOf), journal, sessionId)) {
+          pendingForgets.pop();
+          journal('forget-persist-error', { sessionId, eventId: decision.eventId,
+            pending: pendingForgets.length });
+          throw new Error('the queued forget could not be made durable');
+        }
+      },
       ...(seam === null ? {} : { revert: seam }) });
     // The round the last process completed, read back from this session's own
     // directory (ISSUE-022 chunk 6). `':memory:'` answers 0, so tests keep the
     // old per-process behaviour unless they opt into a durable root.
     if (durable !== null) targets.set(sessionId, durable);
-    const persistedRound = durable === null ? 0 : readPruneRound(durable);
+    // ISSUE-414: the install boundary. Durable mount state that already exists
+    // means this session's state is ours — a restart, and recovery runs exactly
+    // as before. No durable state at all means this mount is being installed
+    // into a session that may already hold history: it records the tool-result
+    // node ids already on that surface, recovers nothing, and never tables,
+    // removes or asks about them. An in-memory session has no durable state to
+    // read, so it keeps the pre-414 behaviour (recover).
+    let installGeneration: number | null = null;
+    let preInstallNodeIds: ReadonlySet<string> = new Set<string>();
+    let installBoundary: RacoonsSessionEntry['installBoundary'] = 'none';
+    let retryInstallIdentity: (() => void) | null = null;
+    let installWriteFailed = false;
+    let forkClearPending = false;
+    let forkReborn = false;
+    let recoveredFromLedger = false;
+    if (durable !== null) {
+      // ISSUE-437 / ISSUE-456 / ISSUE-457 / ISSUE-475 / ISSUE-476: the copied
+      // durable state still names the parent's owed work and the parent's round
+      // history. Skipping the reads is not removing the facts, and the child's
+      // next mount would be a restart that replays or inherits them as its own.
+      // ISSUE-475: the inherited facts are captured ONCE, at mount. A retry
+      // clears only what that snapshot still finds, so anything the child wrote
+      // after mount (its own round, first-ask flag, accepted forget or append)
+      // is never dropped and never reported as the parent's. ISSUE-476: the
+      // entry-publish queue is a cleared fact too. Each clear's result is read:
+      // the drop line counts only facts whose write returned true, a failed
+      // clear is named beside its file and count, and the fork withholds the
+      // child's install identity until every fact is gone, so the next mount is
+      // still a fork and never replays them. A failed count is retried at the
+      // next boundary (no new cap; ADR-0060).
+      interface ForkFactsSnapshot {
+        readonly forgets: readonly DurableForget[];
+        readonly appends: readonly DurableAppendRecord[];
+        readonly publishes: readonly DurableEntryPublish[];
+        readonly round: number;
+        readonly trigger: PruneWindowTriggerState | null;
+        readonly entryAskFired: boolean;
+      }
+      let forkFacts: ForkFactsSnapshot | null = null;
+      const captureForkFacts = (): ForkFactsSnapshot => ({
+        forgets: readPendingForgets(durable),
+        appends: readPendingAppends(durable, journal, sessionId),
+        publishes: readPendingEntryPublishes(durable, journal, sessionId),
+        round: readPruneRound(durable),
+        trigger: readPruneTriggerState(durable),
+        entryAskFired: readEntryAskFired(durable),
+      });
+      const publishKey = (record: DurableEntryPublish): string =>
+        `${record.callId}\u0000${record.eventId}`;
+      // The header facts are value-shaped, so "the parent's" cannot be told from
+      // "the child's" by reading the file after the child has written. The
+      // owed state is therefore carried across calls: a fact the mount-time
+      // clear already reconciled is never attempted again (ISSUE-475).
+      let owedHeader: { round: boolean; askFired: boolean } | null = null;
+      const clearForkFacts = (): boolean => {
+        const facts = forkFacts ??= captureForkFacts();
+        owedHeader ??= { round: facts.round > 0 || facts.trigger !== null,
+          askFired: facts.entryAskFired };
+        // Forgets: remove only the records the mount-time snapshot holds.
+        const currentForgets = readPendingForgets(durable);
+        const parentForgetIds = new Set(facts.forgets.map(record => record.eventId));
+        const parentForgets = currentForgets.filter(record => parentForgetIds.has(record.eventId));
+        let droppedForgets = 0;
+        if (parentForgets.length > 0
+          && writePendingForgets(durable,
+            currentForgets.filter(record => !parentForgetIds.has(record.eventId)),
+            journal, sessionId)) {
+          droppedForgets = parentForgets.length;
+        }
+        const forgetsLeft = parentForgets.length - droppedForgets;
+        // Appends: same rule, keyed by the durable record id.
+        const currentAppends = readPendingAppends(durable, journal, sessionId);
+        const parentAppendIds = new Set(facts.appends.map(record => record.recordId));
+        const parentAppends = currentAppends.filter(record => parentAppendIds.has(record.recordId));
+        let droppedAppends = 0;
+        if (parentAppends.length > 0
+          && writePendingAppends(durable,
+            currentAppends.filter(record => !parentAppendIds.has(record.recordId)),
+            journal, sessionId)) {
+          droppedAppends = parentAppends.length;
+        }
+        const appendsLeft = parentAppends.length - droppedAppends;
+        // ISSUE-476: the entry-publish queue the parent committed but never
+        // landed is a cleared fact like an append, and a file can hold it alone.
+        const currentPublishes = readPendingEntryPublishes(durable, journal, sessionId);
+        const parentPublishKeys = new Set(facts.publishes.map(publishKey));
+        const parentPublishes = currentPublishes.filter(record =>
+          parentPublishKeys.has(publishKey(record)));
+        let droppedPublishes = 0;
+        if (parentPublishes.length > 0
+          && writePendingEntryPublishes(durable,
+            currentPublishes.filter(record => !parentPublishKeys.has(publishKey(record))),
+            journal, sessionId)) {
+          droppedPublishes = parentPublishes.length;
+        }
+        const publishesLeft = parentPublishes.length - droppedPublishes;
+        // The parent's round, latch and first-ask flag are not the child's
+        // (ISSUE-457). Each is cleared only while it is still owed and the file
+        // still holds the snapshot's value, so a child that advanced one keeps
+        // it (ISSUE-475).
+        let droppedRound = false;
+        let roundLeft = 0;
+        if (owedHeader.round) {
+          const currentRound = readPruneRound(durable);
+          if (currentRound !== facts.round) {
+            // The child advanced the ordinal: the parent's header is gone.
+            owedHeader.round = false;
+          } else {
+            const currentTrigger = readPruneTriggerState(durable);
+            // ISSUE-475: a latch the child wrote is kept even when the snapshot
+            // held none; only the value the fork captured may be cleared.
+            const keepTrigger = sameTriggerState(currentTrigger, facts.trigger)
+              ? undefined : (currentTrigger ?? undefined);
+            if (writePruneRound(durable, 0, journal, sessionId, keepTrigger)) {
+              droppedRound = true;
+              owedHeader.round = false;
+            } else {
+              roundLeft = (facts.round > 0 ? 1 : 0) + (facts.trigger !== null ? 1 : 0);
+            }
+          }
+        }
+        let droppedAsk = false;
+        let askLeft = false;
+        if (owedHeader.askFired) {
+          const currentAskFired = readEntryAskFired(durable);
+          if (!currentAskFired) {
+            owedHeader.askFired = false;
+          } else if (writeEntryAskFired(durable, false, journal, sessionId)) {
+            droppedAsk = true;
+            owedHeader.askFired = false;
+          } else {
+            askLeft = true;
+          }
+        }
+        if (droppedForgets > 0 || droppedAppends > 0 || droppedPublishes > 0
+          || droppedRound || droppedAsk) {
+          journal('fork-state-dropped', { sessionId, parentSessionId: forkFrom,
+            forgets: droppedForgets, appends: droppedAppends,
+            entryPublishes: droppedPublishes,
+            ...(droppedRound ? { round: facts.round, latch: facts.trigger !== null } : {}),
+            ...(droppedAsk ? { entryAskFired: true } : {}) });
+        }
+        if (forgetsLeft > 0) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: MOUNT_STATE_FILE, fact: 'forgets', count: forgetsLeft });
+        }
+        if (appendsLeft > 0) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: PRUNE_ROUND_FILE, fact: 'appends', count: appendsLeft });
+        }
+        if (publishesLeft > 0) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: PRUNE_ROUND_FILE, fact: 'entryPublishes', count: publishesLeft });
+        }
+        if (roundLeft > 0) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: PRUNE_ROUND_FILE, fact: 'round', count: roundLeft });
+        }
+        if (askLeft) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: PRUNE_ROUND_FILE, fact: 'entryAskFired', count: 1 });
+        }
+        return forgetsLeft === 0 && appendsLeft === 0 && publishesLeft === 0
+          && roundLeft === 0 && !askLeft;
+      };
+      const surfaceToolIds = host === undefined ? []
+        : surfaceTranscript(host, { sessionId }).items
+          .filter(item => item.role === 'tool').map(item => item.id);
+      let identity: DurableInstall;
+      if (forked) {
+        // ISSUE-422: the state names the parent. Every result on the inherited
+        // surface was settled by the parent, so all of it is this child's
+        // pre-install history; the child records its own generation-1 identity
+        // over the copy so a later mount of the child is a plain restart.
+        // ISSUE-478: a re-fork of a child that already ran here keeps the
+        // pre-install set its own first fork recorded. Recomputing it from the
+        // surface would promote the child's own results to inherited history.
+        const restoredIds = ownPreinstall !== null ? [...ownPreinstall.ids] : surfaceToolIds;
+        forkReborn = ownPreinstall !== null;
+        if (ownPreinstall !== null && ownPreinstall.pendingClear) {
+          journal('fork-clear-pending', { sessionId, parentSessionId: forkFrom,
+            ids: restoredIds.length, file: PREINSTALL_RECORD_FILE });
+        }
+        installGeneration = 1;
+        preInstallNodeIds = new Set(restoredIds);
+        installBoundary = 'fork';
+        identity = { generation: 1, installedAtMs: clock.nowMs(),
+          preInstallNodeIds: restoredIds, sessionId };
+        forkClearPending = !clearForkFacts();
+        // The marker is independent of the withheld identity, so the next mount
+        // knows both the inherited set and that the clear is still owed.
+        writePreinstallRecord(durable, { sessionId, ids: restoredIds,
+          pendingClear: forkClearPending }, journal, sessionId);
+      } else if (priorInstall === null) {
+        // ISSUE-460: the failed-write retry lives only in the entry closure, so
+        // a death before the boundary lands leaves no install identity. A ledger
+        // row under THIS session id is proof the session already ran here (a
+        // fork's copied rows carry the parent's id, so they never count). Trust
+        // the ledger over the missing file: classify a restart, promote nothing
+        // to pre-install, and name the fallback.
+        if (await ledgerHasRows(ledger, sessionId)) {
+          // ISSUE-477: the pre-install set the first mount computed is durable
+          // proof independent of the install identity, so a death before that
+          // identity lands does not promote inherited history to eligible.
+          // Without that proof the surface cannot be shown to be this session's
+          // own, so every surface result stays excluded by name.
+          const ids = ownPreinstall !== null ? [...ownPreinstall.ids] : surfaceToolIds;
+          installGeneration = 1;
+          preInstallNodeIds = new Set(ids);
+          installBoundary = 'restart';
+          identity = { generation: 1, installedAtMs: clock.nowMs(),
+            preInstallNodeIds: ids, sessionId };
+          recoveredFromLedger = true;
+          journal('install-fallback', { sessionId, reason: 'ledger-rows',
+            source: ownPreinstall !== null ? 'preinstall-record' : 'surface-unsafe',
+            preInstall: ids.length });
+          if (ownPreinstall === null) {
+            writePreinstallRecord(durable, { sessionId, ids, pendingClear: false },
+              journal, sessionId);
+          }
+        } else {
+          // ISSUE-414: "pre-install" is what this mount never OBSERVED land. The
+          // session/event observer has captured every result appended since the
+          // plugin was applied, so a surface result absent from the capture
+          // buffer predates the plugin and must never be replayed, asked over or
+          // removed. (A host that appends between apply and the first session
+          // registration cannot be told apart; it is the same shape a fresh
+          // install into existing history produces, so it is excluded too.)
+          const observed = new Set((buffers.get(sessionId) ?? []).map(capture => capture.eventId));
+          const ids = host === undefined ? [] : surfaceTranscript(host, { sessionId }).items
+            .filter(item => item.role === 'tool' && !observed.has(item.id))
+            .map(item => item.id);
+          installGeneration = 1;
+          preInstallNodeIds = new Set(ids);
+          // ISSUE-422: history already present on a first mount is the fork shape
+          // the host did not announce; NAMED `inherited` instead of guessed at.
+          installBoundary = ids.length > 0 ? 'inherited' : 'fresh';
+          identity = { generation: 1, installedAtMs: clock.nowMs(),
+            preInstallNodeIds: ids, sessionId };
+          // ISSUE-477: record the exclusion before the first pass, in its own
+          // file, so a lost install write cannot erase it.
+          writePreinstallRecord(durable, { sessionId, ids, pendingClear: false },
+            journal, sessionId);
+        }
+      } else {
+        installGeneration = priorInstall.generation + 1;
+        preInstallNodeIds = new Set(priorInstall.preInstallNodeIds);
+        installBoundary = 'restart';
+        identity = { ...priorInstall, generation: installGeneration,
+          sessionId: priorInstall.sessionId ?? sessionId };
+      }
+      const journalBoundary = (): void => {
+        journal('install-boundary', { sessionId, generation: installGeneration,
+          fresh: priorInstall === null, state: installBoundary,
+          preInstall: preInstallNodeIds.size,
+          ...(forkFrom === null ? {} : { parentSessionId: forkFrom }) });
+      };
+      const attemptedBoundary = installBoundary;
+      if (forked && forkClearPending) {
+        // ISSUE-456: the child must not record its own install identity while a
+        // parent fact the fork could not clear still sits on the copy. Keeping
+        // the parent's identity on disk makes the next mount a fork again,
+        // which never replays inherited work, and the boundary retries the
+        // clear until both facts are gone (ADR-0065 Decision 2/3).
+        installWriteFailed = true;
+        journal('install-persist-error', { sessionId, state: attemptedBoundary,
+          generation: identity.generation, retry: 'next-boundary',
+          reason: 'fork-clear-pending' });
+        retryInstallIdentity = () => {
+          if (!clearForkFacts()) {
+            journal('install-persist-error', { sessionId, state: attemptedBoundary,
+              generation: identity.generation, retry: 'next-boundary',
+              reason: 'fork-clear-pending' });
+            return;
+          }
+          if (writeInstall(durable, identity, journal, sessionId)) {
+            journalBoundary();
+            // ISSUE-478: the pending clear is done, so the marker no longer
+            // says a fork still owes the parent's facts.
+            markPreinstallReconciled(durable, journal, sessionId);
+            retryInstallIdentity = null;
+          } else {
+            journal('install-persist-error', { sessionId, state: attemptedBoundary,
+              generation: identity.generation, retry: 'next-boundary' });
+          }
+        };
+      } else if (writeInstall(durable, identity, journal, sessionId)) {
+        journalBoundary();
+      } else {
+        // ISSUE-439 / ADR-0065: a durable write that failed is never treated as
+        // landed. The mount does not journal a boundary the file does not hold;
+        // it fails closed and retries the identity at each boundary until it
+        // lands. ISSUE-458: only a genuine restart (a prior install exists)
+        // falls back to "this session's own state with no result promoted to
+        // pre-install". A first mount classified `inherited` or `fresh` keeps
+        // the set it just computed — those ids were proved never observed, so
+        // demoting them would make history eligible.
+        installWriteFailed = true;
+        if (!forked && priorInstall !== null) {
+          installGeneration = priorInstall.generation + 1;
+          preInstallNodeIds = new Set(priorInstall.preInstallNodeIds);
+          installBoundary = 'restart';
+          identity = { ...priorInstall, generation: installGeneration,
+            installedAtMs: priorInstall.installedAtMs,
+            preInstallNodeIds: [...preInstallNodeIds],
+            sessionId: priorInstall.sessionId ?? sessionId };
+        }
+        journal('install-persist-error', { sessionId, state: attemptedBoundary,
+          generation: identity.generation, retry: 'next-boundary' });
+        retryInstallIdentity = () => {
+          if (writeInstall(durable, identity, journal, sessionId)) {
+            journalBoundary();
+            retryInstallIdentity = null;
+          } else {
+            journal('install-persist-error', { sessionId, state: attemptedBoundary,
+              generation: identity.generation, retry: 'next-boundary' });
+          }
+        };
+      }
+    }
+    const persistedRound = durable === null || forked ? 0 : readPruneRound(durable);
     if (persistedRound > 0) {
       journal('prune-round-resumed', { sessionId, round: persistedRound });
     }
@@ -1783,21 +2430,47 @@ export function createRacoonsMount(options: {
       pruneTrigger: new PruneWindowTrigger(config.contextWindowTokens,
         config.pruneThresholdTokens),
       requestEstimate: null, usageSeen: new Set<string>(), pendingForgets, floorBytes,
+      floorProvider: (config.floorBytes === undefined || config.floorBytes === null)
+        ? (openingRoute?.provider ?? null) : null,
+      floorModel: (config.floorBytes === undefined || config.floorBytes === null)
+        ? (openingRoute?.model ?? null) : null,
       billedPromptTokens: null,
       entryJudged: new Set<string>(), entryKept: new Set<string>(),
-      entryBatch: { pending: [] }, entryLandedBytes: 0, entryAskFired: false,
+      // ISSUE-406: the first-ask flag is a claim about THIS session's ask
+      // history, so a restart restores it from the same durable file the round
+      // and latch ride. A fork starts false: the parent's history is not its.
+      entryBatch: { pending: [] }, entryLandedBytes: 0,
+      entryAskFired: durable === null || forked ? false : readEntryAskFired(durable),
       entryBatchUnit: new Map(),
-      resumeRecovery: true,
+      resumeRecovery: durable === null
+        || (forked
+          // ISSUE-478: a re-fork whose own proof names this session resumed, so
+          // its own results on the surface are recovered; a first fork has no
+          // proof and never replays the parent's inherited work.
+          ? forkReborn
+          : (priorInstall !== null || installWriteFailed || recoveredFromLedger)),
+      preInstallNodeIds, installGeneration,
+      installBoundary, retryInstallIdentity,
+      compactionGeneration: 0, askWindow: 'none',
+      compactionRearmDeferred: false,
       pendingAppends,
+      pendingEntryPublishes: [],
       ...(durable === null ? {} : { persistPendingAppends: () => {
         writePendingAppends(durable, durableAppendsOf(pendingAppends), journal, sessionId);
+      } }),
+      // ISSUE-450: the entry-publish queue is durable too, so a release with a
+      // non-empty queue leaves a replayable record instead of losing the
+      // replacement with the process. The closure reads the queue at call time.
+      ...(durable === null ? {} : { persistPendingEntryPublishes: () => {
+        writePendingEntryPublishes(durable,
+          durableEntryPublishesOf(entry.pendingEntryPublishes), journal, sessionId);
       } }),
       takePublication: () => { const value = latestRequest; latestRequest = null; return value; } };
     // The latch's post-pass state rides the round file (ISSUE-336): a remount
     // restores the baseline the last process left, so the first observation
     // after a restart is not counted as fresh growth past a stale zero. An
     // unreadable or absent state leaves the fresh latch untouched.
-    const persistedTrigger = durable === null ? null : readPruneTriggerState(durable);
+    const persistedTrigger = durable === null || forked ? null : readPruneTriggerState(durable);
     if (persistedTrigger !== null) {
       entry.pruneTrigger.restore(persistedTrigger);
       journal('prune-trigger-resumed', { sessionId, ...persistedTrigger });
@@ -1959,6 +2632,12 @@ export function createRacoonsMount(options: {
    * episode can call it a miss.
    */
   function observe(session: DshMountSession, event: DshMountEvent): DshToolResultItem | null {
+    // ISSUE-474: once `close()` starts, observation must not write. The host's
+    // listeners stay attached through dispose, and the shutdown enumerates the
+    // observed ids once; a late `tool/call`, `tool/result`, `/cremate` or
+    // `session/end` would otherwise re-add an id that was already evicted after
+    // the release loop passed it. Mirrors `sessionFor`'s refusal (ISSUE-416).
+    if (closing) return null;
     const data = isRecord(event.data) ? event.data : {};
     // A step's authoritative accounting (G8, ISSUE-045 D1; PRD §6.9). The host
     // attaches the model adapter's `usage` row to `assistant/message` and emits
@@ -1996,32 +2675,52 @@ export function createRacoonsMount(options: {
     // or rewrites the host's compaction (owner ruling 2026-10-23, ISSUE-029);
     // the flag only decides whether the observation re-arms our own latch. The
     // observation is journaled either way, so a run shows that it happened.
-    if (event.type === 'compaction/end') {
+    //
+    // ISSUE-423: `compaction/start` is read too, when the host emits it, because
+    // it is the earliest moment an in-flight ask's array is known to be gone.
+    // Either phase bumps the compaction generation; an ask/apply window that is
+    // open DEFERS the latch re-arm instead of taking it mid-flight, so a
+    // compaction during one ask cannot arm a second above-bar ask while that
+    // ask's apply runs (ADR-0050's backstop still fires, at the window's end).
+    if (event.type === 'compaction/start' || event.type === 'compaction/end') {
+      const phase = event.type === 'compaction/start' ? 'start' : 'end';
       const armed = config.nativeCompactionBackstop;
       const entry = sessions.get(session.id);
-      if (armed && entry !== undefined) {
-        entry.pruneTrigger.noteNativeCompaction();
-        // The re-arm is durable too (ISSUE-336): a restart after a native
-        // compaction must not resurrect the pre-compaction baseline.
-        const target = targets.get(session.id);
-        if (target !== undefined) {
-          writePruneRound(target, entry.pruneRounds, journal, entry.sessionId,
-            entry.pruneTrigger.snapshot());
+      let generation: number | null = null;
+      let rearmed = false;
+      let deferred = false;
+      if (entry !== undefined) {
+        entry.compactionGeneration += 1;
+        generation = entry.compactionGeneration;
+        if (entry.askWindow !== 'none') {
+          entry.compactionRearmDeferred = true;
+          deferred = true;
+          journal('native-compaction-deferred', { sessionId: entry.sessionId,
+            seq: event.seq, phase, generation, window: entry.askWindow, armed });
+        } else if (phase === 'end' && armed) {
+          entry.pruneTrigger.noteNativeCompaction();
+          rearmed = true;
+          // The re-arm is durable too (ISSUE-336): a restart after a native
+          // compaction must not resurrect the pre-compaction baseline.
+          const target = targets.get(session.id);
+          if (target !== undefined) {
+            writePruneRound(target, entry.pruneRounds, journal, entry.sessionId,
+              entry.pruneTrigger.snapshot());
+          }
         }
       }
       journal('native-compaction', { sessionId: session.id, seq: event.seq,
-        rearmed: armed && entry !== undefined });
+        phase, generation, armed, rearmed, ...(deferred ? { deferred: true } : {}) });
       return null;
     }
-    // The session ended (ISSUE-350): its capture and call facts are dead state.
-    // Evict both per-session maps so memory tracks live sessions, not every
-    // session ever seen. Lifecycle eviction, not a size cap (ADR-0060).
+    // The session ended (ISSUE-350, ISSUE-418): its entry, capture and call
+    // facts are dead state, but an in-flight boundary may still be reading them
+    // — an ask that has not read its seed yet, a later `syncPass` pairing a
+    // result with its call facts. So this branch evicts NOTHING: the release
+    // path does, after the drain and the flush, once no work can read them.
+    // Evicting here would turn a valid seed into a false `no-seed`.
     if (event.type === 'session/end') {
-      calls.delete(session.id);
-      mainWire.evict(session.id);
-      // The heaviest per-session state — the open ledger/engine/port entry,
-      // the buffers and the durable target — goes too (ISSUE-377). The
-      // drain+release appends, so it must not run inside this observer:
+      // The drain+release appends, so it must not run inside this observer:
       // `endSession` yields out of the synchronous dispatch first, and never
       // rejects (every leg fails open), so starting it here is safe.
       void endSession(session);
@@ -2060,6 +2759,9 @@ export function createRacoonsMount(options: {
 
   /** Observe one request the host dispatched; junk and our own asks are skipped. */
   function observeWire(options: unknown): void {
+    // ISSUE-474: a request dispatched while `close()` runs must not re-add an
+    // already-released session id to the main-wire store. See `observe`.
+    if (closing) return;
     mainWire.note(options);
   }
 
@@ -2230,18 +2932,47 @@ export function createRacoonsMount(options: {
    * one: `surfaceTranscript` names a message `dsh:<session>:message:<seq>`, and
    * `mount-revert.ts` repeats that formula, so both agree.
    */
-  function appendAskTurns(session: DshMountSession,
-    turns: readonly EntryAskTurn[]): readonly DshMountEvent[] {
+  function appendAskTurns(entry: RacoonsSessionEntry, session: DshMountSession,
+    turns: readonly EntryAskTurn[]): readonly DshMountEvent[] | null {
     const events: DshMountEvent[] = [];
-    for (const turn of turns) {
-      events.push(session.append('user/message', {
-        content: [{ type: 'text', text: turn.text }],
-        source: { kind: `${config.recordName}/entry-ask` },
-        role: 'user',
-        id: randomUUID(),
-      }, { surfaceOp: 'append' }));
+    try {
+      for (const turn of turns) {
+        events.push(session.append('user/message', {
+          content: [{ type: 'text', text: turn.text }],
+          source: { kind: `${config.recordName}/entry-ask` },
+          role: 'user',
+          id: randomUUID(),
+        }, { surfaceOp: 'append' }));
+      }
+      return events;
+    } catch (error) {
+      // ISSUE-403: a partial append is not the same state as "appended, then
+      // apply failed". The turns already written are a question the user never
+      // asked, so collapse that prefix NOW instead of waiting for cold recovery.
+      const message = messageOf(error);
+      const first = events[0], last = events[events.length - 1];
+      const collapse = first === undefined || last === undefined ? null
+        : entry.port.rewindAskExchange({ resultNodeId: '',
+          askNodeId: messageNodeId(entry.sessionId, first.seq),
+          answerNodeId: messageNodeId(entry.sessionId, last.seq), summary: '' });
+      if (collapse !== null) {
+        // The collapse is the mount's write, never a row's apply.
+        entry.port.takeEntryWrite();
+      }
+      // ISSUE-479: a throwing append leaves the write outcome UNKNOWN. The
+      // throwing turn may have landed even though no event was returned, so the
+      // collapsed range built from the returned events cannot prove the
+      // exchange left the surface — and with zero events there is no range at
+      // all. Keep the exchange owed on every throw so the next boundary's
+      // surface scan collapses whatever `entry-ask` turns actually landed
+      // (ISSUE-403, ISSUE-463).
+      entry.resumeRecovery = true;
+      journal('entry-ask-append-failed', { sessionId: entry.sessionId,
+        appended: events.length, message,
+        ...(collapse === null ? {} : { collapse: collapse.status }),
+        ...(collapse !== null && collapse.status === 'refused' ? { code: collapse.code } : {}) });
+      return null;
     }
-    return events;
   }
 
   /**
@@ -2330,11 +3061,27 @@ export function createRacoonsMount(options: {
       ...write !== null && 'code' in write ? { code: write.code } : {},
       engineStatus: outcome.engine.status, intentId: outcome.engine.intentId,
     });
+    if (outcome.engine.status === 'applied') {
+      // ISSUE-436: the engine wrote its `applied` row, so the crash-window copy
+      // of this receipt has no further reader.
+      collectSettledReceipt(entry, outcome.engine.intentId);
+    }
     if (outcome.status === 'fail-open') {
+      // A host write that MOVED while the engine could not record it is
+      // recovery-pending, not "core planned nothing" (ISSUE-430): `recordApplied`
+      // failing after the write lands leaves the receipt unproved, so the next
+      // pass must reconcile before it applies again. The moved surface is read
+      // from the host's own seq delta (`appends`): the adapter consumes the
+      // write slot on a non-applied engine result, so the delta is the evidence
+      // that survives. Name that true cause.
+      const hostMoved = appends !== null ? appends > 0 : write?.status === 'applied';
+      const movedUnrecorded = outcome.engine.status === 'recovery-pending' && hostMoved;
       journal('entry-apply-refused', { sessionId: entry.sessionId, eventId: capture.eventId,
         answerEventId, status: 'fail-open',
         code: outcome.refusal?.code ?? null,
-        detail: outcome.refusal?.detail ?? 'core planned nothing to apply',
+        detail: outcome.refusal?.detail ?? (movedUnrecorded
+          ? 'the host write moved but its applied record could not be written; recovery-pending'
+          : 'core planned nothing to apply'),
         engineStatus: outcome.engine.status });
     }
     // The surface moved exactly when the host appended: `appends` is the host's
@@ -2414,7 +3161,7 @@ export function createRacoonsMount(options: {
    * early exit journals ONE line naming why the seam did nothing.
    */
   async function runEntryAsks(entry: RacoonsSessionEntry, session: DshMountSession,
-    captures: readonly Capture[]): Promise<void> {
+    captures: readonly Capture[], signal?: AbortSignal): Promise<void> {
     const trigger = config.entryAskTrigger;
     if (trigger.mode === 'off') {
       // ADR-0050 decision 4: the product configuration. Each result the entry
@@ -2431,12 +3178,13 @@ export function createRacoonsMount(options: {
       return;
     }
     const llm = options.llm;
-    const route = judgeRouteOf(entry.host ?? session, options.judgeRoute);
-    // One breaker reading for the whole step. A disabled breaker is machinery
-    // health, not a content decision (ADR-0020 §Decision 5b): the ask lane
-    // stands down and the results land whole. An unreadable ledger is not a
-    // breaker reading at all, and says so.
-    const breaker = await breakerReading(entry);
+    const route = resolveRoute(entry.host ?? session);
+    // One ledger-health reading for the whole step (ISSUE-440; ISSUE-426): the
+    // same three-way read the prune lane uses before its paid send. A disabled
+    // breaker is machinery health, an unreadable ledger says nothing about it,
+    // and an unfinished `prepared` intent means core's next pass would answer
+    // `recovery-pending` and apply nothing — so a paid ask cannot land.
+    const standdown = await ledgerStanddown(entry);
     for (const capture of captures) {
       if (!entryAskable(entry, capture)) continue;
       if (llm === undefined) {
@@ -2448,19 +3196,17 @@ export function createRacoonsMount(options: {
       if (route === null) {
         journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
           callId: capture.item.callId, byteLength: capture.item.bytes.length,
-          reason: 'no-route' });
+          // The prune lane names the same condition `not-configured` (ISSUE-427):
+          // one journal name for one absent route, in both lanes.
+          reason: 'not-configured' });
         continue;
       }
-      if (breaker === 'open') {
+      if (standdown !== null) {
+        // `ledger-unavailable`, `recovery-pending` and `breaker-open` are the
+        // same names the prune lane journals; one condition, one name.
         journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
           callId: capture.item.callId, byteLength: capture.item.bytes.length,
-          reason: 'breaker-open' });
-        continue;
-      }
-      if (breaker === 'unknown') {
-        journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
-          callId: capture.item.callId, byteLength: capture.item.bytes.length,
-          reason: 'ledger-unavailable' });
+          reason: standdown });
         continue;
       }
       const node = landedNodeOf(entry, capture);
@@ -2504,7 +3250,7 @@ export function createRacoonsMount(options: {
         if (id === capture.eventId) rows.push({ capture, node, unitId });
       }
       if (rows.length === 0) continue;
-      await askBatch(entry, session, rows, llm, route);
+      await askBatch(entry, session, rows, llm, route, signal);
     }
   }
 
@@ -2546,10 +3292,11 @@ export function createRacoonsMount(options: {
    * reaches the engine, so no validation row exists for the breaker to count
    * and the guard's own arithmetic is untouched.
    */
-  async function askBatch(entry: RacoonsSessionEntry, session: DshMountSession,
+  async function askBatchCore(entry: RacoonsSessionEntry, session: DshMountSession,
     rows: readonly { readonly capture: Capture; readonly node: ToolResultNode;
       readonly unitId: UnitId }[],
     llm: DshLlmService, route: JudgeRoute,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (rows.length === 0) return;
     // The live rows the ask describes: a fresh read per row, never the landing
@@ -2591,9 +3338,43 @@ export function createRacoonsMount(options: {
     // Nothing survives: no request leaves, no exchange is appended and every
     // dropped row's unit stays landed whole (ADR-0022 §14).
     if (live.length === 0) return;
+    // ISSUE-423: the ask is stamped with the compaction generation it was built
+    // under. A compaction observed while it runs bumps the generation, and the
+    // apply below then refuses by name instead of recording a receipt for an
+    // array the host rewrote.
+    const askGeneration = entry.compactionGeneration;
+    // ISSUE-422: a forked/inherited session's first step can land a result
+    // before the child's own main request is captured (the parent's request is
+    // not this session's seed). Refusing `no-seed` there is a false refusal:
+    // the mount has no capture YET, not no possible seed. Name the missing
+    // capture instead; the result keeps its unit whole and a later pass may
+    // table it.
+    if (mainWire.last(entry.sessionId) === null
+      && (entry.installBoundary === 'inherited' || entry.installBoundary === 'fork')) {
+      for (const row of live) {
+        journal('entry-ask-off', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+          callId: row.capture.item.callId, unitId: row.unitId,
+          byteLength: row.capture.item.bytes.length,
+          reason: 'inherited-no-capture', installBoundary: entry.installBoundary });
+      }
+      return;
+    }
     const last = live[live.length - 1];
     if (last === undefined) return;
-    const seed = mainWire.last(entry.sessionId)?.wire ?? null;
+    // ISSUE-432: the capture records the route it was dispatched under. A
+    // mid-session model switch makes that prefix belong to the old model, so
+    // it is invalidated by name rather than served silently. A capture that
+    // states no route (an older host) stays usable: absence is not evidence.
+    const captured = mainWire.last(entry.sessionId);
+    let seed = captured?.wire ?? null;
+    // ISSUE-432 / ISSUE-470: one staleness rule for both ask lanes.
+    if (captured !== null && seedRouteStale(captured, route)) {
+      journal('seed-model-stale', { sessionId: entry.sessionId,
+        seedProvider: captured.provider, seedModel: captured.model,
+        routeProvider: route?.provider ?? null, routeModel: route?.model ?? null,
+        action: 'seed-invalidated' });
+      seed = null;
+    }
     // The ask sits under the LAST SURVIVING row's turn, so a dropped tail never
     // leaves the question above a result the table does not describe.
     const surface = postLandingWire(session, entry.sessionId, last.node.id);
@@ -2610,179 +3391,332 @@ export function createRacoonsMount(options: {
     // send (no row left tabled, no seed) leaves the session's first trigger
     // still ahead of it, and a route-off ask never reaches this function.
     const firstTrigger = !entry.entryAskFired;
-    // The ask rides the native status card (ISSUE-372): the pair wraps only the
-    // ask itself, and the done fires on the answered, refused and off outcomes
-    // alike — the apply leg below is host writes, not ask time.
-    const outcome = await underAskCard(session,
-      () => askEntryBatch({ rows: batch, seed, surface, llm, route,
-        grammar: config.entryAskGrammar, firstTrigger }),
-      result => result.status === 'answered'
-        ? { kind: 'success', text: 'entry ask answered' }
-        : result.status === 'refused'
-          ? { kind: 'error', text: `entry ask refused: ${result.code}` }
-          : { kind: 'success', text: 'entry ask off' });
-    const left = outcome.status === 'answered'
-      || (outcome.status === 'refused' && outcome.turns.length > 0);
-    if (left) entry.entryAskFired = true;
-    if (outcome.status === 'off') {
-      for (const row of live) {
-        journal('entry-ask-off', { sessionId: entry.sessionId, eventId: row.capture.eventId,
-          callId: row.capture.item.callId, byteLength: row.capture.item.bytes.length,
-          reason: 'route-off' });
+    // The ask rides the native status card (ISSUE-372; ISSUE-404): the card is
+    // opened before the send, but it settles only after the append/apply leg
+    // with the whole pass's outcome — never with the ask's alone, because an
+    // answered ask whose apply failed did not actually remove anything.
+    const card = openAskCard(session);
+    // ISSUE-461: the card settles exactly once on every path, in the `finally`
+    // below, mirroring the prune pass. An unsettled pass is an error, never a
+    // success, and a throw from the append/apply leg still closes the card.
+    let cardText: { kind: 'success' | 'error'; text: string } =
+      { kind: 'error', text: 'the entry ask did not settle' };
+    try {
+      const outcome = await askEntryBatch({ rows: batch, seed, surface, llm, route,
+        grammar: config.entryAskGrammar, firstTrigger,
+        // ISSUE-405: the configured judge deadline reaches the entry ask, and
+        // the host's own pre-step signal preempts a cancelled turn. `0` is the
+        // documented deadline-off switch, so the same contract the prune ask
+        // already reads applies here byte for byte.
+        timeoutMs: config.judgeTimeoutMs,
+        ...(signal === undefined ? {} : { signal }) });
+      const left = outcome.status === 'answered'
+        || (outcome.status === 'refused' && outcome.turns.length > 0);
+      if (left) {
+        entry.entryAskFired = true;
+        // ISSUE-406: persist the flag on the first answered/refused-with-turns ask,
+        // so a restart does not repeat the 70 percent first-ask share line. The
+        // write is fail-open: the in-memory flag still serves this process.
+        const target = targets.get(entry.sessionId);
+        if (target !== undefined) writeEntryAskFired(target, true, journal, entry.sessionId);
       }
-      return;
-    }
-    if (outcome.status === 'refused') {
-      // Fail-open: every result is already landed whole, so nothing is appended
-      // and nothing is marked. One line per row names the same code.
-      for (const row of live) {
-        journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
-          callId: row.capture.item.callId, unitId: row.unitId, code: outcome.code,
-          ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
-          ...(outcome.raw === undefined
-            ? {}
-            : { raw: outcome.raw.slice(0, ENTRY_ASK_REFUSED_RAW_CHARS) }),
-          retried: outcome.retried, turns: outcome.turns.length,
+      if (outcome.status === 'off') {
+        // No request left the seam, so the card must not read as a completed ask.
+        cardText = { kind: 'success', text: 'entry ask off; no ask was sent' };
+        for (const row of live) {
+          journal('entry-ask-off', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, byteLength: row.capture.item.bytes.length,
+            reason: 'not-configured' });
+        }
+        return;
+      }
+      if (outcome.status === 'refused') {
+        cardText = { kind: 'error', text: `entry ask refused: ${outcome.code}` };
+        // Fail-open: every result is already landed whole, so nothing is appended
+        // and nothing is marked. One line per row names the same code.
+        for (const row of live) {
+          journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, unitId: row.unitId, code: outcome.code,
+            ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+            ...(outcome.raw === undefined
+              ? {}
+              : { raw: outcome.raw.slice(0, ENTRY_ASK_REFUSED_RAW_CHARS) }),
+            retried: outcome.retried, turns: outcome.turns.length,
+            ...(outcome.usage === undefined ? {} : { usage: outcome.usage }) });
+        }
+        return;
+      }
+      // ISSUE-423: the host compacted while this ask was in flight. The answer
+      // describes rows the compaction rewrote, so nothing is appended and nothing
+      // is applied: a receipt here would record a removal of the pre-ask array.
+      // Each row keeps its unit whole and is refused by name.
+      if (entry.compactionGeneration !== askGeneration) {
+        cardText = { kind: 'error', text: 'entry ask refused: compaction-generation-changed' };
+        for (const row of live) {
+          journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, unitId: row.unitId,
+            code: 'compaction-generation-changed',
+            askGeneration, compactionGeneration: entry.compactionGeneration,
+            retried: outcome.retried, turns: outcome.turns.length,
+            reason: 'the host compacted during the ask, so the answer names an array that no longer exists; '
+              + 'the exchange was not appended and the unit keeps' });
+        }
+        return;
+      }
+      // Answered: ONE exchange (ask turn … answer turn) covers the whole batch, so
+      // it is appended once and recorded on every answered row's event id.
+      const appended = appendAskTurns(entry, session, outcome.turns);
+      if (appended === null) {
+        // ISSUE-403: the partial append collapsed its own prefix; the ask fails
+        // open with `entry-ask-append-failed` already naming the host error, and
+        // the card must not read as a completed ask.
+        cardText = { kind: 'error', text: 'entry ask failed: the exchange could not be appended' };
+        return;
+      }
+      const askNode = appended[0], answerNode = appended[appended.length - 1];
+      if (askNode === undefined || answerNode === undefined) {
+        cardText = { kind: 'error', text: 'entry ask refused: empty-exchange' };
+        for (const row of live) {
+          journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, unitId: row.unitId, code: 'no-seed',
+            retried: outcome.retried, turns: outcome.turns.length, reason: 'empty-exchange' });
+        }
+        return;
+      }
+      const askNodeId = messageNodeId(entry.sessionId, askNode.seq);
+      const answerNodeId = messageNodeId(entry.sessionId, answerNode.seq);
+      // True once a row's write moved the host surface, which is what takes the
+      // exchange off it. A fail-open apply that wrote nothing leaves this false, so
+      // the collapse below still runs (ISSUE-215); it also gates the later rows'
+      // `rewound: true`, which may only name a write that happened.
+      let appliedAny = false;
+      // The card's apply-side truth (ISSUE-404): a row whose apply failed open or
+      // threw did not land, so a card cannot read success just because the model
+      // answered.
+      let applyFailures = 0;
+      // ISSUE-480: a row the ask did not answer, or whose bytes moved between
+      // ask and apply, was refused by this lane rather than by the engine. Its
+      // unit stays whole and its paid answer is lost, so the card must name it
+      // exactly as the prune card names an undecided row — never settle success.
+      let refusedRows = 0;
+      for (const [position, row] of live.entries()) {
+        const read = outcome.rows.find(candidate => candidate.index === position + 1);
+        if (read === undefined || read.status !== 'answered') {
+          refusedRows += 1;
+          // A refused or missing row keeps its unit: no ask line's action, no
+          // apply. The refusal code is the table reader's own, and `wireCode`
+          // names the parser defect underneath a `malformed-row` when there was
+          // one — the field that makes a refused row classifiable afterwards
+          // (ISSUE-179). It is written only when the parser named a code, so an
+          // old journal and a refusal with no inner defect both read the same.
+          journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, unitId: row.unitId,
+            code: read === undefined ? 'missing-index' : read.code,
+            ...(read === undefined || read.wireCode === undefined || read.wireCode === null
+              ? {}
+              : { wireCode: read.wireCode }),
+            retried: outcome.retried, turns: outcome.turns.length, batchIndex: position + 1 });
+          continue;
+        }
+        const answer = read.answer;
+        journal('entry-ask', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+          callId: row.capture.item.callId, unitId: row.unitId, answeredInRound: 0,
+          action: answer.action,
+          ...(answer.action === 'keepall' ? {} : { summary: answer.summary }),
+          raw: outcome.raw, retried: outcome.retried, turns: outcome.turns.length,
+          askNodeId, answerNodeId, askGeneration,
+          batchIndex: position + 1, batchSize: live.length,
           ...(outcome.usage === undefined ? {} : { usage: outcome.usage }) });
+        // Every later unit marks `rewound: true`: unit 1's write takes the exchange
+        // off the surface, so units 2..N name only their own result turn (ADR-0035
+        // §5, the plan's prescribed flag — never a multi-replacement application).
+        const exchange: DshAskExchange = {
+          resultNodeId: row.capture.eventId,
+          askNodeId, answerNodeId,
+          summary: answer.action === 'keepall' ? '' : answer.summary,
+          ...(appliedAny ? { rewound: true as const } : {}),
+        };
+        // One batch shares ONE answer turn, and the engine answers one event id
+        // once (`engine.ts` dedupe): handing every row the bare answer id would
+        // make rows 2..N replays that plan nothing and journal `fail-open`. So a
+        // multi-row batch keys each row under its own id, `<answer>#<index>`, and
+        // a one-row batch keeps the bare id — today's event id, byte for byte,
+        // which is the default-off gate's third surface.
+        const rowAnswerEventId = live.length === 1
+          ? answerNodeId : `${answerNodeId}#${String(position + 1)}`;
+        // The apply's own re-read: the answer was about the bytes the table showed
+        // at fire. If they moved while the model answered, this row is refused
+        // locally — nothing reaches the engine, so the guard writes no validation
+        // row and the breaker counts no application failure for our stale read.
+        const now = liveTranscriptNodeOf(entry, row.capture);
+        if (now === null || now.sha256 !== row.node.sha256) {
+          refusedRows += 1;
+          journal('entry-apply-refused', { sessionId: entry.sessionId,
+            eventId: row.capture.eventId, callId: row.capture.item.callId, unitId: row.unitId,
+            answerEventId: rowAnswerEventId, status: 'fail-open', code: 'ask-row-stale',
+            batchIndex: position + 1, askSha256: row.node.sha256,
+            liveSha256: now === null ? null : now.sha256,
+            detail: 'the result changed after the ask, so the answer names bytes that no longer exist; '
+              + 'the row keeps its unit whole' });
+          continue;
+        }
+        // ISSUE-428: an apply that THROWS must not skip the batch's collapse below.
+        // The throw is named here and the row counts as not applied, so the
+        // exchange is still collapsed as a refused batch and the orphan cannot
+        // reach the next model turn.
+        try {
+          const applied = await applyEntryAnswer(entry, session, row.capture, now, exchange,
+            rowAnswerEventId, answer, outcome.raw);
+          // Only a write that moved the surface took the exchange off it. A
+          // fail-open apply (`appends: 0`) leaves the pair in place, so it must not
+          // suppress the batch's collapse below (ISSUE-215) — and it must not mark
+          // every later row `rewound`, because no earlier write happened. The host
+          // surface moved (the exchange appended at least, and possibly rewound), so
+          // the port's transcript is re-read before the next row's apply and before
+          // the at-rest pass plans against it.
+          appliedAny = appliedAny || applied.movedSurface;
+          if (applied.outcome.status === 'fail-open') applyFailures += 1;
+          syncPass(entry, session);
+        } catch (error) {
+          applyFailures += 1;
+          journal('entry-apply-refused', { sessionId: entry.sessionId,
+            eventId: row.capture.eventId, callId: row.capture.item.callId, unitId: row.unitId,
+            answerEventId: rowAnswerEventId, status: 'fail-open', code: 'apply-threw',
+            batchIndex: position + 1,
+            detail: error instanceof Error ? error.message : String(error) });
+        }
       }
-      return;
-    }
-    // Answered: ONE exchange (ask turn … answer turn) covers the whole batch, so
-    // it is appended once and recorded on every answered row's event id.
-    const appended = appendAskTurns(session, outcome.turns);
-    const askNode = appended[0], answerNode = appended[appended.length - 1];
-    if (askNode === undefined || answerNode === undefined) {
-      for (const row of live) {
-        journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
-          callId: row.capture.item.callId, unitId: row.unitId, code: 'no-seed',
-          retried: outcome.retried, turns: outcome.turns.length, reason: 'empty-exchange' });
+      if (!appliedAny) {
+        // No write took the exchange off the surface: every row was refused or
+        // missing, the answer was unreadable row by row, or an answered row's apply
+        // failed open and appended nothing (ISSUE-215 — a `keeplines` naming every
+        // line is the live shape). Both turns are `user/message`, so the next model
+        // turn would answer the stale question instead of the task (ISSUE-185). The
+        // exchange is not a record (ADR-0022 §Consequences): collapse it exactly as
+        // a keep-all does, one replace over `[ask … answer]`. Nothing is applied and
+        // nothing settles, so every refused row's unit stays landed whole
+        // (ADR-0022 §14, ADR-0028 §4) and the next bulk prune may still list it.
+        // A pair the surface no longer holds is refused by name inside the port and
+        // writes nothing; the journal says so.
+        const collapsed = entry.port.rewindAskExchange({ resultNodeId: last.capture.eventId,
+          askNodeId, answerNodeId, summary: '' });
+        // This write is the mount's, never a row's apply: consume it so a later
+        // `takeEntryWrite` cannot read it as that row's own outcome.
+        entry.port.takeEntryWrite();
+        journal('entry-ask-collapsed', { sessionId: entry.sessionId,
+          resultNodeId: last.capture.eventId, askNodeId, answerNodeId,
+          batchSize: live.length, status: collapsed.status,
+          ...(collapsed.status === 'refused' ? { code: collapsed.code } : {}) });
+        // ISSUE-463: only an applied collapse took the exchange off the surface.
+        // A refused or unknown rewind keeps it owed, so the next boundary's
+        // recovery retries it in the same process.
+        if (collapsed.status === 'applied') {
+          syncPass(entry, session);
+        } else {
+          entry.resumeRecovery = true;
+        }
       }
-      return;
-    }
-    const askNodeId = messageNodeId(entry.sessionId, askNode.seq);
-    const answerNodeId = messageNodeId(entry.sessionId, answerNode.seq);
-    // True once a row's write moved the host surface, which is what takes the
-    // exchange off it. A fail-open apply that wrote nothing leaves this false, so
-    // the collapse below still runs (ISSUE-215); it also gates the later rows'
-    // `rewound: true`, which may only name a write that happened.
-    let appliedAny = false;
-    for (const [position, row] of live.entries()) {
-      const read = outcome.rows.find(candidate => candidate.index === position + 1);
-      if (read === undefined || read.status !== 'answered') {
-        // A refused or missing row keeps its unit: no ask line's action, no
-        // apply. The refusal code is the table reader's own, and `wireCode`
-        // names the parser defect underneath a `malformed-row` when there was
-        // one — the field that makes a refused row classifiable afterwards
-        // (ISSUE-179). It is written only when the parser named a code, so an
-        // old journal and a refusal with no inner defect both read the same.
-        journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
-          callId: row.capture.item.callId, unitId: row.unitId,
-          code: read === undefined ? 'missing-index' : read.code,
-          ...(read === undefined || read.wireCode === undefined || read.wireCode === null
-            ? {}
-            : { wireCode: read.wireCode }),
-          retried: outcome.retried, turns: outcome.turns.length, batchIndex: position + 1 });
-        continue;
+      // ISSUE-404: the card settles in the `finally` below, after the
+      // append/apply leg, with the pass's true outcome. A model answer whose rows
+      // never landed is not a completed ask. ISSUE-480: a refused row is one
+      // rule in both lanes — a fired batch with any undecided row settles
+      // `error` and names the count, even when another row applied.
+      if (applyFailures > 0 || refusedRows > 0) {
+        const parts: string[] = [];
+        if (applyFailures > 0) parts.push(`${String(applyFailures)} row(s) failed to apply`);
+        if (refusedRows > 0) parts.push(`${String(refusedRows)} row(s) refused`);
+        cardText = { kind: 'error', text: `entry ask answered; ${parts.join('; ')}` };
+      } else {
+        cardText = appliedAny ? { kind: 'success', text: 'entry ask answered' }
+          : { kind: 'error', text: 'entry ask answered; no row was applied' };
       }
-      const answer = read.answer;
-      journal('entry-ask', { sessionId: entry.sessionId, eventId: row.capture.eventId,
-        callId: row.capture.item.callId, unitId: row.unitId, answeredInRound: 0,
-        action: answer.action,
-        ...(answer.action === 'keepall' ? {} : { summary: answer.summary }),
-        raw: outcome.raw, retried: outcome.retried, turns: outcome.turns.length,
-        askNodeId, answerNodeId,
-        batchIndex: position + 1, batchSize: live.length,
-        ...(outcome.usage === undefined ? {} : { usage: outcome.usage }) });
-      // Every later unit marks `rewound: true`: unit 1's write takes the exchange
-      // off the surface, so units 2..N name only their own result turn (ADR-0035
-      // §5, the plan's prescribed flag — never a multi-replacement application).
-      const exchange: DshAskExchange = {
-        resultNodeId: row.capture.eventId,
-        askNodeId, answerNodeId,
-        summary: answer.action === 'keepall' ? '' : answer.summary,
-        ...(appliedAny ? { rewound: true as const } : {}),
-      };
-      // One batch shares ONE answer turn, and the engine answers one event id
-      // once (`engine.ts` dedupe): handing every row the bare answer id would
-      // make rows 2..N replays that plan nothing and journal `fail-open`. So a
-      // multi-row batch keys each row under its own id, `<answer>#<index>`, and
-      // a one-row batch keeps the bare id — today's event id, byte for byte,
-      // which is the default-off gate's third surface.
-      const rowAnswerEventId = live.length === 1
-        ? answerNodeId : `${answerNodeId}#${String(position + 1)}`;
-      // The apply's own re-read: the answer was about the bytes the table showed
-      // at fire. If they moved while the model answered, this row is refused
-      // locally — nothing reaches the engine, so the guard writes no validation
-      // row and the breaker counts no application failure for our stale read.
-      const now = liveTranscriptNodeOf(entry, row.capture);
-      if (now === null || now.sha256 !== row.node.sha256) {
-        journal('entry-apply-refused', { sessionId: entry.sessionId,
-          eventId: row.capture.eventId, callId: row.capture.item.callId, unitId: row.unitId,
-          answerEventId: rowAnswerEventId, status: 'fail-open', code: 'ask-row-stale',
-          batchIndex: position + 1, askSha256: row.node.sha256,
-          liveSha256: now === null ? null : now.sha256,
-          detail: 'the result changed after the ask, so the answer names bytes that no longer exist; '
-            + 'the row keeps its unit whole' });
-        continue;
-      }
-      const applied = await applyEntryAnswer(entry, session, row.capture, now, exchange,
-        rowAnswerEventId, answer, outcome.raw);
-      // Only a write that moved the surface took the exchange off it. A
-      // fail-open apply (`appends: 0`) leaves the pair in place, so it must not
-      // suppress the batch's collapse below (ISSUE-215) — and it must not mark
-      // every later row `rewound`, because no earlier write happened. The host
-      // surface moved (the exchange appended at least, and possibly rewound), so
-      // the port's transcript is re-read before the next row's apply and before
-      // the at-rest pass plans against it.
-      appliedAny = appliedAny || applied.movedSurface;
-      syncPass(entry, session);
-    }
-    if (!appliedAny) {
-      // No write took the exchange off the surface: every row was refused or
-      // missing, the answer was unreadable row by row, or an answered row's apply
-      // failed open and appended nothing (ISSUE-215 — a `keeplines` naming every
-      // line is the live shape). Both turns are `user/message`, so the next model
-      // turn would answer the stale question instead of the task (ISSUE-185). The
-      // exchange is not a record (ADR-0022 §Consequences): collapse it exactly as
-      // a keep-all does, one replace over `[ask … answer]`. Nothing is applied and
-      // nothing settles, so every refused row's unit stays landed whole
-      // (ADR-0022 §14, ADR-0028 §4) and the next bulk prune may still list it.
-      // A pair the surface no longer holds is refused by name inside the port and
-      // writes nothing; the journal says so.
-      const collapsed = entry.port.rewindAskExchange({ resultNodeId: last.capture.eventId,
-        askNodeId, answerNodeId, summary: '' });
-      // This write is the mount's, never a row's apply: consume it so a later
-      // `takeEntryWrite` cannot read it as that row's own outcome.
-      entry.port.takeEntryWrite();
-      journal('entry-ask-collapsed', { sessionId: entry.sessionId,
-        resultNodeId: last.capture.eventId, askNodeId, answerNodeId,
-        batchSize: live.length, status: collapsed.status,
-        ...(collapsed.status === 'refused' ? { code: collapsed.code } : {}) });
-      if (collapsed.status !== 'refused') syncPass(entry, session);
+    } catch (error) {
+      // ISSUE-461: a throw from the host surface read or the append/apply leg
+      // is named here and rethrown; the `finally` still closes exactly one card.
+      cardText = { kind: 'error', text: `entry ask failed: ${messageOf(error)}` };
+      throw error;
+    } finally {
+      card.settle(cardText.kind, cardText.text);
     }
   }
 
   /**
-   * The breaker's current state as the session's own durable record states it
-   * (ISSUE-057; ADR-0020 §Decision 5b). Read-only, through the public `Ledger`
-   * seam: the last `validation` row's own `breaker` is the authoritative
-   * reading (`engine/journal.ts` `breakerState` derives exactly this), and the
-   * ask lane never appends a validation and never increments the streak, so an
-   * ask failure cannot quiet the gate.
-   *
-   * Three answers, not two, because the third is the honest one: a ledger that
-   * cannot be read says nothing about machinery health, so the lane stands down
-   * and journals `ledger-unavailable` rather than claiming the breaker tripped.
+   * One batch ask under the ISSUE-423 ask/apply window. The window is what a
+   * compaction observed on the event lane sees while this ask and its applies
+   * run: it defers the latch's native-compaction re-arm to here, so no second
+   * above-bar ask is armed from inside the first one's apply. The window closes
+   * on every path, including a throw from the ask seam.
    */
-  async function breakerReading(entry: RacoonsSessionEntry): Promise<'closed' | 'open' | 'unknown'> {
+  async function askBatch(entry: RacoonsSessionEntry, session: DshMountSession,
+    rows: readonly { readonly capture: Capture; readonly node: ToolResultNode;
+      readonly unitId: UnitId }[],
+    llm: DshLlmService, route: JudgeRoute,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    entry.askWindow = 'entry';
+    try {
+      await askBatchCore(entry, session, rows, llm, route, signal);
+    } finally {
+      entry.askWindow = 'none';
+      flushDeferredCompaction(entry);
+    }
+  }
+
+  /**
+   * Take a compaction's deferred latch re-arm once no ask/apply window is open
+   * (ISSUE-423). The re-arm is the shipped backstop (ADR-0050): the surface was
+   * rewritten, so the prior baseline does not describe it. It runs here rather
+   * than mid-ask, and rides the round file like the direct observation does.
+   */
+  function flushDeferredCompaction(entry: RacoonsSessionEntry): void {
+    if (!entry.compactionRearmDeferred || entry.askWindow !== 'none') return;
+    entry.compactionRearmDeferred = false;
+    if (!config.nativeCompactionBackstop) return;
+    entry.pruneTrigger.noteNativeCompaction();
+    const target = targets.get(entry.sessionId);
+    if (target !== undefined) {
+      writePruneRound(target, entry.pruneRounds, journal, entry.sessionId,
+        entry.pruneTrigger.snapshot());
+    }
+  }
+
+  /**
+   * Why a paid ask must not run right now, read BEFORE the send, for BOTH ask
+   * lanes (ISSUE-426 gave the prune lane this third question; ISSUE-440 gave
+   * the entry lane the same read). One ledger read answers all three
+   * healthy-or-not questions:
+   *
+   * - the read throws (the refusing ledger of a failed open) → `ledger-unavailable`;
+   * - an unfinished `prepared` intent → `recovery-pending`: core's next pass
+   *   would return `recovery-pending` and apply nothing, so the paid ask would
+   *   be bought for an apply that cannot land;
+   * - the last `validation` row's breaker is disabled → `breaker-open`
+   *   (ISSUE-057; ADR-0020 §Decision 5b — read-only, and an ask never writes a
+   *   validation, so an ask failure cannot quiet the gate).
+   *
+   * `null` means the ask may run. Any read failure is a standdown, never a
+   * throw: the lane does nothing and later passes still run.
+   */
+  async function ledgerStanddown(entry: RacoonsSessionEntry):
+  Promise<'ledger-unavailable' | 'recovery-pending' | 'breaker-open' | null> {
     try {
       let disabled = false;
+      const prepared = new Set<string>();
+      const finished = new Set<string>();
       for await (const row of entry.ledger.events(entry.sessionId)) {
-        if (row.event.kind === 'validation') disabled = row.event.breaker.disabled;
+        const event = row.event;
+        if (event.kind === 'validation') disabled = event.breaker.disabled;
+        else if (event.kind === 'prepared') prepared.add(event.intentId);
+        else if (event.kind === 'abandoned') finished.add(event.intentId);
+        else if (event.kind === 'applied') finished.add(event.receipt.intentId);
       }
-      return disabled ? 'open' : 'closed';
+      for (const intentId of prepared) {
+        if (!finished.has(intentId)) return 'recovery-pending';
+      }
+      return disabled ? 'breaker-open' : null;
     } catch {
-      return 'unknown';
+      return 'ledger-unavailable';
     }
   }
 
@@ -2801,17 +3735,21 @@ export function createRacoonsMount(options: {
   }
 
   /**
-   * Wrap one ask in the host's native command lifecycle (ISSUE-372; ADR-0062
-   * D1): `command/run` opens the host's shimmer card under `ASK_CARD_NAME` and
-   * `command/done` closes it — finally-guaranteed, so an answered, refused or
-   * thrown ask all settle the card. Both appends are log-only (no `surfaceOp`):
-   * the pair never enters the model surface, takes no lock and opens no turn,
-   * the same shape the host's own command executor writes. A card append that
-   * throws is contained — the ask must still run and settle — so a failed open
-   * skips the close and a failed close only warns.
+   * Open the host's native command card (ISSUE-372; ADR-0062 D1): `command/run`
+   * under `ASK_CARD_NAME`, paired by a minted id. The returned handle settles it
+   * with `command/done`, exactly once; ISSUE-404 moved the settle to the caller
+   * so a pass can close the card only after its append/apply leg, with the whole
+   * pass's outcome rather than the ask's alone.
+   *
+   * Both appends are log-only (no `surfaceOp`): the pair never enters the model
+   * surface, takes no lock and opens no turn, the same shape the host's own
+   * command executor writes. A card append that throws is contained — the ask
+   * must still run and settle — so a failed open skips the close and a failed
+   * close only warns.
    */
-  async function underAskCard<T>(session: DshMountSession, ask: () => Promise<T>,
-    settled: (outcome: T) => { kind: 'success' | 'error'; text: string }): Promise<T> {
+  function openAskCard(session: DshMountSession): {
+    settle(kind: 'success' | 'error', text: string): void;
+  } {
     const commandId = `cremator-ask-${randomUUID()}`;
     let opened = true;
     try {
@@ -2820,26 +3758,30 @@ export function createRacoonsMount(options: {
         source: { kind: 'user' } });
     } catch (error) {
       opened = false;
-      options.warn?.(`ask card open: ${messageOf(error)}`);
+      const message = messageOf(error);
+      // The card could not open, so there is nothing to close; the line names
+      // that failure and the ask still runs and settles (ISSUE-429).
+      journal('ask-card-error', { sessionId: session.id, phase: 'open', commandId, message });
+      safeWarn(`ask card open: ${message}`);
     }
-    let done: { kind: 'success' | 'error'; text: string } =
-      { kind: 'error', text: 'the ask did not settle' };
-    try {
-      const outcome = await ask();
-      done = settled(outcome);
-      return outcome;
-    } catch (error) {
-      done = { kind: 'error', text: messageOf(error) };
-      throw error;
-    } finally {
-      if (opened) {
+    let settled = false;
+    return {
+      settle(kind, text) {
+        if (settled) return;
+        settled = true;
+        if (!opened) return;
         try {
-          session.append('command/done', { commandId, kind: done.kind, text: done.text });
+          session.append('command/done', { commandId, kind, text });
         } catch (error) {
-          options.warn?.(`ask card close: ${messageOf(error)}`);
+          const message = messageOf(error);
+          // `cardKind` (not `kind`) carries the card outcome: `kind` is the
+          // journal record's own discriminator and must not be overwritten.
+          journal('ask-card-error', { sessionId: session.id, phase: 'close',
+            commandId, cardKind: kind, message });
+          safeWarn(`ask card close: ${message}`);
         }
-      }
-    }
+      },
+    };
   }
 
   /**
@@ -2853,22 +3795,44 @@ export function createRacoonsMount(options: {
    * engine's `{kind:'prune'}` input, which plans one checkpoint-revert for the
    * whole pass (one epoch break, ADR-0009); `record-only` still records.
    */
-  async function runPrune(session: DshMountSession): Promise<RecordOnlyPruneOutcome | null> {
-    // Reached from `runStep` (the entry exists) or directly by a rig/test, where
-    // a retryable open surfaces as `RacoonsStorageRetryError` to the caller —
-    // the same seam every other boundary uses.
-    const entry = await sessionFor(session.id, session);
+  async function runPrune(session: DshMountSession,
+    existing?: RacoonsSessionEntry, signal?: AbortSignal): Promise<RecordOnlyPruneOutcome | null> {
+    // Reached from `runStep` (which hands its own entry in, ISSUE-401/416) or
+    // directly by a rig/test, where a retryable open surfaces as
+    // `RacoonsStorageRetryError` to the caller — the same seam every other
+    // boundary uses. Re-entering `sessionFor` here would hit the ISSUE-416
+    // closing guard on a step that was already in flight at close.
+    const entry = existing ?? await sessionFor(session.id, session);
     pruneRequests.delete(session.id);
     syncPass(entry, session);
     const snapshot = await entry.port.snapshot();
     entry.pruneRounds += 1;
+    // ISSUE-404: the card is opened only after the standdown check (a pass that
+    // sends nothing has no ask to show) and settles in the `finally` below,
+    // after the apply leg, with the whole pass's outcome. Its default is the
+    // honest one: an unsettled pass is an error, never a success.
+    let card: ReturnType<typeof openAskCard> | null = null;
+    let cardText: { kind: 'success' | 'error'; text: string } =
+      { kind: 'error', text: 'the prune pass did not settle' };
     try {
-      // The bulk ask rides the same native status card as the entry ask
-      // (ISSUE-372). The card wraps the pass — the ask is its only slow leg —
-      // and closes before the apply leg; a pass that asked nothing or refused
-      // rows settles the card by name instead of leaving it shimmering.
-      const outcome = await underAskCard(session,
-        () => runRecordOnlyPrune({
+      // The paid ask is refused before it is sent when the write it depends on
+      // cannot land (ISSUE-426): a refusing ledger, a recovery-pending intent, or
+      // a disabled breaker stands the pass down by name. The pass does nothing
+      // and later passes still run (fail-open).
+      const standdown = await ledgerStanddown(entry);
+      if (standdown !== null) {
+        journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
+          reason: standdown });
+        return null;
+      }
+      card = openAskCard(session);
+      // ISSUE-423: the ask and its apply run inside the prune window. A
+      // compaction observed here defers the latch's re-arm instead of clearing
+      // the pass's baseline mid-flight; the ask's own generation decides whether
+      // the document may still apply.
+      const passGeneration = entry.compactionGeneration;
+      entry.askWindow = 'prune';
+      const outcome: RecordOnlyPruneOutcome = await runRecordOnlyPrune({
           sessionId: entry.sessionId,
           snapshot,
           transcript: entry.port.transcript(),
@@ -2885,47 +3849,87 @@ export function createRacoonsMount(options: {
           // table must not re-list them. The pass reads the invalidation itself,
           // so a unit a write made stale is still listable.
           settledNodeIds: entry.entryKept,
+          // ISSUE-414: results already on the surface before this session's
+          // durable state existed were never observed landing, so the pass can
+          // neither table nor remove them.
+          excludedNodeIds: entry.preInstallNodeIds,
           // ISSUE-221: the bulk ask's grammar, resolved from the row; absent is
           // `3option`, the shipped contract byte for byte.
           grammar: config.pruneAskGrammar,
           ...(options.llm === undefined ? {} : { llm: options.llm }),
-          route: () => judgeRouteOf(entry.host ?? session, options.judgeRoute),
+          route: () => resolveRoute(entry.host ?? session),
           // The capture main's last sent request (ISSUE-027, ADR-0010): a prune
           // ask is a fork of it, never a re-render.
           seed: () => mainWire.last(entry.sessionId),
           journal,
           timeoutMs: config.judgeTimeoutMs,
-        }),
-        result => {
-          if (result.refusedFor !== null) {
-            return { kind: 'error', text: `prune ask refused: ${result.refusedFor}` };
-          }
-          // The pass's own totals: rows still refused after the one re-ask, and
-          // rows a halt left undecided (ISSUE-177 — a dead stream defers, it
-          // does not refuse). Either means the ask did not fully settle.
-          const totals = result.attempts?.pass;
-          const unsettled = (totals?.finalRefusals ?? 0) + (totals?.deferred ?? 0);
-          return unsettled > 0
-            ? { kind: 'error', text: 'prune rows left undecided' }
-            : { kind: 'success', text: 'prune ask settled' };
+          // ISSUE-405: the same host pre-step signal the entry ask receives
+          // preempts a cancelled prune turn instead of waiting out the deadline.
+          ...(signal === undefined ? {} : { signal }),
         });
+      if (outcome.refusedFor !== null) {
+        // No request left the seam for this pass: the card names the refusal,
+        // never the ask's success text.
+        cardText = { kind: 'error', text: `prune ask refused: ${outcome.refusedFor}` };
+      } else if (outcome.plan.askRows.length === 0) {
+        // A pass with nothing to ask makes no model call. The card is still the
+        // pass's visible trace, so it says exactly that (ISSUE-404).
+        cardText = { kind: 'success', text: 'prune pass: no ask was sent' };
+      }
       // The apply leg (ISSUE-022 chunk 6; ADR-0009): one engine event for the
       // whole pass, so the guard validates once and the pass costs exactly one
       // checkpoint-revert. A mount with no window stays record-only, which is
-      // the rollout's first stage (ADR-0008).
-      await applyPrunePass({ sessionId: entry.sessionId, engine: entry.engine,
+      // the rollout's first stage (ADR-0008). ISSUE-423: a compaction during the
+      // ask invalidated the array this document planned against, so it is
+      // refused by name instead of recording a receipt for the pre-ask array.
+      if (entry.compactionGeneration !== passGeneration) {
+        cardText = { kind: 'error', text: 'prune ask refused: compaction-generation-changed' };
+        journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
+          reason: 'compaction-generation-changed', passGeneration,
+          compactionGeneration: entry.compactionGeneration });
+        return null;
+      }
+      const applied = await applyPrunePass({ sessionId: entry.sessionId, engine: entry.engine,
         application: outcome.application, round: outcome.plan.round,
         windowTokens: config.contextWindowTokens, journal,
         // Read for the journal line only: the engine decides, and its answer is
         // what the line reports (CRITIC-022 P2 #8).
         enforcement: config.enforcement,
         revertHistory: entry.adapter.capabilities.revertHistory });
+      // ISSUE-436: the pass's applied row supersedes the crash-window receipt.
+      if (applied !== null && applied.status === 'applied') {
+        collectSettledReceipt(entry, applied.intentId);
+      }
+      if (outcome.refusedFor === null && outcome.plan.askRows.length > 0) {
+        // The pass's own totals: rows still refused after the one re-ask, and
+        // rows a halt left undecided (ISSUE-177 — a dead stream defers, it
+        // does not refuse). Either means the ask did not fully settle.
+        const totals = outcome.attempts?.pass;
+        const unsettled = (totals?.finalRefusals ?? 0) + (totals?.deferred ?? 0);
+        cardText = unsettled > 0
+          ? { kind: 'error', text: 'prune rows left undecided' }
+          : { kind: 'success', text: 'prune ask settled' };
+      }
+      // ISSUE-462: the card reads the APPLY result too, not the ask totals
+      // alone. Planned removals the engine refused did not settle, so the
+      // visible trace names the status and the guard's own issue code.
+      // `unchanged` is not an error: record-only is an explicit opt-out that
+      // plans nothing.
+      if (applied !== null && applied.status !== 'applied' && applied.status !== 'unchanged') {
+        const codes = applied.validation?.ok === false
+          ? applied.validation.issues.map(issue => String(issue.code)) : [];
+        cardText = { kind: 'error', text: `prune apply ${applied.status}`
+          + (codes.length === 0 ? '' : `: ${codes.join(', ')}`) };
+      }
       return outcome;
     } catch (error) {
       // A caller bug inside core's planners is the only throw; a host must
       // still see its step finish, so it lands as a named record.
       journal('prune-error', { sessionId: entry.sessionId,
         message: error instanceof Error ? error.message : String(error) });
+      // ISSUE-404: an apply/host failure is the card's outcome, not a
+      // success that hides the failed leg.
+      cardText = { kind: 'error', text: `prune pass failed: ${messageOf(error)}` };
       return null;
     } finally {
       // CRITIC-022 P1-1: a pass ends here whether it applied, refused or threw,
@@ -2944,7 +3948,75 @@ export function createRacoonsMount(options: {
         writePruneRound(target, entry.pruneRounds, journal, entry.sessionId,
           entry.pruneTrigger.snapshot());
       }
+      // ISSUE-423: the window is over on every path (applied, refused, threw).
+      // A compaction that landed inside it takes its re-arm now, after the pass
+      // left its own baseline, so no second ask was armed mid-pass.
+      entry.askWindow = 'none';
+      flushDeferredCompaction(entry);
+      // The card settles LAST (ISSUE-404): after the ask, the append and the
+      // apply, with the pass's whole outcome. A standdown opened no card.
+      card?.settle(cardText.kind, cardText.text);
     }
+  }
+
+  /**
+   * Publish the entry applications one step committed, then retry whatever an
+   * earlier boundary could not publish (ISSUE-441; ADR-0065).
+   *
+   * A publish that throws is a durable-write failure: the ledger already
+   * records the application as applied, so the request is named in the journal
+   * and left at the queue head. Every boundary calls this again, so the surface
+   * is reconciled without a new cap, retry count or timeout (standing rule 7 /
+   * ADR-0060). The call never throws into the host hook.
+   */
+  function publishEntryApplications(session: DshMountSession, entry: RacoonsSessionEntry,
+    applications: readonly { readonly request: RacoonsApplicationRequest;
+      readonly capture: Capture }[]): void {
+    entry.pendingEntryPublishes.push(...applications);
+    // Persist the intent at commit (ISSUE-450), before the first publish
+    // attempt, so a throw or a death before the flush cannot lose it.
+    entry.persistPendingEntryPublishes?.();
+    flushEntryPublishes(session, entry);
+  }
+
+  /**
+   * Publish the queue head and retry what an earlier boundary could not publish.
+   *
+   * A transient throw (the host surface refused the write) stays at the head
+   * and stops the flush, so the next boundary retries it. A node-missing throw
+   * can never succeed — the host no longer holds the node — so it is named
+   * once and removed from the head, and the queue continues instead of starving
+   * every later application behind one dead node (ISSUE-449). No cap, no retry
+   * count (standing rule 7 / ADR-0060).
+   */
+  function flushEntryPublishes(session: DshMountSession, entry: RacoonsSessionEntry): void {
+    let changed = false;
+    for (;;) {
+      const application = entry.pendingEntryPublishes[0];
+      if (application === undefined) break;
+      try {
+        publishEntry(session, application.request, application.capture);
+      } catch (error) {
+        if (error instanceof EntryPublishNodeMissingError) {
+          entry.pendingEntryPublishes.shift();
+          changed = true;
+          journal('entry-publish-dropped', { sessionId: entry.sessionId,
+            eventId: application.capture.eventId, callId: application.capture.item.callId,
+            reason: error.code, pending: entry.pendingEntryPublishes.length,
+            message: error.message });
+          continue;
+        }
+        journal('entry-publish-failed', { sessionId: entry.sessionId,
+          eventId: application.capture.eventId, callId: application.capture.item.callId,
+          pending: entry.pendingEntryPublishes.length,
+          message: error instanceof Error ? error.message : String(error) });
+        if (changed) entry.persistPendingEntryPublishes?.();
+        return;
+      }
+      entry.pendingEntryPublishes.shift();
+      changed = true;
+    }
+    if (changed) entry.persistPendingEntryPublishes?.();
   }
 
   /**
@@ -2974,7 +4046,23 @@ export function createRacoonsMount(options: {
       status: result.status, intentId: result.intentId,
       issues: result.validation?.ok === false ? result.validation.issues : [],
     });
+    if (result.status === 'applied') collectSettledReceipt(entry, result.intentId);
     return result;
+  }
+
+  /**
+   * Drop the durable copy of one receipt once the engine's own `applied` row is
+   * durable (ISSUE-436). The receipt existed for the crash window before that
+   * row (ISSUE-417); the port's live map still answers this process, while the
+   * file tracks live obligations instead of every removal ever applied.
+   */
+  function collectSettledReceipt(entry: RacoonsSessionEntry, intentId: string | null): void {
+    if (intentId === null) return;
+    entry.port.settleDurableReceipt(intentId as IntentId);
+    const target = targets.get(entry.sessionId);
+    if (target !== undefined) {
+      removeDurableReceipt(target, intentId, journal, entry.sessionId);
+    }
   }
 
   /**
@@ -2993,7 +4081,8 @@ export function createRacoonsMount(options: {
    */
   async function applyForgets(entry: RacoonsSessionEntry): Promise<EngineResult[]> {
     const outcomes: EngineResult[] = [];
-    for (const pending of entry.pendingForgets.splice(0)) {
+    const drained = entry.pendingForgets.splice(0);
+    for (const pending of drained) {
       let result: EngineResult;
       try {
         result = await entry.engine.process({ kind: 'forget', eventId: pending.eventId,
@@ -3009,7 +4098,20 @@ export function createRacoonsMount(options: {
         ranges: pending.request.ranges.length, status: result.status,
         intentId: result.intentId,
         issues: result.validation?.ok === false ? result.validation.issues : [] });
+      if (result.status === 'applied') collectSettledReceipt(entry, result.intentId);
       outcomes.push(result);
+    }
+    // ISSUE-417: the queue is empty again, so the durable owed-forget fact goes
+    // with it. A failed clear leaves the row for a remount to replay; the engine
+    // dedupes by event id, so a replay of an applied forget applies nothing.
+    // Only a boundary that actually drained something rewrites the file; a
+    // forget that landed during the drain was already persisted by the queue.
+    const target = targets.get(entry.sessionId);
+    if (drained.length > 0 && target !== undefined
+      && !writePendingForgets(target, entry.pendingForgets.map(durableForgetOf), journal,
+        entry.sessionId)) {
+      journal('forget-persist-error', { sessionId: entry.sessionId,
+        pending: entry.pendingForgets.length });
     }
     return outcomes;
   }
@@ -3028,11 +4130,25 @@ export function createRacoonsMount(options: {
    * intent (ISSUE-374) is re-queued so the boundary's flush replays the records
    * a death before the flush left owed to the host. A fresh session finds
    * nothing to recover and writes no line.
+   *
+   * Two bounds shape it. ISSUE-414: a result whose node id is in the mount's
+   * durable pre-install set was never observed landing, so it is never re-queued
+   * and never asked over. ISSUE-428: the latch clears only when every leg
+   * succeeds; a throw (`collapse`, `surface-read`, `marks`, `appends`, `sync`)
+   * leaves a named `entry-recovery-retry` line and the next boundary retries.
    */
   async function recoverResumedEntry(entry: RacoonsSessionEntry,
     session: DshMountSession): Promise<void> {
     if (!entry.resumeRecovery) return;
-    entry.resumeRecovery = false;
+    // ISSUE-428: the latch clears only when every recovery leg succeeds. A leg
+    // that throws is journaled by name and the entry keeps owing its recovery,
+    // so the next boundary retries instead of the process silently losing it.
+    let step = 'collapse';
+    let collapsed = 0;
+    let redelivered = 0;
+    let kept = 0;
+    let appends = 0;
+    try {
     const askKind = `${config.recordName}/entry-ask`;
     const isAsk = (seq: number): boolean => {
       const event = session.eventAt?.(seq);
@@ -3041,8 +4157,14 @@ export function createRacoonsMount(options: {
       const source = isRecord(data['source']) ? data['source'] : {};
       return source['kind'] === askKind;
     };
-    let collapsed = 0;
     let run: number[] = [];
+    // ISSUE-403: a refused collapse is NOT recovered. ISSUE-463: an `unknown`
+    // collapse is not recovered either — the host did not confirm the write, so
+    // the range may still be on the surface. Both name the retry and stop this
+    // pass before any leg can clear the latch, so the next boundary tries again
+    // instead of treating "the host said maybe/no" as done.
+    let collapseRefused: string | null = null;
+    let collapseUnknown: string | null = null;
     const collapseRun = (): void => {
       const first = run[0], last = run[run.length - 1];
       run = [];
@@ -3054,7 +4176,13 @@ export function createRacoonsMount(options: {
       // This write is the mount's, never a row's apply: consume it so a later
       // `takeEntryWrite` cannot read it as that row's own outcome.
       entry.port.takeEntryWrite();
-      collapsed += 1;
+      if (outcome.status === 'applied') {
+        collapsed += 1;
+      } else if (outcome.status === 'refused') {
+        collapseRefused ??= outcome.code;
+      } else {
+        collapseUnknown ??= outcome.detail;
+      }
       journal('entry-ask-collapsed', { sessionId: entry.sessionId, resultNodeId: '',
         askNodeId, answerNodeId, batchSize: 0, status: outcome.status, reason: 'resume',
         ...(outcome.status === 'refused' ? { code: outcome.code } : {}) });
@@ -3064,15 +4192,30 @@ export function createRacoonsMount(options: {
       else collapseRun();
     }
     collapseRun();
+    if (collapseRefused !== null) {
+      journal('entry-recovery-retry', { sessionId: entry.sessionId, step: 'collapse',
+        reason: 'collapse-refused', code: collapseRefused,
+        message: 'the host refused the orphaned exchange rewind; recovery keeps owing' });
+      return;
+    }
+    if (collapseUnknown !== null) {
+      journal('entry-recovery-retry', { sessionId: entry.sessionId, step: 'collapse',
+        reason: 'collapse-unknown', detail: collapseUnknown,
+        message: 'the host did not confirm the orphaned exchange rewind; recovery keeps owing' });
+      return;
+    }
     // Rebuild the settled marks and re-queue the landings the buffer lost. A
     // result already queued was captured live by THIS mount and delivers
     // through the normal drain; only the surface's pre-existing rows are new.
+    step = 'surface-read';
     const synced = surfaceTranscript(session, { sessionId: entry.sessionId });
     const buffer = buffers.get(entry.sessionId) ?? [];
     const queued = new Set(buffer.map(capture => capture.eventId));
-    let redelivered = 0;
     for (const [index, item] of synced.items.entries()) {
       if (item.role !== 'tool') continue;
+      // ISSUE-414: a result that predates this session's durable state was
+      // never observed landing, so it is never re-queued (and never asked over).
+      if (entry.preInstallNodeIds.has(item.id)) continue;
       // A failed result is never queued, exactly as `observe` skips it.
       if (isRecord(item.hostData) && item.hostData['isError'] === true) continue;
       if ((item.embeddedRecords?.length ?? 0) > 0) entry.entryJudged.add(item.id);
@@ -3082,12 +4225,13 @@ export function createRacoonsMount(options: {
       redelivered += 1;
     }
     buffers.set(entry.sessionId, buffer);
-    let kept = 0;
     // A ledger that refuses the read (the refusing ledger of a failed open,
     // ISSUE-004 chunk 4) must not abort the boundary: the engine passes still
     // run and report `recovery-pending` themselves. Only the ledger-derived
     // kept marks are skipped; the surface recovery above already stands
-    // (ISSUE-371).
+    // (ISSUE-371). ISSUE-428: the failure is named in the journal, not a host
+    // warning alone.
+    step = 'marks';
     try {
       for await (const row of entry.ledger.events(entry.sessionId)) {
         if (row.event.kind !== 'validation' || !row.event.ok) continue;
@@ -3101,7 +4245,9 @@ export function createRacoonsMount(options: {
         }
       }
     } catch (error) {
-      options.warn?.(`resume recovery read: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      journal('entry-recovery-mark-error', { sessionId: entry.sessionId, message });
+      safeWarn(`resume recovery read: ${message}`);
     }
     // The durable pending-append intent (ISSUE-374): a committed append the
     // previous process never flushed died with its in-memory queue, but the
@@ -3109,19 +4255,41 @@ export function createRacoonsMount(options: {
     // replay request in commit order; the boundary's `flushAppends` runs right
     // after this pass and `publishAppend` skips any record already on the
     // surface, so a record that landed before the death is never duplicated.
-    let appends = 0;
+    // A retry after a partial pass must not queue the same replay twice.
+    step = 'appends';
     const appendTarget = targets.get(entry.sessionId);
     if (appendTarget !== undefined) {
-      const records = readPendingAppends(appendTarget);
-      if (records.length > 0) {
+      const records = readPendingAppends(appendTarget, journal, entry.sessionId);
+      if (records.length > 0 && entry.pendingAppends.length === 0) {
         entry.pendingAppends.push(replayAppendRequest(records));
         appends = records.length;
       }
     }
-    if (collapsed > 0 || redelivered > 0 || kept > 0 || appends > 0) {
+    step = 'entry-publishes';
+    let entryPublishes = 0;
+    const publishTarget = targets.get(entry.sessionId);
+    if (publishTarget !== undefined) {
+      // ISSUE-450: a replacement the previous life committed but could not
+      // publish is on disk. Re-queue it as ONE replay per record; the boundary's
+      // `flushEntryPublishes` runs right after this pass, so a node still on the
+      // surface catches up and a node the host dropped is named `dropped`.
+      const records = readPendingEntryPublishes(publishTarget, journal, entry.sessionId);
+      if (records.length > 0 && entry.pendingEntryPublishes.length === 0) {
+        for (const record of records) entry.pendingEntryPublishes.push(replayEntryPublish(record));
+        entryPublishes = records.length;
+      }
+    }
+    if (collapsed > 0 || redelivered > 0 || kept > 0 || appends > 0 || entryPublishes > 0) {
       journal('entry-resume-recovered', { sessionId: entry.sessionId,
-        collapsed, redelivered, kept, appends });
+        collapsed, redelivered, kept, appends,
+        ...(entryPublishes > 0 ? { entryPublishes } : {}) });
+      step = 'sync';
       syncPass(entry, session);
+    }
+    entry.resumeRecovery = false;
+    } catch (error) {
+      journal('entry-recovery-retry', { sessionId: entry.sessionId, step,
+        message: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -3131,9 +4299,17 @@ export function createRacoonsMount(options: {
    * the live session.
    */
   async function runStep(session: DshMountSession,
-    ordinals: { turn: number; step: number }): Promise<StepOutcome> {
+    ordinals: { turn: number; step: number }, signal?: AbortSignal): Promise<StepOutcome> {
+    // ISSUE-439: a mount whose install-identity write failed retries it at the
+    // NEXT boundary, before any pass classifies the session (ADR-0065
+    // Decision 4). The boundary that created the entry already attempted it.
+    const known = sessions.has(session.id);
     const entry = await sessionFor(session.id, session);
+    if (known) entry.retryInstallIdentity?.();
     await recoverResumedEntry(entry, session);
+    // Retry any entry replacement an earlier boundary committed but could not
+    // publish (ISSUE-441): the surface, not the ledger, is the missing half.
+    flushEntryPublishes(session, entry);
     // Retry any append an earlier boundary committed but never landed
     // (ISSUE-342): a failed publishAppend stays queued until it succeeds.
     try { flushAppends(session, entry, config); }
@@ -3184,7 +4360,7 @@ export function createRacoonsMount(options: {
     // step yet, so a result's unit is asked once before any later seam can name
     // it. Sequential, one ask per result, and fail-open throughout: the step is
     // never held past the ask's own deadline.
-    await runEntryAsks(entry, session, landed);
+    await runEntryAsks(entry, session, landed, signal);
     // An answered exchange appended turns and may have rewound them: the
     // at-rest pass must plan against the surface that actually stands now.
     syncPass(entry, session);
@@ -3271,7 +4447,7 @@ export function createRacoonsMount(options: {
     // state without writing any.
     if (pruneRequests.has(session.id) || crossed) {
       try {
-        await runPrune(session);
+        await runPrune(session, entry, signal);
         // A pass that applied changed the transcript the next request sends.
         // Re-read the estimate rather than leave the pre-pass number standing
         // (G8, ISSUE-045 D1): the row that answers the NEXT request is measured
@@ -3293,8 +4469,11 @@ export function createRacoonsMount(options: {
    * dispatch is a serial hook, not the `session/event` observer.
    */
   async function runTurnEnd(session: DshMountSession, turn: number): Promise<TurnEndOutcome> {
+    const known = sessions.has(session.id);
     const entry = await sessionFor(session.id, session);
+    if (known) entry.retryInstallIdentity?.();
     await recoverResumedEntry(entry, session);
+    flushEntryPublishes(session, entry);
     try { flushAppends(session, entry, config); }
     catch (error) {
       journal('append-publish-failed', { sessionId: entry.sessionId,
@@ -3338,35 +4517,184 @@ export function createRacoonsMount(options: {
    * a reopen restores the round/latch (ISSUE-336) and replays any owed append
    * intent (ISSUE-374) through the ISSUE-341 recovery.
    */
-  async function releaseSession(sessionId: string): Promise<boolean> {
+  async function releaseSession(sessionId: string,
+    reason: 'session/end' | 'close'): Promise<boolean> {
     const entry = sessions.get(sessionId);
-    if (entry === undefined) return false;
-    sessions.delete(sessionId);
-    if (entry.ownedLedger) await entry.ledger.close().catch(() => {});
-    calls.delete(sessionId);
-    buffers.delete(sessionId);
-    targets.delete(sessionId);
-    mainWire.evict(sessionId);
-    return true;
+    if (entry !== undefined) {
+      // ISSUE-450: a replacement the host still owes the surface is never
+      // dropped silently. A durable queue is on disk and replayed at the next
+      // entry for this id; an in-memory one is named as lost.
+      if (entry.pendingEntryPublishes.length > 0) {
+        const head = entry.pendingEntryPublishes[0];
+        journal('entry-publish-abandoned', { sessionId,
+          ...(head === undefined ? {} : { callId: head.capture.item.callId,
+            eventId: head.capture.eventId }),
+          pending: entry.pendingEntryPublishes.length,
+          durable: entry.persistPendingEntryPublishes !== undefined, reason });
+      }
+      sessions.delete(sessionId);
+      // ISSUE-451: evict this life's maps BEFORE the ledger-close await. The
+      // await yields, and the host may reopen the same id (ISSUE-374) into a
+      // fresh entry; evicting afterwards would delete state that new life wrote.
+      evictSessionState(sessionId);
+      if (entry.ownedLedger) await entry.ledger.close().catch(() => {});
+    } else {
+      evictSessionState(sessionId);
+    }
+    return entry !== undefined;
   }
 
   /**
-   * Register one boundary's work for `endSession` to await (ISSUE-397). The
-   * outermost boundary owns the map slot; a nested boundary (the tail prune
-   * inside a step) is already covered by its caller's promise. The slot is
-   * cleared only by the promise that owns it, so a later boundary's slot is
-   * never deleted by an earlier one's cleanup.
+   * Evict every mount-wide map keyed by one session id (ISSUE-402, ISSUE-433,
+   * ISSUE-434). Eviction is not gated on an open entry: `observe` fills the call
+   * facts, captures, prune request and main wire before any entry exists, and
+   * the storage bookkeeping (`openFailures`, `unavailable`, `planned`) encodes
+   * one session's lifecycle. A reopen therefore starts with no carried-over
+   * state, a fresh retry allowance and its own named storage lines. Lifecycle
+   * eviction only — no cap, no LRU, no timeout (standing rule 7 / ADR-0060).
+   */
+  function evictSessionState(sessionId: string): void {
+    calls.delete(sessionId);
+    buffers.delete(sessionId);
+    targets.delete(sessionId);
+    // A `/cremate` request is per-session state too (ISSUE-402): one recorded
+    // and never consumed must not survive the eviction and fire a paid pass on
+    // a later reopen of the same id. `runPrune` already cleared its own on
+    // consumption, so an evicted-but-consumed request leaves nothing here.
+    pruneRequests.delete(sessionId);
+    mainWire.evict(sessionId);
+    openFailures.delete(sessionId);
+    unavailable.delete(sessionId);
+    planned.delete(sessionId);
+  }
+
+  /**
+   * Every session id this mount holds state for, whether or not an entry was
+   * ever opened (ISSUE-433). `observe` fills the maps before the first pre-step,
+   * and `observeWire` can fill the main-wire store before any `session/event`,
+   * so `close()` enumerates every one of them (ISSUE-455) and not only
+   * `sessions`.
+   */
+  function observedSessionIds(): string[] {
+    return [...new Set([...sessions.keys(), ...calls.keys(), ...buffers.keys(),
+      ...targets.keys(), ...pruneRequests, ...openFailures.keys(), ...unavailable,
+      ...planned, ...mainWire.sessionIds()])];
+  }
+
+  /**
+   * Register one boundary's work for the drain to await (ISSUE-397, ISSUE-401).
+   * EVERY boundary registers its own promise and a settled promise removes only
+   * its own registration, so two boundaries overlapping on one session (an ask
+   * and a direct `runPrune`) are both held, in whatever order they settle.
+   * Tracking work, never permission: a boundary that never started is not here.
    */
   function trackBoundary<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
     const promise = work();
-    if (!boundaries.has(sessionId)) {
-      boundaries.set(sessionId, promise);
-      const settle = (): void => {
-        if (boundaries.get(sessionId) === promise) boundaries.delete(sessionId);
-      };
-      promise.then(settle, settle);
-    }
+    const inFlight = boundaries.get(sessionId) ?? new Set<Promise<unknown>>();
+    boundaries.set(sessionId, inFlight);
+    inFlight.add(promise);
+    const settle = (): void => {
+      inFlight.delete(promise);
+      if (inFlight.size === 0 && boundaries.get(sessionId) === inFlight) {
+        boundaries.delete(sessionId);
+      }
+    };
+    void promise.then(settle, settle);
     return promise;
+  }
+
+  /**
+   * Run one host tool call's ledger/durable work as a tracked boundary
+   * (ISSUE-435). `forget` and `recall` touch the same ledger and durable state
+   * as a step, so `endSession` and `close()` must wait them out before the
+   * entry is released; otherwise a recall reads a closed ledger and a forget
+   * writes after `session-evicted`. A call that starts once `close()` began is
+   * refused by name instead of racing the release. Tracking work, never
+   * permission; no cap or timeout (standing rule 7 / ADR-0060).
+   */
+  function runToolWork<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+    if (closing) throw new RacoonsClosingError(sessionId);
+    return trackBoundary(sessionId, work);
+  }
+
+  /**
+   * Wait out every in-flight boundary of one session (ISSUE-397, ISSUE-401).
+   * The loop re-checks because a settling boundary can hand off to another
+   * tracked call; each ask is already bounded by its own declared ask deadline,
+   * so the drain adds no cap or timeout of its own (standing rule 7 /
+   * ADR-0060).
+   */
+  async function drainBoundaries(sessionId: string): Promise<void> {
+    for (;;) {
+      const inFlight = boundaries.get(sessionId);
+      if (inFlight === undefined) return;
+      const pending = [...inFlight];
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
+  /** The `close()` drain (ISSUE-401): every session's boundaries, re-checked. */
+  async function drainAllBoundaries(): Promise<void> {
+    for (;;) {
+      const pending = [...boundaries.values()].flatMap((inFlight) => [...inFlight]);
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
+  /**
+   * The `close()` drain for in-flight session ends (ISSUE-453). An end's
+   * release is not a boundary: it can be parked inside `ledger.close()`, and a
+   * shutdown that resolved before that settled would let an eviction line land
+   * after close. Re-checked because the release loop can meet work registered
+   * while it ran. No cap or timeout (standing rule 7 / ADR-0060).
+   */
+  async function drainEndings(): Promise<void> {
+    for (;;) {
+      const pending = [...endings.values()]
+        .flatMap((live) => [...live].map((ending) => ending.promise));
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
+  /**
+   * Flush one session's committed-but-unpublished appends (ISSUE-342), fail-open
+   * like every boundary. A session opened with no host has no surface to append
+   * to, so its queue stays in-process (there is nothing to publish it to).
+   */
+  function flushOwed(sessionId: string): void {
+    const entry = sessions.get(sessionId);
+    if (entry === undefined) return;
+    const session = entry.host;
+    if (session === null) return;
+    flushEntryPublishes(session, entry);
+    try { flushAppends(session, entry, config); }
+    catch (error) {
+      journal('append-publish-failed', { sessionId: entry.sessionId,
+        pending: entry.pendingAppends.length,
+        message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  /**
+   * Wait out the other ends registered for one id (ISSUE-473). An end that
+   * finds no mapped entry evicts the observed state and has nothing to release,
+   * but an earlier life's release may still be parked inside `ledger.close()`;
+   * its caller must not see the id as ended before that settles. The caller's
+   * own registration is excluded so the wait cannot deadlock, and the loop
+   * re-checks because the releases it awaits can hand off to another end. No
+   * cap or timeout (standing rule 7 / ADR-0060).
+   */
+  async function drainOtherEndings(sessionId: string, own: SessionEnding): Promise<void> {
+    for (;;) {
+      const pending = [...(endings.get(sessionId) ?? [])]
+        .filter((ending) => ending !== own)
+        .map((ending) => ending.promise);
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
   }
 
   /**
@@ -3379,53 +4707,122 @@ export function createRacoonsMount(options: {
    * owed records replayable on reopen. Buffered captures need no drain: the
    * surface still holds them and the ISSUE-341 recovery re-queues them at the
    * reopened entry's first boundary. A second call coalesces with the
-   * in-flight eviction, so an awaiter settles the same work. An in-flight
-   * boundary is awaited FIRST (ISSUE-397): its tail runs on the open entry and
-   * any appends it commits belong to the flush below.
+   * in-flight eviction for the same mapped entry, so an awaiter settles the
+   * same work; a life that does not coalesce (a reopen, or no mapped entry at
+   * all) registers its own end beside every other live one (ISSUE-452,
+   * ISSUE-473). EVERY in-flight boundary is awaited FIRST (ISSUE-397,
+   * ISSUE-401): their tails run on the open entry and any appends they commit
+   * belong to the flush below.
    */
   function endSession(session: DshMountSession): Promise<void> {
+    const current = sessions.get(session.id);
     const inFlight = endings.get(session.id);
-    if (inFlight !== undefined) return inFlight;
+    // ISSUE-452: coalesce only with the end that owns the entry currently
+    // mapped. A reopen installs a new life, whose own end must release it;
+    // ISSUE-473: every other live end stays registered beside this one.
+    if (inFlight !== undefined) {
+      for (const ending of inFlight) {
+        if (ending.entry === current) return ending.promise;
+      }
+    }
+    const registration: SessionEnding = { entry: current, promise: Promise.resolve() };
+    const live = endings.get(session.id) ?? new Set<SessionEnding>();
+    const settle = (): void => {
+      live.delete(registration);
+      if (live.size === 0 && endings.get(session.id) === live) endings.delete(session.id);
+    };
     const work = (async () => {
       await Promise.resolve();
-      // Wait out the running boundary before the flush+release (ISSUE-397).
-      // A failed boundary already journaled its own error; the release still
-      // proceeds (fail-open), exactly as a failed flush does.
-      const boundary = boundaries.get(session.id);
-      if (boundary !== undefined) await boundary.catch(() => {});
+      // Wait out EVERY running boundary before the flush+release, not only the
+      // first one registered (ISSUE-401). A failed boundary already journaled
+      // its own error; the release still proceeds (fail-open), exactly as a
+      // failed flush does.
+      await drainBoundaries(session.id);
       const entry = sessions.get(session.id);
-      if (entry === undefined) return;
+      if (entry === undefined) {
+        // ISSUE-433: a session that never opened an entry still has observed
+        // state (call facts, captures, a pending /cremate request, main wire,
+        // storage bookkeeping). Evict it here; the release path is unreachable
+        // for an id `sessions` does not hold. ISSUE-473: this end settles only
+        // after any earlier release for the id settles too.
+        evictSessionState(session.id);
+        await drainOtherEndings(session.id, registration);
+        return;
+      }
+      flushEntryPublishes(session, entry);
       try { flushAppends(session, entry, config); }
       catch (error) {
         journal('append-publish-failed', { sessionId: entry.sessionId,
           pending: entry.pendingAppends.length,
           message: error instanceof Error ? error.message : String(error) });
       }
-      if (await releaseSession(session.id)) {
+      if (await releaseSession(session.id, 'session/end')) {
         journal('session-evicted', { sessionId: session.id, reason: 'session/end' });
       }
-    })().finally(() => { endings.delete(session.id); });
-    endings.set(session.id, work);
+    })().finally(settle);
+    registration.promise = work;
+    live.add(registration);
+    endings.set(session.id, live);
     return work;
   }
 
-  return { sessions, counters, sessionFor, syncTranscript, observe, observeWire,
+  return { sessions, counters, observedSessionIds, sessionFor, syncTranscript, observe, observeWire,
     // Each public boundary registers its work so a concurrent `endSession`
     // waits it out before releasing (ISSUE-397). Internal calls (the tail
     // prune inside a step) ride the outer boundary's registration.
-    runStep: (session: DshMountSession, ordinals: { turn: number; step: number }) =>
-      trackBoundary(session.id, () => runStep(session, ordinals)),
+    runStep: (session: DshMountSession, ordinals: { turn: number; step: number },
+      signal?: AbortSignal) =>
+      trackBoundary(session.id, () => runStep(session, ordinals, signal)),
     runTurnEnd: (session: DshMountSession, turn: number) =>
       trackBoundary(session.id, () => runTurnEnd(session, turn)),
-    runPrune: (session: DshMountSession) =>
-      trackBoundary(session.id, () => runPrune(session)),
+    runPrune: (session: DshMountSession, signal?: AbortSignal) =>
+      trackBoundary(session.id, () => runPrune(session, undefined, signal)),
+    publishEntryApplications,
+    runToolWork,
+    emitJournal: journal,
     endSession,
     close: async () => {
-      // Each entry leaves through the same release the session/end eviction
-      // uses (ISSUE-377): the owned ledger closes and the per-session state
-      // (calls, capture, buffers, target) goes with it, never accumulates.
-      for (const sessionId of [...sessions.keys()]) await releaseSession(sessionId);
+      // A shutdown, not a release loop (ISSUE-416). The guard first, so a
+      // pre-step or turn-end delivered during the awaits below is refused by
+      // name instead of reopening a released session or opening a ledger
+      // nothing closes. Then owed appends flush; running boundaries drain
+      // (ISSUE-401) — their tails may commit more appends, so the flush is
+      // repeated after the drain; only then does every entry leave through the
+      // same release the session/end eviction uses (ISSUE-377).
+      closing = true;
+      for (const sessionId of [...sessions.keys()]) flushOwed(sessionId);
+      await drainAllBoundaries();
+      // ISSUE-453: an in-flight session-end release is outside `boundaries`.
+      // Await every one before releasing, so a gated ledger close can never
+      // finish (and journal `session-evicted`) after close() resolved.
+      await drainEndings();
+      // ISSUE-433: every id with observed state is released, not only the ids
+      // that opened an entry, so a shutdown leaves no map holding a dead id.
+      for (const sessionId of observedSessionIds()) {
+        flushOwed(sessionId);
+        await releaseSession(sessionId, 'close');
+      }
+      // An end started while the release loop awaited settles before close too.
+      await drainEndings();
     } };
+}
+
+/**
+ * A publish failure the host surface can never heal: the node the application
+ * names is no longer on the surface (a trimmed result, or a seq the host no
+ * longer holds). Named so `flushEntryPublishes` can take it out of the queue
+ * once instead of retrying a dead head at every later boundary (ISSUE-449).
+ * The ledger already records the application as applied; dropping the request
+ * is durable divergence, so the line that names it must say why.
+ */
+export class EntryPublishNodeMissingError extends Error {
+  readonly code: 'no-live-result' | 'no-host-event';
+
+  constructor(code: 'no-live-result' | 'no-host-event', message: string) {
+    super(message);
+    this.name = 'EntryPublishNodeMissingError';
+    this.code = code;
+  }
 }
 
 /**
@@ -3439,9 +4836,15 @@ export function publishEntry(session: DshMountSession, request: RacoonsApplicati
   // The result's current surface position, not the seq it was captured at: a
   // later cap already replaced the node once, and the surface moved with it.
   const seq = currentResultSeq(session, capture.item.callId);
-  if (seq === null) throw new Error(`racoons: no live tool/result for call ${capture.item.callId}`);
+  if (seq === null) {
+    throw new EntryPublishNodeMissingError('no-live-result',
+      `racoons: no live tool/result for call ${capture.item.callId}`);
+  }
   const original = session.eventAt?.(seq);
-  if (original === undefined) throw new Error(`racoons: no host event at seq ${String(seq)}`);
+  if (original === undefined) {
+    throw new EntryPublishNodeMissingError('no-host-event',
+      `racoons: no host event at seq ${String(seq)}`);
+  }
   const data = isRecord(original.data) ? original.data : {};
   const message = isRecord(data['message']) ? data['message'] : {};
   const text = new TextDecoder('utf-8', { fatal: false }).decode(replacement.bytes);
@@ -3497,6 +4900,83 @@ function durableAppendsOf(requests: readonly RacoonsApplicationRequest[]): Durab
 }
 
 /**
+ * The entry-publish queue's replay payload (ISSUE-450): one record per queued
+ * application, in commit order. An application with no replacement body is a
+ * publish no-op, so it carries no record.
+ */
+function durableEntryPublishesOf(queue: readonly {
+  readonly request: RacoonsApplicationRequest; readonly capture: Capture;
+}[]): DurableEntryPublish[] {
+  const records: DurableEntryPublish[] = [];
+  for (const application of queue) {
+    const bytes = application.request.application.replacements[0]?.bytes;
+    if (bytes === undefined) continue;
+    records.push({ callId: application.capture.item.callId,
+      eventId: application.capture.eventId,
+      bytesBase64: Buffer.from(bytes).toString('base64') });
+  }
+  return records;
+}
+
+/** One queued forget as the durable mount state stores it (ISSUE-417). */
+function durableForgetOf(decision: DshForgetScheduled): DurableForget {
+  return { eventId: decision.eventId, unitId: decision.unitId,
+    source: decision.request.source, label: decision.request.label,
+    ranges: decision.ranges.map(range => ({ ...range })) };
+}
+
+/**
+ * Whether this session's own ledger already holds a row (ISSUE-460). A fork's
+ * copied rows carry the parent's id, so only this session's own past can answer
+ * true. A read failure is fail-open to the caller's previous classification.
+ */
+async function ledgerHasRows(ledger: Ledger, sessionId: string): Promise<boolean> {
+  try {
+    for await (const row of ledger.events(sessionId)) {
+      if (row !== null) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Collect the durable receipts whose intents the ledger already records as
+ * `applied` (ISSUE-436). A receipt exists for the crash window before that row
+ * (ISSUE-417); once the row is durable the copy has no reader. A failed ledger
+ * read keeps every receipt (fail-open) and the next mount retries the sweep.
+ */
+async function collectSettledReceipts(target: ResolvedRacoonsStorage,
+  receipts: readonly ApplyReceipt[], ledger: Ledger, journal: MountJournal,
+  sessionId: string): Promise<ApplyReceipt[]> {
+  try {
+    const applied = new Set<string>();
+    for await (const row of ledger.events(sessionId)) {
+      if (row.event.kind === 'applied') applied.add(row.event.receipt.intentId);
+    }
+    if (applied.size === 0) return [...receipts];
+    for (const receipt of receipts) {
+      if (applied.has(receipt.intentId)) {
+        removeDurableReceipt(target, receipt.intentId, journal, sessionId);
+      }
+    }
+    return receipts.filter(receipt => !applied.has(receipt.intentId));
+  } catch {
+    return [...receipts];
+  }
+}
+
+/** One durable forget rebuilt as the queue's own record (ISSUE-417). */
+function forgetFromDurable(record: DurableForget): DshForgetScheduled {
+  return { status: 'scheduled', eventId: record.eventId as EventId,
+    unitId: record.unitId as UnitId,
+    request: { source: record.source,
+      ranges: record.ranges.map(range => ({ ...range })), label: record.label },
+    ranges: record.ranges.map(range => ({ ...range })) };
+}
+
+/**
  * One replay request over the recovered records (ISSUE-374). Only the fields
  * `publishAppend` reads are carried — the intent, receipts and archives of the
  * original application already committed to the ledger before the death; the
@@ -3507,6 +4987,22 @@ function replayAppendRequest(records: readonly DurableAppendRecord[]): RacoonsAp
     appendRecords: records.map(record => ({ recordId: record.recordId,
       bytes: new Uint8Array(Buffer.from(record.bytesBase64, 'base64')) })) } };
   return request as unknown as RacoonsApplicationRequest;
+}
+
+/**
+ * One replay entry replacement over a durable record (ISSUE-450). Only the
+ * fields `publishEntry` reads are carried — the replacement bytes and the call
+ * id its live surface node resolves by; the ledger already recorded the
+ * application as applied before the death.
+ */
+function replayEntryPublish(record: DurableEntryPublish):
+{ request: RacoonsApplicationRequest; capture: Capture } {
+  const shaped: unknown = { application: { mode: 'entry', replacements: [{
+    bytes: new Uint8Array(Buffer.from(record.bytesBase64, 'base64')) }] } };
+  const request = shaped as RacoonsApplicationRequest;
+  const capture = { eventId: record.eventId, seq: 0,
+    item: { callId: record.callId } as unknown as DshToolResultItem };
+  return { request, capture };
 }
 
 /**
@@ -3559,18 +5055,90 @@ export function singleLiveSession(ctx: DshMountContext): DshMountSession | undef
 }
 
 /**
- * The mount entry a tool call answers from: the single live session's entry,
- * else the only one the mount has opened. Both tools resolve their session this
- * way, so a test that drives the mount directly (no `ctx.sessions` store) still
- * gets the same wiring a live host gets.
+ * The caller's session id as the host tool context can name it (ISSUE-415).
+ * dsh hands the tool call's context to `execute`; the identity may ride on
+ * `session`, `agent.session`, or a plain `sessionId`/`sessionID`. Any shape
+ * that names one session resolves; no shape returns `undefined`, never a guess.
  */
-function liveEntry(mount: RacoonsMount, ctx: DshMountContext): RacoonsSessionEntry | undefined {
+function sessionIdFromContext(context: unknown): string | undefined {
+  if (typeof context !== 'object' || context === null) return undefined;
+  const value = context as {
+    readonly session?: { readonly id?: unknown };
+    readonly sessionId?: unknown;
+    readonly sessionID?: unknown;
+    readonly agent?: {
+      readonly session?: { readonly id?: unknown };
+      readonly sessionId?: unknown;
+    };
+  };
+  for (const candidate of [value.session?.id, value.sessionId, value.sessionID,
+    value.agent?.session?.id, value.agent?.sessionId]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
+  }
+  return undefined;
+}
+
+/** A named refusal: the `name` states the condition the caller must fix. */
+function sessionError(name: string, message: string): Error {
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+/** How many live sessions the host reports; a direct mount counts its own. */
+function liveSessionCount(ctx: DshMountContext, mount: RacoonsMount): number {
+  const store = ctx.sessions;
+  if (store !== undefined && typeof store.list === 'function') return store.list().length;
+  return mount.sessions.size;
+}
+
+/**
+ * The mount entry a tool call answers from (ISSUE-415). The caller's own
+ * session wins when the host context names one. Otherwise the single live
+ * session is used, and a mount driven directly (no `ctx.sessions` store) still
+ * answers from its only opened entry. More than one live session and no
+ * identity is a refusal by name: the wrong session must never be mutated.
+ */
+function resolveLiveEntry(mount: RacoonsMount, ctx: DshMountContext,
+  context: unknown, tool: 'forget' | 'recall'): RacoonsSessionEntry {
+  const namedId = sessionIdFromContext(context);
+  if (namedId !== undefined) {
+    const entry = mount.sessions.get(namedId);
+    if (entry !== undefined) return entry;
+    throw sessionError('CrematorToolSessionError',
+      `cremator: ${tool} refused: the tool context names session ${namedId},`
+      + ' but the mount has no open entry for it');
+  }
   const named = singleLiveSession(ctx);
   if (named !== undefined) {
     const entry = mount.sessions.get(named.id);
     if (entry !== undefined) return entry;
   }
-  return [...mount.sessions.values()][0];
+  const live = liveSessionCount(ctx, mount);
+  if (live > 1) {
+    throw sessionError('CrematorAmbiguousSessionError',
+      `cremator: ${tool} refused: ${String(live)} live sessions and no caller`
+      + ' session in the host tool context; the call must name its session');
+  }
+  const only = mount.sessions.size === 1 ? [...mount.sessions.values()][0] : undefined;
+  if (only !== undefined) return only;
+  throw sessionError('CrematorToolSessionError',
+    `cremator: ${tool} has no live session to read from`);
+}
+
+/**
+ * The sessions an unnamed `agent/turn-stopping` must seal (ISSUE-415). With a
+ * host store it is every live session; a mount driven directly (no store)
+ * falls back to the host sessions it has open. Every returned session is
+ * sealed — more than one is never a reason to skip, and the only empty result
+ * is a genuinely session-less mount.
+ */
+function liveTurnEndSessions(mount: RacoonsMount, ctx: DshMountContext): DshMountSession[] {
+  const store = ctx.sessions;
+  if (store !== undefined && typeof store.list === 'function') return [...store.list()];
+  const out: DshMountSession[] = [];
+  for (const entry of mount.sessions.values()) if (entry.host !== null) out.push(entry.host);
+  return out;
 }
 
 /**
@@ -3651,7 +5219,7 @@ interface DshHostTool {
     readonly schema: Readonly<Record<string, unknown>>;
     render(args: unknown, value: unknown): unknown;
   };
-  execute(args: unknown): Promise<unknown>;
+  execute(args: unknown, context?: unknown): Promise<unknown>;
 }
 
 /**
@@ -3671,7 +5239,8 @@ function hostTool(tool: DshToolRegistration): DshHostTool {
       render: (_args: unknown, value: unknown): unknown => [{ type: 'text',
         text: tool.spec.name === 'forget' ? forgetAnswerText(value) : recallBodyText(value) }],
     },
-    execute: async (args: unknown): Promise<unknown> => tool.execute(args),
+    execute: async (args: unknown, context?: unknown): Promise<unknown> =>
+      tool.execute(args, context),
   };
 }
 
@@ -3689,6 +5258,42 @@ function recallBodyText(value: unknown): string {
   if (!Array.isArray(parts) || parts.length === 0) return '';
   return JSON.stringify({ recallId: value['recallId'], text: null,
     byteLength: value['byteLength'], parts });
+}
+
+/** The named refusal a second apply of one configuration raises (ISSUE-424). */
+export const CREMATOR_DUPLICATE_MOUNT_CODE = 'duplicate-mount';
+
+/**
+ * A second live `apply` for one durable configuration (ISSUE-424). Two mounts
+ * would open two ledgers for the same session and publish duplicate asks and
+ * cards; the refusal is by name so a host log line says what happened.
+ */
+export class RacoonsDuplicateMountError extends Error {
+  readonly code = CREMATOR_DUPLICATE_MOUNT_CODE;
+  readonly key: string;
+
+  constructor(key: string) {
+    super('cremator: a plugin for this configuration is already mounted; '
+      + 'refusing the second apply rather than open a second ledger');
+    this.name = 'RacoonsDuplicateMountError';
+    this.key = key;
+  }
+}
+
+/**
+ * The process-level registry (ISSUE-424): one live plugin per durable
+ * configuration. `':memory:'` has no durable identity and is not tracked, so
+ * tests may apply as many memory mounts as they need.
+ */
+const activePluginApplies = new Map<string, true>();
+
+function pluginApplyKey(
+  config: ReturnType<typeof resolvePluginConfig>,
+  storage: { databasePath: string; root?: string },
+): string | null {
+  if (storage.databasePath === ':memory:') return null;
+  return JSON.stringify({ config, databasePath: storage.databasePath,
+    root: storage.root ?? null });
 }
 
 /**
@@ -3710,6 +5315,19 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
     async apply(ctx, rawConfig) {
       const config = resolvePluginConfig({ ...options.config, ...rawConfig });
       const storage = resolveStorage(options.storage, config.crematorStorageRoot);
+      /**
+       * ISSUE-424: one live apply per durable configuration. The claim runs
+       * before any session opens a ledger, so a second apply can never construct
+       * a second ledger for the same session. Cancelled when this apply fails
+       * and when the host unloads the plugin's fiber.
+       */
+      const registryKey = pluginApplyKey(config, storage);
+      if (registryKey !== null) {
+        if (activePluginApplies.has(registryKey)) {
+          throw new RacoonsDuplicateMountError(registryKey);
+        }
+        activePluginApplies.set(registryKey, true);
+      }
       // A host-supplied ledger wins; otherwise the default plan is durable
       // (ADR-0013) and `':memory:'` only appears when a test asks for it.
       const ledgerSource = options.openLedger !== undefined ? 'host'
@@ -3722,12 +5340,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       const warn = (message: string): void => {
         try { ctx.logger?.warn?.(`racoons: ${message}`); } catch { /* logging only */ }
       };
-      const mount = createRacoonsMount({ config, storage, clock: { nowMs },
-        ...llm === undefined ? {} : { llm },
-        ...options.judgeRoute === undefined ? {} : { judgeRoute: options.judgeRoute },
-        ...options.openLedger === undefined ? {} : { openLedger: options.openLedger },
-        ...options.journal === undefined ? {} : { journal: options.journal },
-        warn });
+      let mount: ReturnType<typeof createRacoonsMount>;
+      try {
+        mount = createRacoonsMount({ config, storage, clock: { nowMs },
+          ...llm === undefined ? {} : { llm },
+          ...options.judgeRoute === undefined ? {} : { judgeRoute: options.judgeRoute },
+          ...options.openLedger === undefined ? {} : { openLedger: options.openLedger },
+          ...options.journal === undefined ? {} : { journal: options.journal },
+          warn });
+      } catch (error) {
+        if (registryKey !== null) activePluginApplies.delete(registryKey);
+        throw error;
+      }
+      if (registryKey !== null) {
+        ctx.effect?.(() => () => { activePluginApplies.delete(registryKey); },
+          'racoons.mount-registry');
+      }
       // Typed, not cast: `kind` must be a member of the closed journal
       // vocabulary, so the mount line can never drift from the union
       // (CRITIC-022 P3 #14).
@@ -3763,7 +5391,10 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         estimate: 'host-billed-prompt',
         nativeCompactionBackstop: config.nativeCompactionBackstop,
       });
-      options.journal?.(mountedLine);
+      // The mounted line rides the mount's swallowing wrapper (ISSUE-430): a
+      // throwing sink is contained exactly as every other line is, so it cannot
+      // reject the plugin apply.
+      mount.emitJournal(mountedLine.kind, { ...mountedLine });
 
       // Both handlers need a session, resolved lazily at call time: the
       // registration must not depend on a session existing when the plugin
@@ -3771,25 +5402,42 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       // queues the request for that session's next boundary; `recall` reads the
       // ledger of the one live session.
       const toolHost = resolveToolHost(ctx, options.tools);
+      // The inventory this mount tries to advertise, named in every outcome
+      // (ISSUE-454): absent, registered and refused all state the same fields,
+      // so an operator can read the tool outcome from one line.
+      const offered = DSH_TOOL_SPECS.map(spec => spec.name);
       let unregisterTools: (() => void) | undefined;
-      if (toolHost !== undefined) {
+      if (toolHost === undefined) {
+        // No tools service is a named state, never silence that reads exactly
+        // like a host that registered both tools (ISSUE-454).
+        mount.emitJournal('tool-registration', { status: 'absent', registered: 0,
+          offered, reason: 'no-tools-service' });
+      } else {
         try {
           unregisterTools = registerPluginTools(toolHost, {
-            recall: async (id) => {
-              const entry = liveEntry(mount, ctx);
-              if (entry === undefined) throw new Error('cremator: recall has no live session to read from');
-              return entry.adapter.recall(id as RecallId);
+            recall: async (id, context) => {
+              const entry = resolveLiveEntry(mount, ctx, context, 'recall');
+              // ISSUE-435: the ledger read is a tracked boundary, drained
+              // before this entry's ledger closes.
+              return mount.runToolWork(entry.sessionId,
+                () => entry.adapter.recall(id as RecallId));
             },
-            forget: async (request) => {
-              const entry = liveEntry(mount, ctx);
-              if (entry === undefined) {
-                throw new Error('cremator: forget has no live session to read from');
-              }
-              return entry.adapter.forget(request);
+            forget: async (request, context) => {
+              const entry = resolveLiveEntry(mount, ctx, context, 'forget');
+              return mount.runToolWork(entry.sessionId, () => entry.adapter.forget(request));
             },
           });
+          mount.emitJournal('tool-registration', { status: 'registered',
+            registered: offered.length, offered });
         } catch (error) {
-          warn(`tool registration: ${error instanceof Error ? error.message : String(error)}`);
+          // ISSUE-443: registration is all-or-nothing, so a host refusal leaves
+          // NEITHER tool advertised while the `mounted` line above reads as a
+          // healthy mount. Name the failure in the journal (ADR-0065's record
+          // rule) and stay fail-open: the plugin apply still completes.
+          const message = error instanceof Error ? error.message : String(error);
+          mount.emitJournal('tool-registration-error', { registered: 0,
+            offered, allOrNothing: true, message });
+          warn(`tool registration: ${message}`);
         }
       }
 
@@ -3818,18 +5466,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         agent?: { session?: DshMountSession };
         turn?: number;
         step?: number;
+        signal?: AbortSignal;
       }, next: () => unknown) => {
         const session = payload.agent?.session;
         if (session === undefined) return next();
+        // A host (or a rig) may name any value in the `signal` slot. Only a
+        // real `AbortSignal` may reach `AbortSignal.any`, so the boundary
+        // validates it and falls back to no signal rather than throwing the
+        // step out on a malformed payload.
+        const signal = payload.signal instanceof AbortSignal ? payload.signal : undefined;
         try {
           const stepResult = await mount.runStep(session,
-            { turn: Number(payload.turn ?? 0), step: Number(payload.step ?? 0) });
-          for (const application of stepResult.entryApplications) {
-            try { publishEntry(session, application.request, application.capture); }
-            catch (error) {
-              warn(`entry publish: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
+            { turn: Number(payload.turn ?? 0), step: Number(payload.step ?? 0) },
+            signal);
+          // ISSUE-441: a failed publish is named and queued, never warn-only.
+          mount.publishEntryApplications(session, stepResult.entry,
+            stepResult.entryApplications);
           if (stepResult.appendRequest !== null) {
             try { flushAppends(session, stepResult.entry, config); }
             catch (error) {
@@ -3852,19 +5504,24 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         turn?: number;
         agent?: { session?: DshMountSession };
       }) => {
-        const session = payload.agent?.session ?? singleLiveSession(ctx);
-        if (session === undefined) return;
-        try {
-          const turnResult = await mount.runTurnEnd(session, Number(payload.turn ?? 0));
-          if (turnResult.appendRequest !== null) {
-            try { flushAppends(session, turnResult.entry, config); }
-            catch (error) {
-              warn(`turn-end append publish: ${error instanceof Error ? error.message : String(error)}`);
+        const named = payload.agent?.session;
+        // A payload that names its agent seals that one; an unnamed payload
+        // seals every live session, so more than one is never a silent no-op
+        // (ISSUE-415). Only a session-less mount yields no work.
+        const sessions = named !== undefined ? [named] : liveTurnEndSessions(mount, ctx);
+        for (const session of sessions) {
+          try {
+            const turnResult = await mount.runTurnEnd(session, Number(payload.turn ?? 0));
+            if (turnResult.appendRequest !== null) {
+              try { flushAppends(session, turnResult.entry, config); }
+              catch (error) {
+                warn(`turn-end append publish: ${error instanceof Error ? error.message : String(error)}`);
+              }
             }
-          }
-        } catch (error) {
-          if (!(error instanceof RacoonsStorageRetryError)) {
-            warn(`turn-end: ${error instanceof Error ? error.message : String(error)}`);
+          } catch (error) {
+            if (!(error instanceof RacoonsStorageRetryError)) {
+              warn(`turn-end: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
         }
       });

@@ -69,16 +69,21 @@ const HOST_MAIN = {
 function fakeSession(id: string): DshMountSession & {
   readonly log: DshMountEvent[];
   readonly surfaceNodes: number[];
+  setRoute(next: { readonly provider: string; readonly model: string }): void;
 } {
   const log: DshMountEvent[] = [];
   const surfaceNodes: number[] = [];
+  let route = { provider: 'a6', model: 'prune-model' };
   const session = {
     id,
     get seq() { return log.length; },
     get surface() { return { nodes: surfaceNodes }; },
     get log() { return log; },
     get surfaceNodes() { return surfaceNodes; },
-    requestHeader: () => ({ config: { provider: 'a6', model: 'prune-model' } }),
+    requestHeader: () => ({ config: { provider: route.provider, model: route.model } }),
+    setRoute(next: { readonly provider: string; readonly model: string }) {
+      route = { provider: next.provider, model: next.model };
+    },
     eventAt: (seq: number) => log[seq],
     append(type: string, data: unknown, options: Record<string, unknown> = {}) {
       const seq = log.length;
@@ -179,7 +184,8 @@ async function mounted(params: {
   // `capture: false` is a session whose main request has not been seen yet: no
   // prefix exists to count, so the trigger reads transcript content only.
   if (params.capture !== false) {
-    mainWire.note({ sessionId: session.id, ...HOST_MAIN,
+    mainWire.note({ sessionId: session.id, provider: 'a6', model: 'prune-model',
+      ...HOST_MAIN,
       ...(params.mainSystem === undefined ? {} : { system: params.mainSystem }) });
   }
   const llm = params.answer === undefined ? undefined : fakeLlm(params.answer);
@@ -657,10 +663,36 @@ test('a warm watermark at the removal\'s node applies; one node deeper refuses',
     const issues = applied?.['issues'] as readonly { code?: string }[];
     assert.deepEqual(issues.map(issue => issue.code), ['cut-below-watermark'],
       'and speaks the fence\'s own code');
+    // ISSUE-462: the visible card names the rejected apply, never "settled".
+    const done = deeper.session.log.find(event => event.type === 'command/done');
+    const doneData = done?.data as { kind?: string; text?: string } | undefined;
+    assert.equal(doneData?.kind, 'error', 'a rejected apply does not settle success');
+    assert.match(doneData?.text ?? '', /rejected/u, 'the text names the apply status');
+    assert.match(doneData?.text ?? '', /cut-below-watermark/u, 'and the guard code');
     assert.equal(deeper.session.log.filter(event => event.surfaceOp !== undefined
       && event.surfaceOp !== 'append').length, 0, 'nothing moved on the host surface');
   } finally {
     await deeper.mount.close();
+  }
+});
+
+test('ISSUE-470: a stale main-wire capture refuses the prune seed by name', async () => {
+  const env = await mounted({ id: 's-prune-seed-stale', window: 1_000_000,
+    answer: '{"1":{"forgetall":"an old read"}}' });
+  try {
+    // Captured under the opening route; the pass now runs under another model.
+    env.session.setRoute({ provider: 'a6', model: 'gpt-6-astra' });
+    const outcome = await env.mount.runPrune(env.session);
+    assert.equal(env.llm?.calls.length, 0, 'no request left the seam');
+    assert.equal(outcome?.refusedFor, 'seed-model-stale', 'the pass refuses by name');
+    const stale = env.records.records.filter(record => record['kind'] === 'seed-model-stale');
+    assert.equal(stale.length, 1, 'one named refusal line');
+    assert.equal(stale[0]?.['seedModel'], 'prune-model', 'the capture route is named');
+    assert.equal(stale[0]?.['routeModel'], 'gpt-6-astra', 'the live route is named');
+    assert.equal(env.records.records.filter(record => record['kind'] === 'prune-seed').length, 0,
+      'the stale capture never seeded a fork');
+  } finally {
+    await env.mount.close();
   }
 });
 

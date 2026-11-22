@@ -42,6 +42,20 @@ export interface DshPortOptions {
    * boundary: it supplies no reader and a ledger miss stays `not-found`.
    */
   readonly workspaceRoot?: string;
+  /**
+   * Applied receipts a previous process minted for this session (ISSUE-417).
+   * The in-process map dies with the process; these rows come back from the
+   * mount's durable state so `lookupReceipt` can resolve a prepared ledger row
+   * the previous process landed instead of answering `unknown` forever.
+   */
+  readonly receipts?: readonly ApplyReceipt[];
+  /**
+   * Called once per receipt the port mints, at the host write and before the
+   * engine's own `applied` ledger row (ISSUE-417). A process death between the
+   * two therefore leaves a durable receipt the remount can answer from.
+   * Fail-open: a throwing callback never changes the apply's outcome.
+   */
+  readonly persistReceipt?: (receipt: ApplyReceipt) => void;
 }
 
 /**
@@ -206,6 +220,14 @@ export class DshApplicationPort implements ApplicationPort {
   private state: DshSessionState;
   private generation = 0;
   private readonly receipts = new Map<IntentId, ApplyReceipt>();
+  /**
+   * The receipts a previous process minted, read back from the mount's durable
+   * state (ISSUE-417). Kept apart from `this.receipts`: a replayed intent after
+   * a restart names a different base revision, so it must not be answered from
+   * the live replay map. `lookupReceipt` is the only reader.
+   */
+  private readonly durableReceipts = new Map<IntentId, ApplyReceipt>();
+  private readonly persistReceipt: DshPortOptions['persistReceipt'];
   // Event identity only: original removed bodies belong exclusively in the core ledger.
   private readonly delivered = new Map<string, string>();
   private deliveryQueue: Promise<void> = Promise.resolve();
@@ -214,8 +236,8 @@ export class DshApplicationPort implements ApplicationPort {
   private readonly revisionPrefix: string;
   private readonly failApply: DshPortOptions['failApply'];
   private readonly publish: DshPortOptions['publish'];
-  private readonly revert: DshRevertSession | undefined;
-  private readonly workspaceRoot: string | undefined;
+  private revert: DshRevertSession | undefined;
+  private workspaceRoot: string | undefined;
   /**
    * Per-path byte coverage over every tool-result node this port holds (PRD
    * §6.6, gap G3; ISSUE-053). One meter per session, recorded on every
@@ -246,6 +268,8 @@ export class DshApplicationPort implements ApplicationPort {
     this.revisionPrefix = options.revision ?? '0';
     this.failApply = options.failApply;
     this.publish = options.publish;
+    this.persistReceipt = options.persistReceipt;
+    for (const receipt of options.receipts ?? []) this.durableReceipts.set(receipt.intentId, receipt);
     this.revert = options.revert;
     this.workspaceRoot = options.workspaceRoot === undefined ? undefined
       : isAbsolute(options.workspaceRoot) ? options.workspaceRoot : undefined;
@@ -256,6 +280,22 @@ export class DshApplicationPort implements ApplicationPort {
   }
 
   private revision(): string { return `${this.revisionPrefix}:${this.generation}`; }
+
+  /**
+   * ISSUE-432: the entry-opening host is not the session's host forever. The
+   * mount rebinds these when a boundary sees a different host, so a later
+   * mount's revert seam and recall-source boundary are not the old object's.
+   * A mount that opened with no seam stays seam-less: capability truth is
+   * decided once at mount (ISSUE-010), so a null seam never turns one on here.
+   * A host that names no workspace root leaves the existing boundary in place
+   * rather than widening the read allowance.
+   */
+  updateHostSeams(revert: DshRevertSession | null, workspaceRoot: string | undefined): void {
+    if (this.revert !== undefined && revert !== null) this.revert = revert;
+    if (workspaceRoot !== undefined) {
+      this.workspaceRoot = isAbsolute(workspaceRoot) ? workspaceRoot : this.workspaceRoot;
+    }
+  }
 
   transcript(): readonly DshTranscriptItem[] { return structuredClone(this.items); }
 
@@ -740,7 +780,7 @@ export class DshApplicationPort implements ApplicationPort {
       }
       this.items = candidate;
       this.generation += 1;
-      this.receipts.set(intent.intentId, receipt);
+      this.commitReceipt(receipt);
       return { status: 'applied', receipt };
     } catch {
       return { status: 'not-applied', reason: 'host-error' };
@@ -781,15 +821,38 @@ export class DshApplicationPort implements ApplicationPort {
       sessionId: this.sessionId, baseRevision: intent.baseRevision,
       resultRevision: `${this.revisionPrefix}:${this.generation}`,
       applicationSha256: intent.applicationSha256, appliedAtMs: this.clock.nowMs() });
-    this.receipts.set(intent.intentId, receipt);
+    this.commitReceipt(receipt);
     return { status: 'applied', receipt };
+  }
+
+  /**
+   * File one applied receipt in memory and, when the mount supplied a durable
+   * sink, persist it at the host write (ISSUE-417). The persist is contained:
+   * a storage failure is the mount's own journal line and never changes the
+   * apply's outcome.
+   */
+  private commitReceipt(receipt: ApplyReceipt): void {
+    this.receipts.set(receipt.intentId, receipt);
+    try { this.persistReceipt?.(receipt); } catch { /* the mount journals its own failure */ }
   }
 
   async lookupReceipt(intentId: IntentId): Promise<ReceiptLookup> {
     // Absence from this process's map is not a refusal: only a positive host
-    // record can answer not-applied (ADR-0015, ISSUE-030 R1).
-    const receipt = this.receipts.get(intentId);
+    // record can answer not-applied (ADR-0015, ISSUE-030 R1). A receipt the
+    // previous process minted is a host record, so the durable set answers it
+    // for a remount's recovery instead of leaving the prepared row blocked
+    // forever (ISSUE-417).
+    const receipt = this.receipts.get(intentId) ?? this.durableReceipts.get(intentId);
     return receipt !== undefined ? { status: 'applied', receipt } : { status: 'unknown' };
+  }
+
+  /**
+   * Drop one durable receipt once the ledger's `applied` row supersedes it
+   * (ISSUE-436). The live map keeps this process's answer; the durable map only
+   * exists to resolve a prepared row after a remount, and that row is finished.
+   */
+  settleDurableReceipt(intentId: IntentId): void {
+    this.durableReceipts.delete(intentId);
   }
 
   /**
@@ -861,7 +924,7 @@ export class DshApplicationPort implements ApplicationPort {
     this.indexSources(application.archives);
     this.items = [...candidate];
     this.generation += 1;
-    this.receipts.set(intent.intentId, receipt);
+    this.commitReceipt(receipt);
     return { status: 'applied', receipt };
   }
 }

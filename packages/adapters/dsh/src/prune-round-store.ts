@@ -103,7 +103,8 @@ function readDoc(dir: string): Record<string, unknown> {
  * durability across a restart.
  */
 function publishDoc(dir: string, doc: Record<string, unknown>, journal: MountJournal,
-  sessionId: string, errorKind: 'prune-round-error' | 'append-persist-error',
+  sessionId: string,
+  errorKind: 'prune-round-error' | 'append-persist-error' | 'entry-publish-persist-error',
   fields: Record<string, unknown>): boolean {
   const final = join(dir, PRUNE_ROUND_FILE);
   const temp = `${final}.${String(process.pid)}.${String(tempSeq++)}.tmp`;
@@ -135,11 +136,57 @@ export function writePruneRound(target: ResolvedRacoonsStorage, round: number,
   journal: MountJournal, sessionId: string, trigger?: PruneWindowTriggerState): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const appends = readDoc(dir)['appends'];
+  const prior = readDoc(dir);
+  const appends = prior['appends'];
+  const entryPublishes = prior['entryPublishes'];
   return publishDoc(dir, { round,
     ...(trigger === undefined ? {} : { trigger }),
-    ...(Array.isArray(appends) ? { appends } : {}) },
+    ...(typeof prior['entryAskFired'] === 'boolean'
+      ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(Array.isArray(appends) ? { appends } : {}),
+    ...(Array.isArray(entryPublishes) ? { entryPublishes } : {}) },
   journal, sessionId, 'prune-round-error', { round });
+}
+
+/**
+ * Whether this session already shipped its first-ask share line (ISSUE-406),
+ * read from the same per-session file as the round and latch. An absent,
+ * corrupt or non-boolean value reads `false`: the safe failure is to state the
+ * first-ask share once more, never to claim a history the file cannot prove.
+ * A fork starts false (see `plugin.ts`): the parent's ask history is not the
+ * child's, exactly as the round and latch are not inherited.
+ */
+export function readEntryAskFired(target: ResolvedRacoonsStorage): boolean {
+  const dir = sessionDirOf(target);
+  if (dir === null) return false;
+  try {
+    return readDoc(dir)['entryAskFired'] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record that the session has asked at least once (ISSUE-406), preserving the
+ * round, the latch and the pending appends the same file carries. The flag is
+ * one boolean on the existing per-session store — no new store and no cap.
+ * Fail-open: a failed write journals `prune-round-error` and the in-memory flag
+ * still serves this process; only the restart durability is lost.
+ */
+export function writeEntryAskFired(target: ResolvedRacoonsStorage, fired: boolean,
+  journal: MountJournal, sessionId: string): boolean {
+  const dir = sessionDirOf(target);
+  if (dir === null) return true;
+  const prior = readDoc(dir);
+  return publishDoc(dir, {
+    ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
+    ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
+      ? { trigger: prior['trigger'] } : {}),
+    ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
+    ...(Array.isArray(prior['entryPublishes'])
+      ? { entryPublishes: prior['entryPublishes'] } : {}),
+    entryAskFired: fired,
+  }, journal, sessionId, 'prune-round-error', { entryAskFired: fired });
 }
 
 /**
@@ -189,20 +236,34 @@ export interface DurableAppendRecord {
  * the round and latch reads follow. A record whose base64 does not round-trip
  * is malformed: dropping the whole fact is the fail-open answer, never a
  * half-decoded body on the host's wire.
+ *
+ * A malformed record is named (ISSUE-430): when the caller supplies a journal,
+ * one `pending-append-corrupt` line reports the record's position and defect
+ * before the empty list is returned, so a fresh process's corrupt intent is
+ * visible instead of silently reading as "nothing owed".
  */
-export function readPendingAppends(target: ResolvedRacoonsStorage): DurableAppendRecord[] {
+export function readPendingAppends(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): DurableAppendRecord[] {
   const dir = sessionDirOf(target);
   if (dir === null) return [];
   try {
     const appends = readDoc(dir)['appends'];
     if (!Array.isArray(appends)) return [];
     const records: DurableAppendRecord[] = [];
-    for (const value of appends) {
-      if (typeof value !== 'object' || value === null) return [];
+    for (const [index, value] of appends.entries()) {
+      const malformed = (detail: string): DurableAppendRecord[] => {
+        journal?.('pending-append-corrupt', { sessionId, position: index, detail });
+        return [];
+      };
+      if (typeof value !== 'object' || value === null) return malformed('record is not an object');
       const record = value as { readonly recordId?: unknown; readonly bytesBase64?: unknown };
-      if (typeof record.recordId !== 'string' || typeof record.bytesBase64 !== 'string') return [];
+      if (typeof record.recordId !== 'string' || typeof record.bytesBase64 !== 'string') {
+        return malformed('record is missing a string recordId or bytesBase64');
+      }
       const bytes = Buffer.from(record.bytesBase64, 'base64');
-      if (bytes.toString('base64') !== record.bytesBase64) return [];
+      if (bytes.toString('base64') !== record.bytesBase64) {
+        return malformed('bytesBase64 does not round-trip');
+      }
       records.push({ recordId: record.recordId, bytesBase64: record.bytesBase64 });
     }
     return records;
@@ -228,6 +289,87 @@ export function writePendingAppends(target: ResolvedRacoonsStorage,
     ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
     ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
       ? { trigger: prior['trigger'] } : {}),
+    ...(typeof prior['entryAskFired'] === 'boolean'
+      ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(Array.isArray(prior['entryPublishes'])
+      ? { entryPublishes: prior['entryPublishes'] } : {}),
     ...(records.length > 0 ? { appends: records } : {}),
   }, journal, sessionId, 'append-persist-error', { pending: records.length });
+}
+
+/**
+ * One entry replacement a released life still owes the host surface
+ * (ISSUE-450). `callId` is the node identity `publishEntry` resolves at replay
+ * time, `eventId` is the transcript id the journal names, and `bytesBase64`
+ * carries the replacement body losslessly through the JSON file.
+ */
+export interface DurableEntryPublish {
+  readonly callId: string;
+  readonly eventId: string;
+  readonly bytesBase64: string;
+}
+
+/**
+ * The pending entry-publish intent this session's file carries (ISSUE-450), in
+ * commit order, or `[]` when none is readable. The same fail-open rule as the
+ * append intent: a malformed record is named through `pending-append-corrupt`
+ * with `fact: 'entry-publishes'` and the whole fact reads empty rather than a
+ * half-decoded body reaching the host.
+ */
+export function readPendingEntryPublishes(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): DurableEntryPublish[] {
+  const dir = sessionDirOf(target);
+  if (dir === null) return [];
+  try {
+    const publishes = readDoc(dir)['entryPublishes'];
+    if (!Array.isArray(publishes)) return [];
+    const records: DurableEntryPublish[] = [];
+    for (const [index, value] of publishes.entries()) {
+      const malformed = (detail: string): DurableEntryPublish[] => {
+        journal?.('pending-append-corrupt', { sessionId, position: index,
+          detail, fact: 'entry-publishes' });
+        return [];
+      };
+      if (typeof value !== 'object' || value === null) return malformed('record is not an object');
+      const record = value as { readonly callId?: unknown; readonly eventId?: unknown;
+        readonly bytesBase64?: unknown };
+      if (typeof record.callId !== 'string' || typeof record.eventId !== 'string'
+        || typeof record.bytesBase64 !== 'string') {
+        return malformed('record is missing a string callId, eventId or bytesBase64');
+      }
+      const bytes = Buffer.from(record.bytesBase64, 'base64');
+      if (bytes.toString('base64') !== record.bytesBase64) {
+        return malformed('bytesBase64 does not round-trip');
+      }
+      records.push({ callId: record.callId, eventId: record.eventId,
+        bytesBase64: record.bytesBase64 });
+    }
+    return records;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Write the pending entry-publish intent (ISSUE-450), preserving the round,
+ * latch, first-ask flag and append intent the file already carries. An empty
+ * queue removes the fact, so a fully published session leaves no stale replay
+ * payload. Published atomically through the same temp+rename; a failed write
+ * journals `entry-publish-persist-error` and returns false — the in-memory
+ * queue still serves this process, only the restart durability is lost.
+ */
+export function writePendingEntryPublishes(target: ResolvedRacoonsStorage,
+  records: readonly DurableEntryPublish[], journal: MountJournal, sessionId: string): boolean {
+  const dir = sessionDirOf(target);
+  if (dir === null) return true;
+  const prior = readDoc(dir);
+  return publishDoc(dir, {
+    ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
+    ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
+      ? { trigger: prior['trigger'] } : {}),
+    ...(typeof prior['entryAskFired'] === 'boolean'
+      ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
+    ...(records.length > 0 ? { entryPublishes: records } : {}),
+  }, journal, sessionId, 'entry-publish-persist-error', { pending: records.length });
 }
