@@ -71,6 +71,12 @@ the mount appends one JSON record per line to; it is the JSON-config form of the
 optional, and a write failure never changes an outcome. `excludeTools` is the test-only tool
 exclusion described below.
 
+### The `/cremate` command
+
+On a host that exposes `context.command.transform`, `setup` registers the manual `cremate`
+command; the host lists it as `/cremate`. It runs the same table pass on demand. A host without
+that seam mounts without the command; the automatic pass still runs.
+
 ## What the mount does
 
 Per primary request, on `context.session.hook("context", ...)`, before the host converts the
