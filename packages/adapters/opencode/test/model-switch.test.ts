@@ -218,10 +218,12 @@ function pluginFixture(model?: OpencodeModelCatalog): PluginFixture {
     },
     session: {
       hook: async (
-        name: 'context' | 'experimental.idle',
+        name: 'context' | 'compaction' | 'generate' | 'experimental.idle',
         callback: ((input: OpencodeSessionContext) => Promise<void> | void)
           | ((input: OpencodeIdleHookInput) => Promise<void> | void),
       ) => {
+        // This fake predates ADR-0074's request hooks: both registrations are
+        // refused, which the mount journals and survives.
         if (name !== 'context') throw new Error(`no ${name} seam`);
         contextHook = callback as (input: OpencodeSessionContext) => Promise<void> | void;
         return {};

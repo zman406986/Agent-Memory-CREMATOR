@@ -17,7 +17,8 @@ import {
   LedgerError, canonicalManifestBytes, sha256Sync,
 } from '@cremator/core';
 import type { RecallRecord } from '@cremator/core';
-import type { DshMountContext, DshMountEvent, DshMountSession } from '../src/plugin.js';
+import type { DshLlmService, DshMountContext, DshMountEvent, DshMountSession }
+  from '../src/plugin.js';
 import {
   CREMATOR_PLUGIN_INJECT, CREMATOR_PLUGIN_NAME, createRacoonsMount, createRacoonsPlugin,
   engineConfig, eventIdFor, publishAppend, registerPluginTools, resolvePluginConfig,
@@ -31,6 +32,8 @@ import { createMainWireCapture } from '../src/main-wire.js';
 interface FakeSession extends DshMountSession {
   readonly log: DshMountEvent[];
   on(listener: (session: FakeSession, event: DshMountEvent) => void): () => void;
+  /** Set the route the host's `requestHeader` reports (ADR-0071 tests). */
+  setRoute(provider: string, model: string): void;
 }
 
 /**
@@ -41,6 +44,7 @@ interface FakeSession extends DshMountSession {
 function fakeSession(id = 'session-plugin-1', cwd?: string): FakeSession {
   const log: DshMountEvent[] = [];
   const surfaceNodes: number[] = [];
+  let route: { readonly provider: string; readonly model: string } | undefined;
   const listeners = new Set<(session: FakeSession, event: DshMountEvent) => void>();
   const session = {
     id,
@@ -50,6 +54,8 @@ function fakeSession(id = 'session-plugin-1', cwd?: string): FakeSession {
     get seq() { return log.length; },
     get surface() { return { nodes: surfaceNodes, contentGeneration: log.length }; },
     get log() { return log; },
+    requestHeader: () => route === undefined ? undefined : { config: route },
+    setRoute(provider: string, model: string) { route = { provider, model }; },
     eventAt: (seq: number) => log[seq],
     append(type: string, data: unknown, options: Record<string, unknown> = {}) {
       const seq = log.length;
@@ -220,6 +226,7 @@ async function mountedWithListener(options: {
   readonly session: FakeSession;
   readonly plugin: ReturnType<typeof createRacoonsPlugin>;
   readonly listeners: Map<string, (...args: never[]) => unknown>;
+  readonly llm?: DshLlmService;
 }): Promise<{
   preStep(payload: unknown): Promise<unknown>;
   dispose(): Promise<void>;
@@ -232,6 +239,7 @@ async function mountedWithListener(options: {
       return () => options.listeners.delete(event);
     },
     effect: (register) => { const fn = register(); if (typeof fn === 'function') cleanups.push(fn); },
+    ...(options.llm === undefined ? {} : { llm: options.llm }),
   } as DshMountContext, {});
   options.session.on((session, event) => {
     const listener = options.listeners.get('session/event');
@@ -245,6 +253,30 @@ async function mountedWithListener(options: {
     preStep: payload => preStep(payload, async () => ({ kind: 'enter', messages: [] })),
     dispose: async () => { for (const fn of cleanups) await fn(); },
   };
+}
+
+/** A model seam that answers only `resolveModelInfo`; an ask would throw. */
+function windowLlm(answer: (provider: string, model: string) => number | Error): {
+  readonly llm: DshLlmService;
+  readonly calls: string[];
+} {
+  const calls: string[] = [];
+  const llm = {
+    async resolveModelInfo(provider: string, model: string) {
+      calls.push(`${provider}/${model}`);
+      const value = answer(provider, model);
+      if (value instanceof Error) throw value;
+      return { context: { contextWindow: value } };
+    },
+    async *stream() { throw new Error('no ask expected in a window test'); },
+  } as unknown as DshLlmService;
+  return { llm, calls };
+}
+
+/** One pre-step payload the plugin's own listener accepts. */
+function boundary(session: FakeSession, turn: number): Record<string, unknown> {
+  return { agent: { session }, messages: [], turn, step: 1,
+    signal: new AbortController().signal };
 }
 
 test('the plugin declares its name and seams, and resolvePluginConfig fills and refuses knobs',
@@ -287,6 +319,9 @@ test('the plugin declares its name and seams, and resolvePluginConfig fills and 
   // host window, so a bar without a window is refused; both together resolve.
   assert.throws(() => resolvePluginConfig({ pruneThresholdTokens: 60_000 }),
     /requires contextWindowTokens/u);
+  // ADR-0071: the host's model-info seam is the other legal window source.
+  assert.equal(resolvePluginConfig({ pruneThresholdTokens: 60_000 },
+    { hostModelInfo: true }).pruneThresholdTokens, 60_000);
   assert.equal(resolvePluginConfig({
     contextWindowTokens: 400_000, pruneThresholdTokens: 60_000,
   }).pruneThresholdTokens, 60_000);
@@ -548,6 +583,166 @@ const PUBLISH_ROWS: readonly {
     },
   },
 ];
+
+// ADR-0071 / ADR-0072: the routed model's window, its cache, and the switch.
+
+test('ADR-0071: the routed model window arms the latch when none is configured', async () => {
+  const session = fakeSession('s-window-resolve');
+  session.setRoute('p', 'm');
+  const { llm, calls } = windowLlm(() => 200_000);
+  const records: { kind: string; [field: string]: unknown }[] = [];
+  const plugin = createRacoonsPlugin({
+    config: { pruneThresholdTokens: 60_000 },
+    journal: record => { records.push(record as unknown as { kind: string; [field: string]: unknown }); },
+  });
+  const mounted = await mountedWithListener({
+    session, plugin, listeners: new Map(), llm,
+  });
+  try {
+    await mounted.preStep(boundary(session, 1));
+    const resolved = records.filter(line => line.kind === 'window-resolved');
+    assert.equal(resolved.length, 1, 'one line names the resolved window');
+    assert.equal(resolved[0]?.['window'], 200_000);
+    assert.equal(resolved[0]?.['source'], 'host-model-info');
+    const threshold = records.filter(line => line.kind === 'prune-threshold');
+    assert.equal(threshold.at(-1)?.['window'], 200_000,
+      'the bar line names the window in force');
+    assert.equal(threshold.at(-1)?.['windowSource'], 'host-model-info');
+
+    // The same route is not looked up again at the next boundary.
+    await mounted.preStep(boundary(session, 2));
+    assert.equal(calls.length, 1, 'one exact-route lookup');
+    assert.equal(records.some(line => line.kind === 'model-switch'), false,
+      'an unchanged route is not a switch');
+  } finally {
+    await mounted.dispose();
+  }
+});
+
+test('ADR-0071: a configured window is authoritative and the host seam is never called',
+  async () => {
+    const session = fakeSession('s-window-config');
+    session.setRoute('p', 'm');
+    const { llm, calls } = windowLlm(() => 1);
+    const records: { kind: string; [field: string]: unknown }[] = [];
+    const plugin = createRacoonsPlugin({
+      config: { contextWindowTokens: 400_000, pruneThresholdTokens: 60_000 },
+      journal: record => { records.push(record as unknown as { kind: string; [field: string]: unknown }); },
+    });
+    const mounted = await mountedWithListener({
+      session, plugin, listeners: new Map(), llm,
+    });
+    try {
+      await mounted.preStep(boundary(session, 1));
+      assert.equal(calls.length, 0, 'the host is not consulted');
+      assert.equal(records.some(line => line.kind === 'window-resolved'), false,
+        'no resolution line for a configured window');
+      const threshold = records.filter(line => line.kind === 'prune-threshold');
+      assert.equal(threshold.at(-1)?.['window'], 400_000);
+      assert.equal(threshold.at(-1)?.['windowSource'], 'config');
+    } finally {
+      await mounted.dispose();
+    }
+  });
+
+test('ADR-0071: an unresolved window writes one line per route and leaves the latch off',
+  async () => {
+    const session = fakeSession('s-window-unresolved');
+    session.setRoute('p', 'm');
+    const { llm } = windowLlm(() => new Error('no capacity'));
+    const records: { kind: string; [field: string]: unknown }[] = [];
+    const plugin = createRacoonsPlugin({
+      config: { pruneThresholdTokens: 60_000 },
+      journal: record => { records.push(record as unknown as { kind: string; [field: string]: unknown }); },
+    });
+    const mounted = await mountedWithListener({
+      session, plugin, listeners: new Map(), llm,
+    });
+    try {
+      await mounted.preStep(boundary(session, 1));
+      await mounted.preStep(boundary(session, 2));
+      const unresolved = records.filter(line => line.kind === 'window-unresolved');
+      assert.equal(unresolved.length, 1, 'one line for the route, not one per boundary');
+      assert.equal(unresolved[0]?.['reason'], 'model-info-failed');
+      assert.equal(records.filter(line => line.kind === 'prune-threshold').length, 0,
+        'no automatic observation runs without a window');
+    } finally {
+      await mounted.dispose();
+    }
+  });
+
+test('ADR-0072: a route change re-arms and journals model-switch without a pass', async () => {
+  const session = fakeSession('s-window-switch');
+  session.setRoute('p', 'm1');
+  const { llm, calls } = windowLlm((_provider, model) =>
+    model === 'm1' ? 200_000 : 100_000);
+  const records: { kind: string; [field: string]: unknown }[] = [];
+  const plugin = createRacoonsPlugin({
+    config: { pruneThresholdTokens: 60_000 },
+    journal: record => { records.push(record as unknown as { kind: string; [field: string]: unknown }); },
+  });
+  const mounted = await mountedWithListener({
+    session, plugin, listeners: new Map(), llm,
+  });
+  try {
+    await mounted.preStep(boundary(session, 1));
+    session.setRoute('p', 'm2');
+    await mounted.preStep(boundary(session, 2));
+
+    const switched = records.filter(line => line.kind === 'model-switch');
+    assert.equal(switched.length, 1, 'one line for the changed route');
+    assert.deepEqual(switched[0]?.['from'],
+      { provider: 'p', model: 'm1', window: 200_000 });
+    assert.deepEqual(switched[0]?.['to'],
+      { provider: 'p', model: 'm2', window: 100_000 });
+    assert.equal(switched[0]?.['windowSource'], 'host-model-info');
+    assert.equal(records.filter(line => line.kind === 'window-resolved').length, 2,
+      'each route resolves once');
+    const threshold = records.filter(line => line.kind === 'prune-threshold');
+    assert.equal(threshold.at(-1)?.['window'], 100_000,
+      'the bar reads the destination window');
+    assert.equal(threshold.at(-1)?.['crossed'], false,
+      'the switch itself fires no pass');
+    assert.equal(calls.length, 2, 'one lookup per route');
+  } finally {
+    await mounted.dispose();
+  }
+});
+
+test('ADR-0072: a route change re-arms even when the window is configured', async () => {
+  const session = fakeSession('s-window-config-switch');
+  session.setRoute('p', 'm1');
+  const { llm, calls } = windowLlm(() => 1);
+  const records: { kind: string; [field: string]: unknown }[] = [];
+  const plugin = createRacoonsPlugin({
+    config: { contextWindowTokens: 400_000, pruneThresholdTokens: 60_000 },
+    journal: record => { records.push(record as unknown as { kind: string; [field: string]: unknown }); },
+  });
+  const mounted = await mountedWithListener({
+    session, plugin, listeners: new Map(), llm,
+  });
+  try {
+    await mounted.preStep(boundary(session, 1));
+    session.setRoute('p', 'm2');
+    await mounted.preStep(boundary(session, 2));
+
+    const switched = records.filter(line => line.kind === 'model-switch');
+    assert.equal(switched.length, 1, 'the route change is named');
+    assert.deepEqual(switched[0]?.['from'],
+      { provider: 'p', model: 'm1', window: 400_000 });
+    assert.deepEqual(switched[0]?.['to'],
+      { provider: 'p', model: 'm2', window: 400_000 });
+    assert.equal(switched[0]?.['windowSource'], 'config');
+    assert.equal(calls.length, 0, 'the configured window never asks the host');
+    assert.equal(records.some(line => line.kind === 'window-resolved'), false);
+    const threshold = records.filter(line => line.kind === 'prune-threshold');
+    assert.equal(threshold.at(-1)?.['windowSource'], 'config');
+    assert.equal(threshold.at(-1)?.['crossed'], false,
+      'the switch itself fires no pass');
+  } finally {
+    await mounted.dispose();
+  }
+});
 
 test('a failed result is never queued, and a sealed episode publishes one fact', async () => {
   await runRows(PUBLISH_ROWS.map((scenario): Row => ({

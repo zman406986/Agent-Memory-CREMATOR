@@ -2733,8 +2733,8 @@ test('ISSUE-432: a mid-session model switch re-derives the entry floor', async (
     assert.deepEqual(refresh[0]?.['to'],
       { provider: 'p', model: 'deepseek-v4-pro', floorBytes: 768 },
     'the new route and its table floor are named');
-    assert.equal(refresh[0]?.['window'], 'mount-option',
-      'the window is named as model-independent instead of claimed refreshed');
+    assert.equal(refresh[0]?.['window'], 'host-model-info',
+      'the window is named as model-derived (ADR-0071), not claimed refreshed');
     const entry = mount.sessions.get(session.id);
     assert.equal(entry?.floorBytes, 768, 'the entry now reads the new model floor');
     assert.equal(entry?.floorModel, 'deepseek-v4-pro');

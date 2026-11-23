@@ -129,5 +129,6 @@ export async function applyApplication(
     recallIds: status === 'applied' ? measurements.recallIds : [],
     sealedEpisodeIds: status === 'applied' ? application.sealedEpisodeIds : [],
   });
-  return { status, intentId: intent.intentId, receipt, committed };
+  return { status, intentId: intent.intentId, receipt, committed,
+    ...(status === 'applied' ? { removedBytes: measurements.removedBytes } : {}) };
 }

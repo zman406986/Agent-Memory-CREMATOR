@@ -18,8 +18,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type {
-  OpencodeAfterToolInput, OpencodeCommandDefinition, OpencodeHostEvent, OpencodeIdleHookInput,
-  OpencodeMessage, OpencodePluginContext, OpencodeSessionContext, OpencodeToolDefinition,
+  OpencodeAfterToolInput, OpencodeCommandDefinition, OpencodeCompactionContext,
+  OpencodeHostEvent, OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext,
+  OpencodeSessionContext, OpencodeToolDefinition,
 } from '../src/host.js';
 import { createOpencodeMount, createOpencodePlugin } from '../src/plugin.js';
 import type { OpencodeJournalRecord } from '../src/plugin.js';
@@ -94,15 +95,18 @@ function fakeHost(directory: string): FakeHost {
       options: {},
       session: {
         hook: async (
-          name: 'context' | 'experimental.idle',
+          name: 'context' | 'experimental.idle' | 'compaction' | 'generate',
           callback: ((input: OpencodeSessionContext) => Promise<void> | void)
-            | ((input: OpencodeIdleHookInput) => Promise<void> | void),
+            | ((input: OpencodeIdleHookInput) => Promise<void> | void)
+            | ((input: OpencodeCompactionContext) => Promise<void> | void),
         ) => {
           if (name === 'experimental.idle') {
             host.idleHook = callback as (input: OpencodeIdleHookInput) => Promise<void> | void;
             return {};
           }
-          host.contextHook = callback as (input: OpencodeSessionContext) => Promise<void> | void;
+          if (name === 'context') {
+            host.contextHook = callback as (input: OpencodeSessionContext) => Promise<void> | void;
+          }
           return {};
         },
         generate: async () => ({ text: '{}' }),
@@ -227,7 +231,7 @@ test('a second folder reaches the shared mount; `/cremate` and the RPC fire for 
     const call = rpc.handlers['cremate'];
     assert.ok(call !== undefined, 'the RPC declares the cremate method');
     const answer = await call({ sessionID: folderBSession });
-    assert.deepEqual(answer, { ok: true, fired: true },
+    assert.deepEqual(answer, { ok: true, fired: true, reason: 'table', rows: 1 },
       'the RPC fires the manual pass for the other folder');
     assert.equal(secondAsks, 1, 'the ask uses the session-serving activation');
     assert.equal(firstAsks, 0, 'the first activation is not asked for another folder');

@@ -88,7 +88,13 @@ export interface PruneWindowTriggerState {
  * latch on its own; `windowTokens` is then only the deprecated fallback.
  */
 export class PruneWindowTrigger {
-  private readonly windowTokens: number | null;
+  /**
+   * The host window the 75% skip line and the deprecated half-window bar read.
+   * Mutable because a mount may resolve it from the routed model after the
+   * session opened (ADR-0071): the constructor value is the configured window,
+   * and a null one can become a resolved number at a later boundary.
+   */
+  private windowTokens: number | null;
   private readonly thresholdTokens: number | null;
   /**
    * The baseline: the usage at the last fire, or the first observation after
@@ -106,6 +112,30 @@ export class PruneWindowTrigger {
   constructor(windowTokens: number | null, thresholdTokens?: number | null) {
     this.windowTokens = resolveContextWindowTokens(windowTokens);
     this.thresholdTokens = resolvePruneThresholdTokens(thresholdTokens);
+  }
+
+  /**
+   * Replace the host window after the mount resolved the routed model's
+   * capacity (ADR-0071). The latch state is unchanged: the caller decides
+   * whether the new window is a cold boundary and re-arms separately. A null
+   * value disables the window-derived path; an explicit bar still wins.
+   * @param windowTokens - the exact route's positive window, or null when unknown.
+   */
+  setWindowTokens(windowTokens: number | null): void {
+    this.windowTokens = resolveContextWindowTokens(windowTokens);
+  }
+
+  /**
+   * The routed model changed, so the latch's baseline describes another model
+   * (ADR-0072). Re-arm as a completed pass does: the next observation becomes
+   * the baseline and does not fire. Unlike {@link notePassCompleted} this runs
+   * even while the window is unknown, so a later resolution starts from the
+   * switch rather than from a stale baseline.
+   */
+  noteColdBoundary(): void {
+    this.lastFireUsage = null;
+    this.belowSinceFire = false;
+    this.baselinePending = true;
   }
 
   /** True when a configured bar (explicit or window-derived) arms the latch. */

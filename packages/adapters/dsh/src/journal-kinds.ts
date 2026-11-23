@@ -237,6 +237,12 @@ export const CREMATOR_JOURNAL_KINDS = [
   // live route, so the seed is invalidated by name instead of serving a prefix
   // that belongs to the old model.
   'seed-model-stale',
+  // the routed model's context window (ADR-0071, ADR-0072): `window-resolved`
+  // names the route and the source when the host model-info seam answers;
+  // `window-unresolved` names why a route's lookup produced no window, once per
+  // route and session; `model-switch` names a route change that re-armed the
+  // depth latch without forcing a pass.
+  'window-resolved', 'window-unresolved', 'model-switch',
 ] as const;
 
 /** One journal record's kind. */

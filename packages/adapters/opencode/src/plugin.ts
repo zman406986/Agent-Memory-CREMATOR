@@ -37,6 +37,14 @@
  *     Fires follow the depth trigger with no per-session cap (ADR-0060). The
  *     asked set (the revision and unit claims) and an unapplied verdict are
  *     durable; a plugin reload restores them (ISSUE-409; ADR-0063).
+ *   - `session.hook("compaction")` and `session.hook("generate")` → the
+ *     request-only apply (ADR-0074). The host builds each request kind from its
+ *     own stored conversation, so the checkpoint summary and the ask's own
+ *     `session.generate` request would otherwise carry units this product
+ *     already removed. These hooks apply the removals the session has already
+ *     settled to the outgoing array and change nothing else: no depth reading,
+ *     no table, no model call, no meter/latch/idle/ask-state movement, and
+ *     never the host's compaction `result`.
  *   - `context.command.transform` (when the host exposes it) → the manual
  *     `/cremate` command. It runs the same table pass on demand, not gated by
  *     the depth latch; the same-revision guard still applies, and the pass
@@ -131,9 +139,10 @@ import {
 } from './forget.js';
 import type { OpencodeForgetValue } from './forget.js';
 import type {
-  OpencodeAfterToolInput, OpencodeGenerateInput, OpencodeGenerateOutput,
+  OpencodeAfterToolInput, OpencodeCompactionContext, OpencodeGenerateInput, OpencodeGenerateOutput,
   OpencodeHostEvent, OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext,
-  OpencodePluginDefinition, OpencodeSessionContext, OpencodeTextPart, OpencodeToolDefinition,
+  OpencodePluginDefinition, OpencodeRpcEvents, OpencodeSessionContext, OpencodeTextPart,
+  OpencodeToolDefinition,
 } from './host.js';
 import {
   costOf, estimateRequestSplit, estimateRequestTokens, generateUsageRow, isAskStepRequest,
@@ -155,7 +164,13 @@ import type { OpencodeStorageOptions, StorageSelection, StorageTarget } from './
 import {
   OPENCODE_RECALL_TOOL_NAME, createOpencodeForgetTool, createOpencodeTool,
 } from './tools.js';
-import { CREMATE_RPC_DEFINITION } from './cremate-rpc.js';
+import {
+  CREMATE_RPC_DEFINITION, CREMATE_RPC_EVENT_APPLIED, CREMATE_RPC_EVENT_ENDED,
+  CREMATE_RPC_EVENT_FAILED, CREMATE_RPC_EVENT_STARTED, CREMATE_RPC_FIELD_BYTES,
+  CREMATE_RPC_FIELD_FIRED, CREMATE_RPC_FIELD_REASON, CREMATE_RPC_FIELD_REMOVALS,
+  CREMATE_RPC_FIELD_ROWS, CREMATE_RPC_FIELD_SESSION_ID, CREMATE_RPC_FIELD_TRIGGER,
+  CREMATE_RPC_TRIGGER_MANUAL,
+} from './cremate-rpc.js';
 
 /** Stable plugin identity a host log line can name. */
 export const OPENCODE_PLUGIN_NAME = 'cremator-opencode';
@@ -326,7 +341,15 @@ export type OpencodeJournalKind =
   // ISSUE-496: the host staged or committed an undo/revert — a non-compaction
   // history rewrite — so the idle turn-end fact was dropped instead of clamping
   // up to the live turn.
-  | 'reverted';
+  | 'reverted'
+  // ADR-0074: one compaction or generate request was examined by the
+  // request-only lane, with its named outcome (applied, nothing settled, a
+  // prefix the array could not address, a busy lane).
+  | 'request-only'
+  // ADR-0074: the request-only lane could not do its work (a refused hook
+  // registration, a plan/merge/engine throw). The request still ships and the
+  // normal path keeps every stored verdict.
+  | 'request-only-error';
 
 export interface OpencodeJournalRecord {
   readonly kind: OpencodeJournalKind;
@@ -377,6 +400,22 @@ export function opencodeAskEventId(
   return rewrites === 0
     ? `oc:${sessionId}:ask:${revision}`
     : `oc:${sessionId}:ask:${revision}#${String(rewrites + 1)}`;
+}
+
+/**
+ * The event id one request-only apply carries (ADR-0074). Its own
+ * `request:<kind>` namespace, never the step or ask lane's: the normal request
+ * at the same revision owns `oc:<session>:ask:<revision>`, and a shared id
+ * would let one lane's `unchangedEvents` mark or applied count answer for the
+ * other. `rewrites` is the same durable applied count at this revision, so a
+ * rebuilt compaction or generate request is a new pass rather than a replay of
+ * the first (the host rebuilds every request; `rewriteHistory: false`).
+ */
+export function opencodeRequestOnlyEventId(
+  sessionId: string, kind: OpencodeRequestOnlyKind, revision: string, rewrites: number,
+): string {
+  const base = `oc:${sessionId}:request:${kind}:${revision}`;
+  return rewrites === 0 ? base : `${base}#${String(rewrites + 1)}`;
 }
 
 /**
@@ -786,6 +825,14 @@ export interface OpencodeSessionEntry {
   applyInFlight: boolean;
   /** True when a compaction landed inside those windows and owes its re-arm. */
   compactionRearmDeferred: boolean;
+  /**
+   * ADR-0074: resolves when the request-only apply currently driving the shared
+   * engine and port settles; `null` when none runs. The normal transform waits
+   * for it before its own observe, so a request-only stage and a rebuilt
+   * request's stage are never live at once. The request-only lane skips a
+   * second request while it is set.
+   */
+  requestOnlyGate: Promise<void> | null;
 }
 
 /** One resolved manual forget waiting for the next request boundary. */
@@ -847,6 +894,17 @@ export interface OpencodeAskApplyInput {
    */
   readonly appliedPlans?: OpencodeAppliedPlanIndex;
   readonly journal: (kind: OpencodeJournalKind, fields: Record<string, unknown>) => void;
+  /**
+   * ADR-0073: told once, after the `ask-apply` rows, when this apply landed a
+   * judged (`l2`) removal that is new to it. A banked row is a re-application
+   * of a removal an earlier apply already landed, and L1/dedupe removals
+   * recompute on every rebuilt request under `rewriteHistory: false`, so
+   * neither counts as new here. Observation only: a throwing sink never
+   * changes the apply's outcome.
+   */
+  readonly onApplied?: (applied: {
+    readonly removals: number; readonly bytes: number;
+  }) => void;
 }
 
 /**
@@ -1222,6 +1280,27 @@ export async function applyOpencodeAskVerdicts(
       } }),
     });
   }
+  /**
+   * ADR-0073: publish `applied` once for the removals this apply made new. A
+   * banked row re-applies a removal an earlier apply already landed, and an
+   * L1/dedupe removal is recomputed on every rebuilt request; neither is a new
+   * removal a menu part should toast. A pass with no judged first-time removal
+   * publishes nothing.
+   */
+  if (applied && input.onApplied !== undefined) {
+    let removals = 0;
+    let bytes = 0;
+    for (const removal of document.removals) {
+      if (removal.origin !== 'l2' || bankedUnitIds.has(removal.unitId)) continue;
+      removals += 1;
+      bytes += unitBy.get(removal.unitId)?.byteLength ?? 0;
+    }
+    if (removals > 0) {
+      try {
+        input.onApplied({ removals, bytes });
+      } catch { /* a lifecycle sink must never change an apply outcome */ }
+    }
+  }
   // ISSUE-409: persist whatever this apply settled (applied verdicts cleared,
   // guard-dropped ones gone) at the same boundary as the ledger row.
   entry.persistAskState();
@@ -1254,6 +1333,250 @@ function recallIdsByForgottenNode(
     if (recallId !== undefined) ids.set(forgotten, recallId);
   }
   return ids;
+}
+
+/** The request kinds OpenCode builds from its own store, one hook each. */
+export type OpencodeRequestOnlyKind = 'compaction' | 'generate';
+
+/**
+ * Why the request-only lane applied nothing, or did not run at all. Named so a
+ * journal reader can tell "there was nothing settled" from "this array could
+ * not address it" from "another lane held the port".
+ */
+export type OpencodeRequestOnlyReason =
+  | 'no-session' | 'no-array' | 'nothing-settled' | 'busy'
+  | 'no-window' | 'no-units' | 'nothing-applied' | 'cancelled'
+  | 'plan-error' | 'merge-error' | 'engine-error';
+
+/** One request-only apply's inputs: the array the host is about to send. */
+export interface OpencodeSettledApplyInput {
+  readonly entry: OpencodeSessionEntry;
+  readonly kind: OpencodeRequestOnlyKind;
+  /** The request array the host is about to send; the port must already observe it. */
+  readonly messages: readonly OpencodeMessage[];
+  /** The snapshot of `messages` the caller observed; the port holds the same array. */
+  readonly snapshot: SessionSnapshot;
+  /** The window the engine's prune application is priced against; a positive integer. */
+  readonly window: number;
+  /** The pass round the plan is stamped with; never advances `entry.passRound`. */
+  readonly round?: number;
+  /** An explicit node exclusion; absent means every unit on the array is eligible. */
+  readonly excludeNodeIds?: ReadonlySet<NodeId>;
+  readonly journal: (kind: OpencodeJournalKind, fields: Record<string, unknown>) => void;
+}
+
+/** What one request-only apply did, for the mount's journal line. */
+export interface OpencodeSettledApplyOutcome {
+  /** True only when this call landed a new applied receipt on this array. */
+  readonly applied: boolean;
+  /** The judged (`l2`) removals the merged document carried. */
+  readonly removals: number;
+  /** Settled units this array could not address or a guard kept; nothing was dropped. */
+  readonly skipped: number;
+  /** Removals the survivor gate kept rather than apply. */
+  readonly cancelled: number;
+  /**
+   * True when a host compaction made the stored verdicts stale (ISSUE-423):
+   * they were not applied here, and the normal request drops them by name.
+   */
+  readonly staleVerdicts: boolean;
+  readonly eventId: string | null;
+  readonly revision: string;
+  readonly status?: string;
+  readonly committed?: boolean;
+  readonly reason?: OpencodeRequestOnlyReason;
+}
+
+/**
+ * Applies removals this session already settled to one outgoing request that is
+ * not the agent loop (ADR-0074): the checkpoint summary and the ask's own
+ * `session.generate` request.
+ *
+ * The host rebuilds every request kind from its own stored conversation, so
+ * those arrays still carry units the normal request removed. This function
+ * re-applies the settled removals to that array through core's own prune merge
+ * (the judged rows only; L1 and the dedupe stay with the normal request) and
+ * does nothing else:
+ *
+ *   - it never asks: no `session.generate`, no table, no depth reading; the
+ *     plan is core's own pass plan, used only to map units to their node and
+ *     row on THIS array;
+ *   - it never touches the meter, depth latch, idle or turn-end fact,
+ *     `passRound`, `askFires`, `deferredApply` or the host's compaction
+ *     `result` — the caller has none of those in its input;
+ *   - it never mutates ask state. A stored verdict whose unit is absent from
+ *     this array stays stored (ADR-0074 decision 3): the compaction hook may
+ *     receive only the transcript being summarized, so absence is not proof the
+ *     unit is gone. The same holds for a verdict a retention rule or a
+ *     descriptor refuses here; the normal request's own apply settles those.
+ *
+ * What it does apply: the session's stored `askVerdicts` whose unit this array
+ * carries (and the seen/install rules allow), plus the ledger's banked removals
+ * for units the array still carries. A banked row is a whole-unit `forgetall`
+ * with a blank summary, exactly as the deferred apply reads it, so the receipt
+ * line the recall id already names is reused.
+ *
+ * The port must already hold `messages` (the caller observes it), because the
+ * engine applies through the port's snapshot. `rewriteHistory: false` means a
+ * rebuilt identify-identical request reappears with the unit present, so each
+ * call that removes something writes its own `request:<kind>` event id; that is
+ * the removal staying in effect, not a new removal. A second identical request
+ * therefore lands the same single receipt on its own fresh array.
+ */
+export async function applyOpencodeSettledRemovals(
+  input: OpencodeSettledApplyInput,
+): Promise<OpencodeSettledApplyOutcome> {
+  const { entry, messages, snapshot, window, journal } = input;
+  /**
+   * ISSUE-423's stale-verdict rule: a host compaction landed between the ask
+   * that read the verdicts and the apply that would record them, so those
+   * verdicts name an array the host rewrote. They are not applied here — the
+   * normal path drops them — and the request-only path must not turn one into a
+   * banked removal the rewrite was meant to retire. The ledger's banked rows are
+   * already durable and still apply.
+   */
+  const staleVerdicts = entry.askVerdicts.size > 0 && entry.verdictGeneration !== null
+    && entry.verdictGeneration !== entry.compactionGeneration;
+  const empty = (fields: Partial<OpencodeSettledApplyOutcome>): OpencodeSettledApplyOutcome => ({
+    applied: false, removals: 0, skipped: 0, cancelled: 0, eventId: null,
+    revision: snapshot.revision, staleVerdicts, ...fields,
+  });
+  if (!Number.isSafeInteger(window) || window <= 0) return empty({ reason: 'no-window' });
+  const excluded = input.excludeNodeIds;
+  const round = input.round ?? Math.max(1, entry.passRound);
+  let plan: PrunePassPlan | null;
+  try {
+    plan = buildOpencodePassPlan({
+      sessionId: entry.sessionId, snapshot, messages, round,
+      classes: entry.dedupeClasses,
+      ...(excluded === undefined ? {} : { excludeNodeIds: excluded }),
+    });
+  } catch (error) {
+    journal('request-only-error', { sessionId: entry.sessionId, requestKind: input.kind,
+      stage: 'plan', message: error instanceof Error ? error.message : String(error) });
+    return empty({ reason: 'plan-error' });
+  }
+  // No unit on this array: nothing can be removed and, deliberately, nothing is
+  // settled either. A compaction prefix that carries no unit leaves every
+  // stored verdict alone for the normal request.
+  if (plan === null) return empty({ reason: 'no-units' });
+  const unitBy = new Map(plan.units.map(unit => [unit.id, unit] as const));
+  const rowOfUnit = new Map(plan.askRows.map(row => [row.unit.id, row] as const));
+  const nodeIds = snapshot.nodes.map(node => node.id);
+  const live = opencodeLiveResults(messages, entry.sessionId);
+  /**
+   * The units the ledger already banked. Their applied row proves a prior
+   * request carried them, so they are re-applied without a fresh seen mark and
+   * without a new question (ISSUE-300 item 6); the array can still address each
+   * one, which is the only thing this path checks.
+   */
+  const bankedUnitIds = new Set<UnitId>();
+  for (const row of plan.askRows) {
+    if (opencodeBankedRemovalOf(row.unit.nodeId, entry.appliedPlans, messages,
+      entry.sessionId, nodeIds)) {
+      bankedUnitIds.add(row.unit.id);
+    }
+  }
+  /**
+   * A read-only copy of the stored verdicts (skipped when a host compaction made
+   * them stale). The banked rows join it as a whole-unit `forgetall` with a
+   * blank summary; nothing here is ever deleted from `entry.askVerdicts`,
+   * whatever this array does or does not carry.
+   */
+  const wanted = new Map<UnitId, WireAnswer>(
+    staleVerdicts ? [] : [...entry.askVerdicts]);
+  for (const unitId of bankedUnitIds) {
+    if (wanted.has(unitId)) continue;
+    wanted.set(unitId, { verdict: { unitId, action: 'forgetall', summary: '',
+      answeredInRound: round } });
+  }
+  const rows: [string, Record<string, unknown>][] = [];
+  const indices: number[] = [];
+  let skipped = 0;
+  for (const [unitId, answer] of wanted) {
+    const unit = unitBy.get(unitId);
+    const row = rowOfUnit.get(unitId);
+    // The array cannot address this unit (a prefix without the recent tail, or
+    // a host rebuild that dropped it). Keep the stored verdict for the normal
+    // request: absence from this array is not proof the unit is gone.
+    if (unit === undefined || row === undefined) { skipped += 1; continue; }
+    if (excluded?.has(unit.nodeId) === true) { skipped += 1; continue; }
+    if (!bankedUnitIds.has(unitId) && !isSeenUnit(unit, entry.seenNodeIds)) {
+      skipped += 1;
+      continue;
+    }
+    if (answer.verdict.action !== 'forgetall' && answer.verdict.action !== 'keeplines') {
+      skipped += 1;
+      continue;
+    }
+    const summary = answer.verdict.action === 'keeplines'
+      ? answer.keeplinesSummary ?? ''
+      : answer.verdict.summary ?? '';
+    if (descriptorIssue(summary) !== null) { skipped += 1; continue; }
+    if (!bankedUnitIds.has(unitId) && opencodeRetentionOf(unit.nodeId, live) !== null) {
+      skipped += 1;
+      continue;
+    }
+    if (answer.verdict.action === 'keeplines') {
+      rows.push([String(row.index), { keeplines: [
+        ...answer.verdict.ranges.map(range => [range.from, range.to]), summary,
+      ] }]);
+      indices.push(row.index);
+      continue;
+    }
+    rows.push([String(row.index), { forgetall: summary }]);
+    indices.push(row.index);
+  }
+  if (rows.length === 0) return empty({ skipped, reason: 'nothing-applied' });
+  /**
+   * Only judged removals ride a request-only document. L1 and the dedupe are
+   * proofs recomputed over the array they ran on; a compaction prefix can prove
+   * one the full request would not, and a request-only apply that landed such a
+   * proof would bank it in `appliedPlans` — the full request would then
+   * re-apply a removal it never decided. The plan's units, rows, stamps and
+   * content identities stay: the merge and its survivor gate read them.
+   */
+  const settlePlan: PrunePassPlan = plan.l1.removals.length === 0
+    && plan.dedupe.removals.length === 0
+    ? plan
+    : { ...plan, l1: { ...plan.l1, removals: [] },
+      dedupe: { ...plan.dedupe, removals: [] } };
+  let document: PrunePassApplication;
+  try {
+    document = applyPruneAnswers(settlePlan,
+      [JSON.stringify(Object.fromEntries(rows))], { indices, stamps: plan.stamps });
+  } catch (error) {
+    journal('request-only-error', { sessionId: entry.sessionId, requestKind: input.kind,
+      stage: 'merge', message: error instanceof Error ? error.message : String(error) });
+    return empty({ skipped, reason: 'merge-error' });
+  }
+  const rewrites = await appliedRewritesAt(entry.ledger, entry.sessionId, snapshot.revision);
+  const eventId = opencodeRequestOnlyEventId(
+    entry.sessionId, input.kind, snapshot.revision, rewrites);
+  const cancelled = document.cancellations?.length ?? 0;
+  if (document.removals.length === 0) {
+    return empty({ skipped, cancelled, eventId, reason: 'cancelled' });
+  }
+  let result: Awaited<ReturnType<OpencodeSessionEntry['engine']['process']>>;
+  try {
+    result = await entry.engine.process({
+      kind: 'prune', eventId, round, verdicts: document, window,
+    });
+  } catch (error) {
+    journal('request-only-error', { sessionId: entry.sessionId, requestKind: input.kind,
+      stage: 'engine', eventId,
+      message: error instanceof Error ? error.message : String(error) });
+    return empty({ skipped, cancelled, eventId, reason: 'engine-error' });
+  }
+  const committed = result.committed === true || entry.port.commit();
+  const applied = committed && result.status === 'applied' && result.receipt !== null;
+  // ISSUE-495: an applied row is durable, so the crash-window receipt has no
+  // reader left. The same collection the normal apply makes.
+  if (result.status === 'applied') entry.collectSettledReceipt(result.intentId);
+  return {
+    applied, removals: document.removals.length, skipped, cancelled, eventId,
+    revision: snapshot.revision, staleVerdicts, status: result.status, committed,
+  };
 }
 
 /**
@@ -1376,6 +1699,27 @@ export interface OpencodeMountPort extends ApplicationPort {
   appliedPlanIndex?(): OpencodeAppliedPlanIndex;
 }
 
+/**
+ * The named reason one manual pass ended with (ADR-0073 decision 2). A refusal
+ * names why no table ran; a pass that reached the table names its own result.
+ * Every early return in `cremate` maps to one of these, so a menu part never
+ * renders a bare `fired: false`.
+ */
+export type OpencodeCremateReason =
+  | 'closing' | 'no-session' | 'no-array' | 'ask-off' | 'ask-in-flight'
+  | 'ask-standdown' | 'no-rows' | 'claimed-unit' | 'error'
+  | 'table' | 'no-fire' | 'claimed-revision';
+
+/** What one manual pass answers (ADR-0073 decision 2). */
+export interface OpencodeCremateResult {
+  /** True only when a table pass ran and the model answered with a removal. */
+  readonly fired: boolean;
+  /** The named reason this pass ended with; never a bare false. */
+  readonly reason: OpencodeCremateReason;
+  /** The table row count when a table was built; otherwise 0. */
+  readonly rows: number;
+}
+
 export interface OpencodeMount {
   readonly sessions: Map<string, OpencodeSessionEntry>;
   /** The recall tool the mount registers through `context.tool.transform`. */
@@ -1393,6 +1737,17 @@ export interface OpencodeMount {
   transform(
     sessionId: string, messages: readonly OpencodeMessage[],
     context?: Pick<OpencodeSessionContext, 'system' | 'tools' | 'model'> | null,
+  ): Promise<void>;
+  /**
+   * ADR-0074: one `compaction` or `generate` request firing. Applies removals
+   * this session already settled to the outgoing array, and nothing else: no
+   * depth reading, no table, no model call, no meter/latch/idle/ask-state
+   * movement, and never the host's compaction `result`. A request for a session
+   * this mount has not seen, or one that arrives while another lane holds the
+   * shared port, is journalled and skipped whole.
+   */
+  requestOnly(
+    kind: OpencodeRequestOnlyKind, input: OpencodeSessionContext,
   ): Promise<void>;
   /** One manual forget call: resolve and queue it, answering the tool value. */
   forget(sessionId: string, args: unknown): Promise<OpencodeForgetValue>;
@@ -1417,11 +1772,19 @@ export interface OpencodeMount {
   afterTool(input: OpencodeAfterToolInput): Promise<void>;
   /**
    * One manual `/cremate`: the same table pass, on demand and not gated by the
-   * depth latch. Returns `true` only when the pass recorded a readable fire.
-   * The same-revision guard still applies, and the pass re-arms the latch like
-   * any completed pass (ADR-0050 decision 3).
+   * depth latch. Returns the named result: `fired` only when a readable fire
+   * was journalled, `reason` for every refusal, and the table's row count. The
+   * same-revision guard still applies, and the pass re-arms the latch like any
+   * completed pass (ADR-0050 decision 3).
    */
-  cremate(sessionId: string): Promise<boolean>;
+  cremate(sessionId: string): Promise<OpencodeCremateResult>;
+  /**
+   * ADR-0073: bind the host RPC registration's event channel, the value
+   * `rpc.register` returns. `null` unbinds it. A mount a test drives directly
+   * (or a host without the RPC seam) simply never sets one, so every emission
+   * is optional and never throws.
+   */
+  setRpcEmitter(emit: OpencodeRpcEvents['emit'] | null): void;
   /**
    * One awaited `session.hook('experimental.idle')` firing (ADR-0062 D2,
    * ISSUE-373): the idle-origin ask, inside the seam the host's single drain
@@ -1993,6 +2356,26 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    */
   let disposeComplete = false;
   /**
+   * ADR-0073: the host RPC channel's emitter, bound by `createOpencodePlugin`
+   * after `rpc.register` answers. A host without the RPC seam, and a mount a
+   * test drives directly, never set one; every emission is then a no-op.
+   */
+  let rpcEmit: OpencodeRpcEvents['emit'] | null = null;
+  /**
+   * Publish one pass lifecycle event. Observation only: a throwing or
+   * rejecting channel never changes the pass outcome, and the mount never
+   * awaits it, so a slow host subscriber cannot delay a pass.
+   */
+  function emitRpcEvent(
+    name: string, data: Readonly<Record<string, unknown>>,
+  ): void {
+    const emit = rpcEmit;
+    if (emit === null) return;
+    try {
+      void Promise.resolve(emit(name, data)).catch(() => {});
+    } catch { /* an event channel must never change a pass outcome */ }
+  }
+  /**
    * The close signal (ISSUE-425). With the ask deadline off (`0`) the lane
    * waits for the host with no timer of its own, so `close()` needs a named
    * event to stop that wait. The promise resolves once, when close starts. It
@@ -2527,6 +2910,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       installState,
       compactionGeneration: 0, askGeneration: 0, verdictGeneration: null,
       applyInFlight: false, compactionRearmDeferred: false,
+      requestOnlyGate: null,
       stepAskFired: false, askInFlight: false, abandonedAsks: 0, abandonedAsksConsumed: 0,
       askInterrupts: new Set(), askStepRowsSeen: false,
       abandonedAskPromptDigests: new Set<string>(),
@@ -2813,6 +3197,16 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     // opener, so it may reopen an id it released; every other lane is refused.
     const entry = await sessionFor(sessionId, true);
     if (entry === null) return;
+    /**
+     * ADR-0074: a request-only apply (a compaction summary or the ask's own
+     * generate request) holds the shared port while it stages and commits. Wait
+     * for it here, before this transform observes anything, so the two lanes
+     * never both hold a stage on one port. The promise settles in that lane's
+     * `finally` and never rejects.
+     */
+    if (entry.requestOnlyGate !== null) {
+      try { await entry.requestOnlyGate; } catch { /* the lane settles, never rejects */ }
+    }
     // ISSUE-432: observe the request's model before any early return, so a
     // switch is named even when this hook is otherwise skipped.
     observeModel(entry, context?.model);
@@ -3061,6 +3455,16 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
                 ?? Math.max(1, estimateRequestTokens(estimateMeter, snap, prefix)),
               hostWindow: contextWindowTokens,
               journal,
+              // ADR-0073: the applied removals are published from inside the
+              // apply, so a menu part hears about them exactly when the engine
+              // landed them, and only for removals new to this apply.
+              onApplied: ({ removals, bytes }) => {
+                emitRpcEvent(CREMATE_RPC_EVENT_APPLIED, {
+                  [CREMATE_RPC_FIELD_SESSION_ID]: sessionId,
+                  [CREMATE_RPC_FIELD_REMOVALS]: removals,
+                  [CREMATE_RPC_FIELD_BYTES]: bytes,
+                });
+              },
             });
             committed = deferredRemoved || committed;
           } catch (error) {
@@ -3198,6 +3602,91 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       }
       journal('transform-error', { sessionId,
         message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  /**
+   * One `session.hook("compaction")` or `session.hook("generate")` firing
+   * (ADR-0074): the request-only apply.
+   *
+   * This request was built from the host's own store, so it still carries units
+   * the normal request removed. The lane re-applies the session's settled
+   * removals to the outgoing array and does nothing else, with two named gates:
+   *
+   *   - another lane that already owns the shared port (`applyInFlight`, or a
+   *     request-only apply still running) makes this request skip whole. The
+   *     next request re-applies, so a skip costs nothing but one summary or one
+   *     ask request; it never drops a verdict;
+   *   - a compaction request during an in-flight ask is allowed (the ask holds
+   *     no staged derivation at that point); the ask's own generate request is
+   *     the one `generate` the lane serves while `askInFlight` holds. Neither
+   *     reads a verdict the ask has not produced: only `entry.askVerdicts` is
+   *     read, and that map is written after the host answers.
+   *
+   * A session this mount has not seen has nothing settled, and these hooks never
+   * open storage. The shared port is put back on the array the normal lanes
+   * hold before this returns, so a later idle/forget observes its own array.
+   */
+  async function requestOnlyStep(
+    kind: OpencodeRequestOnlyKind, input: OpencodeSessionContext,
+  ): Promise<void> {
+    // ISSUE-420: a callback the host kept after cleanup does nothing.
+    if (closing) return;
+    const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : '';
+    const skip = (reason: OpencodeRequestOnlyReason, extra: Record<string, unknown> = {}): void => {
+      journal('request-only', { sessionId: sessionId.length === 0 ? null : sessionId,
+        requestKind: kind, applied: false, reason, ...extra });
+    };
+    if (sessionId.length === 0) { skip('no-session'); return; }
+    const entry = sessions.get(sessionId);
+    if (entry === undefined) { skip('no-session'); return; }
+    if (entry.requestOnlyGate !== null) { skip('busy', { active: 'request-only' }); return; }
+    if (entry.applyInFlight) { skip('busy', { active: 'apply' }); return; }
+    if (entry.askInFlight && kind !== 'generate') { skip('busy', { active: 'ask' }); return; }
+    if (entry.askVerdicts.size === 0 && entry.appliedPlans.size === 0) {
+      skip('nothing-settled');
+      return;
+    }
+    const messages = Array.isArray(input.messages) ? input.messages : null;
+    if (messages === null || messages.length === 0) { skip('no-array'); return; }
+    let release: () => void = () => {};
+    entry.requestOnlyGate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const snapshot = entry.port.observe(messages);
+      const window = contextWindowTokens
+        ?? Math.max(1, estimateRequestTokens(estimateMeter, snapshot, entry.lastPrefix));
+      const outcome = await applyOpencodeSettledRemovals({
+        entry, kind, messages, snapshot, window, journal,
+      });
+      journal('request-only', {
+        sessionId, requestKind: kind, revision: outcome.revision,
+        applied: outcome.applied, removals: outcome.removals,
+        skipped: outcome.skipped, cancelled: outcome.cancelled,
+        eventId: outcome.eventId,
+        // The configured host window when the mount has one; else the content
+        // estimate, named as an estimate and never as a window.
+        ...(contextWindowTokens === null ? { contentEstimate: window } : { window: contextWindowTokens }),
+        ...(outcome.status === undefined ? {} : { status: outcome.status }),
+        ...(outcome.committed === undefined ? {} : { committed: outcome.committed }),
+        ...(outcome.staleVerdicts ? { staleVerdicts: true } : {}),
+        ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+      });
+    } catch (error) {
+      journal('request-only-error', { sessionId, requestKind: kind, stage: 'apply',
+        message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      entry.requestOnlyGate = null;
+      release();
+      /**
+       * Put the shared port back on the array the turn lanes hold, so an idle
+       * or a manual forget that runs before the next context hook observes the
+       * array it means. A `null` last array (a request this mount saw with no
+       * context hook) leaves the port on this request; the next observe
+       * replaces it either way.
+       */
+      if (entry.lastMessages !== null && entry.lastMessages !== messages) {
+        try { entry.port.observe(entry.lastMessages); } catch { /* restore only */ }
+      }
     }
   }
 
@@ -3852,24 +4341,36 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * durable ledger refuses is named `ask-standdown` for the same reason, before
    * any host call is paid (ISSUE-447).
    */
-  async function cremate(sessionId: string): Promise<boolean> {
+  async function cremate(sessionId: string): Promise<OpencodeCremateResult> {
+    /**
+     * ADR-0073: every refusal names its reason on the journal and publishes
+     * `failed`; no `started` is published for a pass that never reached the
+     * table. The emission is guarded, so it cannot change the outcome.
+     */
+    const refuse = (reason: OpencodeCremateReason): OpencodeCremateResult => {
+      emitRpcEvent(CREMATE_RPC_EVENT_FAILED, {
+        [CREMATE_RPC_FIELD_SESSION_ID]: sessionId,
+        [CREMATE_RPC_FIELD_REASON]: reason,
+      });
+      return { fired: false, reason, rows: 0 };
+    };
     // ISSUE-420 / ISSUE-407: no effect after cleanup, named so a journal says
     // the command was refused because dispose had begun.
     if (closing) {
       if (!disposeComplete) {
         journal('cremate', { sessionId: sessionId || null, fired: false, reason: 'closing' });
       }
-      return false;
+      return refuse('closing');
     }
     const entry = sessions.get(sessionId);
     if (entry === undefined || entry.lastMessages === null) {
-      journal('cremate', { sessionId: sessionId || null, fired: false,
-        reason: entry === undefined ? 'no-session' : 'no-array' });
-      return false;
+      const reason: OpencodeCremateReason = entry === undefined ? 'no-session' : 'no-array';
+      journal('cremate', { sessionId: sessionId || null, fired: false, reason });
+      return refuse(reason);
     }
     if (askGrammar === undefined) {
       journal('cremate', { sessionId, fired: false, reason: 'ask-off' });
-      return false;
+      return refuse('ask-off');
     }
     let deferred = false;
     let buildThrew = false;
@@ -3885,7 +4386,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (entry.askInFlight) {
         skipped = true;
         journal('cremate', { sessionId, fired: false, reason: 'ask-in-flight' });
-        return false;
+        return refuse('ask-in-flight');
       }
       // ISSUE-447: a durable session the engine cannot apply a table to gets no
       // paid host call. The standdown line is the command lane's named reason.
@@ -3893,7 +4394,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (standdown !== null) {
         skipped = true;
         journalAskStanddown(entry, 'command', standdown);
-        return false;
+        return refuse('ask-standdown');
       }
       entry.passRound += 1;
       /**
@@ -3925,11 +4426,21 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         if (unitClaimSuppressed(batch)) {
           journal('cremate', { sessionId, fired: false, reason: 'claimed-unit',
             claims: batch?.dropped.asked ?? 0 });
-        } else {
-          journal('cremate', { sessionId, fired: false, reason: 'no-rows' });
+          return refuse('claimed-unit');
         }
-        return false;
+        journal('cremate', { sessionId, fired: false, reason: 'no-rows' });
+        return refuse('no-rows');
       }
+      const rows = batch.rows.length;
+      /**
+       * ADR-0073: the table is built and the paid call is next, so the pass is
+       * observable from here. `started` goes out before `askPass`; `ended`
+       * after it, whatever the reply.
+       */
+      emitRpcEvent(CREMATE_RPC_EVENT_STARTED, {
+        [CREMATE_RPC_FIELD_SESSION_ID]: sessionId,
+        [CREMATE_RPC_FIELD_TRIGGER]: CREMATE_RPC_TRIGGER_MANUAL,
+      });
       const sent = await askPass(entry, 'command', batch);
       const fired = sent.outcome === 'fired';
       /**
@@ -3938,16 +4449,28 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
        * pre-apply reading the baseline (audit 1).
        */
       deferred = fired && sent.answers.size > 0;
-      // ISSUE-468: a claim or in-flight refusal is named; `no-fire` stays the
-      // reason a table pass ran and the model answered without a removal.
-      const refused = sent.outcome === 'claimed-revision' || sent.outcome === 'ask-in-flight';
-      journal('cremate', { sessionId, fired, reason: fired ? 'table' : refused ? sent.outcome : 'no-fire' });
-      return fired;
+      /**
+       * ISSUE-468: a claim or in-flight refusal is named; `no-fire` stays the
+       * reason a table pass ran and the model answered without a removal.
+       */
+      let reason: OpencodeCremateReason = 'no-fire';
+      if (fired) reason = 'table';
+      else if (sent.outcome === 'claimed-revision' || sent.outcome === 'ask-in-flight') {
+        reason = sent.outcome;
+      }
+      journal('cremate', { sessionId, fired, reason });
+      emitRpcEvent(CREMATE_RPC_EVENT_ENDED, {
+        [CREMATE_RPC_FIELD_SESSION_ID]: sessionId,
+        [CREMATE_RPC_FIELD_FIRED]: fired,
+        [CREMATE_RPC_FIELD_REASON]: reason,
+        [CREMATE_RPC_FIELD_ROWS]: rows,
+      });
+      return { fired, reason, rows };
     } catch (error) {
       journal('ask-error', { sessionId, origin: 'command', stage: 'command',
         message: error instanceof Error ? error.message : String(error) });
       journal('cremate', { sessionId, fired: false, reason: 'error' });
-      return false;
+      return refuse('error');
     } finally {
       if (deferred) {
         entry.deferredApply = true;
@@ -4409,6 +4932,11 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     forgetTool,
     transform: (sessionId, messages, context) => track(
       transformStep(sessionId, messages, context), sessionId),
+    requestOnly: (kind, input) => {
+      if (closing) return Promise.resolve();
+      return track(requestOnlyStep(kind, input),
+        typeof input?.sessionID === 'string' ? input.sessionID : null);
+    },
     forget: (sessionId, args) => track(forgetRequest(sessionId, args), sessionId),
     event: (value, options) => {
       // ISSUE-420: a delivered event after cleanup has no effect.
@@ -4444,6 +4972,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     afterTool: input => track(afterTool(input),
       typeof input?.sessionID === 'string' ? input.sessionID : null),
     cremate: sessionId => track(cremate(sessionId), sessionId),
+    setRpcEmitter: (emit) => { rpcEmit = emit; },
     idle: sessionId => track(idleHookAsk(sessionId), sessionId),
     get idleAskOnEvent(): boolean { return idleAskOnEvent; },
     set idleAskOnEvent(value: boolean) { idleAskOnEvent = value; },
@@ -5052,17 +5581,33 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           try {
             const registration = await context.rpc.register(CREMATE_RPC_DEFINITION, {
               cremate: async (input: unknown) => {
-                if (inert()) return { ok: false };
+                if (inert()) {
+                  return { ok: false, fired: false, reason: 'closing', rows: 0 };
+                }
                 const id = isRecord(input) && typeof input['sessionID'] === 'string'
                   ? input['sessionID'] : '';
-                if (id === '') return { ok: false };
+                if (id === '') {
+                  return { ok: false, fired: false, reason: 'no-session', rows: 0 };
+                }
                 try {
-                  return { ok: true, fired: await mount.cremate(id) };
+                  return { ok: true, ...(await mount.cremate(id)) };
                 } catch {
-                  return { ok: false };
+                  return { ok: false, fired: false, reason: 'error', rows: 0 };
                 }
               },
             });
+            /**
+             * ADR-0073: the registration's event channel carries the pass
+             * lifecycle to the menu parts. A host (or a fake) that answers
+             * without one still mounts: the result is guarded and the mount
+             * simply publishes nothing.
+             */
+            const events = isRecord(registration) ? registration['events'] : undefined;
+            if (isRecord(events) && typeof events['emit'] === 'function') {
+              const emit = events['emit'] as OpencodeRpcEvents['emit'];
+              mount.setRpcEmitter((name, data) =>
+                Promise.resolve(emit.call(events, name, data)));
+            }
             /**
              * The RPC registry keeps the LAST registration for an id. Dispose
              * this activation's registration with its cleanup, or a disabled
@@ -5183,6 +5728,54 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
             };
           await mount.transform(input.sessionID, input.messages, requestContext);
         });
+        /**
+         * ADR-0074: OpenCode builds the checkpoint summary and the ask's own
+         * `session.generate` request from its stored conversation, through
+         * their own hooks. Without these two registrations those requests carry
+         * units this product already removed — the summary can bring one back
+         * in summarized form and the ask pays for its bytes. Each hook runs the
+         * request-only apply: settled removals only, no table, no model call,
+         * no latch/meter/ask-state movement, `result` never set.
+         *
+         * A host that predates either hook refuses its registration. The mount
+         * keeps working with the `context` hook alone: the refusal is journalled
+         * by name and setup continues with the next seam.
+         */
+        try {
+          await context.session.hook('compaction',
+            async (input: OpencodeCompactionContext) => {
+              if (inert()) return;
+              const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : '';
+              // A shared mount's hooks are delivered to every location; only
+              // the session's owner applies the removals, so one request is
+              // never rewritten twice.
+              if (group !== null && lease !== null
+                && !sharedAcceptsSessionHook(group, lease, sessionId)) return;
+              await mount.requestOnly('compaction', input);
+            });
+        } catch (error) {
+          try {
+            emit(Object.freeze({ kind: 'request-only-error', atMs: Date.now(),
+              hook: 'compaction', reason: 'register-failed',
+              message: error instanceof Error ? error.message : String(error) }));
+          } catch { /* a journal sink must never change an outcome */ }
+        }
+        try {
+          await context.session.hook('generate',
+            async (input: OpencodeSessionContext) => {
+              if (inert()) return;
+              const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : '';
+              if (group !== null && lease !== null
+                && !sharedAcceptsSessionHook(group, lease, sessionId)) return;
+              await mount.requestOnly('generate', input);
+            });
+        } catch (error) {
+          try {
+            emit(Object.freeze({ kind: 'request-only-error', atMs: Date.now(),
+              hook: 'generate', reason: 'register-failed',
+              message: error instanceof Error ? error.message : String(error) }));
+          } catch { /* a journal sink must never change an outcome */ }
+        }
         /**
          * The awaited idle seam (ADR-0062 D2, ISSUE-373): the host awaits this
          * hook inside its single drain, so the idle-origin ask blocks queued

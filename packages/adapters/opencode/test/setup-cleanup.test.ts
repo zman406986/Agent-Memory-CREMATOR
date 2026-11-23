@@ -79,7 +79,7 @@ function setupHost(options: Record<string, unknown>, failures: Failures = {}): S
       options,
       session: {
         hook: async (
-          name: 'context' | 'experimental.idle',
+          name: 'context' | 'compaction' | 'generate' | 'experimental.idle',
           callback: ((input: OpencodeSessionContext) => Promise<void> | void)
             | ((input: OpencodeIdleHookInput) => Promise<void> | void),
         ) => {
@@ -87,6 +87,9 @@ function setupHost(options: Record<string, unknown>, failures: Failures = {}): S
             host.idleHook = callback as (input: OpencodeIdleHookInput) => Promise<void> | void;
             return {};
           }
+          // ADR-0074's request hooks are accepted but not driven here; they are
+          // not context registrations.
+          if (name !== 'context') return {};
           host.contextRegistrations += 1;
           if (failures.context === true) throw new Error('context refused');
           host.contextHook = callback as (input: OpencodeSessionContext) => Promise<void> | void;
@@ -216,7 +219,7 @@ test('a closed mount refuses post-dispose work and writes no journal line', asyn
   await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
   await mount.afterTool({ tool: 'read', sessionID: sessionId, id: 'call_1' });
   await mount.idle(sessionId);
-  assert.equal(await mount.cremate(sessionId), false, 'the manual pass is refused');
+  assert.equal((await mount.cremate(sessionId)).fired, false, 'the manual pass is refused');
 
   assert.equal(records.length, afterClose, 'no post-dispose call wrote a journal line');
   const stale = await mount.tool.execute({ id: 'anything' }, { sessionID: sessionId });

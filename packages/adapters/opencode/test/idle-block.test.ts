@@ -126,6 +126,9 @@ test('ISSUE-411: the event consumer is live before the idle hook registers', asy
           hooks.context = callback as unknown as typeof hooks.context;
           return {};
         }
+        // ADR-0074's request hooks register before the idle seam; this row is
+        // about the ISSUE-411 ordering, so they are accepted and left unwired.
+        if (name !== 'experimental.idle') return {};
         // The awaited idle registration is in progress. The stream has no
         // subscriber under the old ordering, so this event is dropped there.
         stream.push({ type: 'session.compaction.started', data: { sessionID: sessionId } });

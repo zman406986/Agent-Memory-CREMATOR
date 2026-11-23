@@ -449,7 +449,9 @@ export interface RacoonsPluginOptions {
 export interface DshMountSession {
   readonly id: string;
   readonly seq?: number;
-  readonly surface?: { readonly nodes?: readonly number[] };
+  readonly surface?: { readonly nodes?: readonly number[];
+    readonly replaceGeneration?: number;
+    readonly contentGeneration?: number };
   eventAt?(seq: number): DshMountEvent | undefined;
   append(type: string, data: unknown, options?: Record<string, unknown>): DshMountEvent;
   /**
@@ -480,7 +482,8 @@ export interface DshMountEvent {
 /** The structural slice of the Cordis context this mount uses. */
 export interface DshMountContext {
   // `never[]` keeps every listener shape assignable without importing cordis.
-  on(event: string, listener: (...args: never[]) => unknown): unknown;
+  on(event: string, listener: (...args: never[]) => unknown,
+    options?: { readonly prepend?: boolean }): unknown;
   effect?(register: () => (() => unknown) | void, label?: string): unknown;
   logger?: { warn?(message: string): void };
   sessions?: { list?(): readonly DshMountSession[] };
@@ -506,6 +509,19 @@ export interface DshMountContext {
 /** The one model call an ask needs: stream a request, read its text deltas. */
 export interface DshLlmService {
   stream(options: DshLlmStreamOptions): AsyncIterable<DshLlmChunk>;
+  /**
+   * The host's exact-route metadata (ADR-0071). Native compaction reads the
+   * same seam for capacity. Optional: a stub host or an older dsh may not
+   * expose it, and the mount then keeps the configured window or leaves the
+   * automatic latch off rather than guessing.
+   */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<DshLlmModelInfo>;
+}
+
+/** The host model-info answer this mount reads; extra fields are ignored. */
+export interface DshLlmModelInfo {
+  readonly context?: { readonly contextWindow?: number };
+  readonly defaultMaxTokens?: number;
 }
 
 /** The request fields the host's `GenerateOptions` requires; extras pass through. */
@@ -611,6 +627,19 @@ export interface RacoonsSessionEntry {
    * an explicit bar nor a window is configured.
    */
   readonly pruneTrigger: PruneWindowTrigger;
+  /**
+   * The context window in force for this session (ADR-0071). Starts at the
+   * configured value; with none it is null until a boundary resolves the
+   * routed model's capacity from the host's model-info seam. The apply leg
+   * reads THIS, not the mount option, so a pass cannot plan against a number
+   * different from the one that armed it.
+   */
+  windowTokens: number | null;
+  /** The provider/model `windowTokens` was resolved from; null when unresolved or configured. */
+  windowProvider: string | null;
+  windowModel: string | null;
+  /** Route keys whose window lookup already wrote its one unresolved line (ADR-0071). */
+  readonly windowUnresolved: Set<string>;
   /**
    * The local estimate of the request the last pre-step was about to send, and
    * the port revision that estimate describes (G8, ISSUE-045 D1). Held here
@@ -857,9 +886,12 @@ export interface RacoonsMount {
    * (ISSUE-535) and return the card's one-shot waiter. The request runs only at
    * the `agent/pre-step` that claims `messageId`, inside that open turn; its
    * waiter settles with that pass's outcome, or by name if the host cancels the
-   * request before the pass runs.
+   * request before the pass runs. `null` means another request or pass already
+   * holds this session, so the command reports busy and opens no turn
+   * (ISSUE-545).
    */
-  beginCremate(sessionId: string, messageId: string, commandId: string | undefined): CremateWait;
+  beginCremate(sessionId: string, messageId: string,
+    commandId: string | undefined): CremateWait | null;
   /** Bind a command request to the host turn that claimed its marker. */
   claimCremate(sessionId: string, messageId: string, turn: number): void;
   /** Drop one command request by name; its waiter reports the failure. */
@@ -983,6 +1015,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** True when the signal exists and is aborted; a helper keeps TS from over-narrowing. */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal !== undefined && signal.aborted;
+}
+
+/**
+ * The host's monotonic surface counters, snapshotted when an ask is built
+ * (ISSUE-548). `replaceGeneration` counts positional replacements and
+ * `contentGeneration` also counts plugin-owned message changes; either moving
+ * means the array an answer describes is no longer the one that would apply.
+ */
+interface SurfaceStamp {
+  readonly replaceGeneration: number;
+  readonly contentGeneration: number;
+}
+
+/** The counters a host exposes, or null on a fake/older host that exposes none. */
+function surfaceStampOf(session: DshMountSession): SurfaceStamp | null {
+  const surface = session.surface;
+  const replaceGeneration = surface?.replaceGeneration;
+  const contentGeneration = surface?.contentGeneration;
+  if (typeof replaceGeneration !== 'number' || !Number.isSafeInteger(replaceGeneration)
+      || typeof contentGeneration !== 'number' || !Number.isSafeInteger(contentGeneration)) {
+    return null;
+  }
+  return { replaceGeneration, contentGeneration };
+}
+
+/** True when the surface moved since `stamp`; a vanished counter counts as moved. */
+function surfaceAdvanced(session: DshMountSession, stamp: SurfaceStamp): boolean {
+  const now = surfaceStampOf(session);
+  return now === null
+    || now.replaceGeneration !== stamp.replaceGeneration
+    || now.contentGeneration !== stamp.contentGeneration;
+}
+
 /**
  * Whether two depth-latch states are the same fact (ISSUE-475). A fork clears
  * the inherited latch only while the file still holds the value it captured at
@@ -997,7 +1065,8 @@ function sameTriggerState(a: PruneWindowTriggerState | null,
 }
 
 /** Validate the flat knobs and fill the engine's defaults. */
-export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined): ResolvedRacoonsConfig {
+export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
+  capabilities: { readonly hostModelInfo?: boolean } = {}): ResolvedRacoonsConfig {
   const config: RacoonsPluginConfig = isRecord(raw) ? raw : {};
   // ADR-0014 (2026-10-23): `capBytes` / `capHeadBytes` are accepted and ignored.
   // They are deliberately not read here: an old config file still mounts, and
@@ -1061,11 +1130,13 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined): Resol
   // validator arms both, so no config value can reach the latch unvalidated.
   const pruneThresholdTokens = resolvePruneThresholdTokens(config.pruneThresholdTokens);
   // The apply leg still plans against the host window (`applyPrunePass` refuses
-  // `no-window`), so a bar without a window would fire a pass that can never
-  // apply. Refuse it at mount instead of silently recording.
-  if (pruneThresholdTokens !== null && contextWindowTokens === null) {
+  // `no-window`), so a bar needs either a configured window or a host that can
+  // answer the routed model's capacity (ADR-0071). Refuse a row that has
+  // neither here, before a pass can fire and never apply.
+  if (pruneThresholdTokens !== null && contextWindowTokens === null
+      && capabilities.hostModelInfo !== true) {
     throw new Error('cremator: pruneThresholdTokens requires contextWindowTokens '
-      + '(the apply leg plans against the host window)');
+      + 'or a host llm.resolveModelInfo seam (the apply leg plans against the host window)');
   }
   // Owner ruling 2026-10-24: the backstop ships ON. The host's native compaction
   // stays armed, and racoons must fire earlier than the host's own trigger would
@@ -1678,6 +1749,14 @@ export function createRacoonsMount(options: {
   readonly warn?: (message: string) => void;
 }): RacoonsMount {
   const { config, storage } = options;
+  // A resolved config can reach here without passing through
+  // `resolvePluginConfig` (a direct caller or a test). The same rule applies:
+  // a bar needs a configured window or the host model-info seam (ADR-0071).
+  if (config.pruneThresholdTokens !== null && config.contextWindowTokens === null
+      && typeof options.llm?.resolveModelInfo !== 'function') {
+    throw new Error('cremator: pruneThresholdTokens requires contextWindowTokens '
+      + 'or a host llm.resolveModelInfo seam (the apply leg plans against the host window)');
+  }
   const clock: Clock = options.clock ?? { nowMs: () => Date.now() };
   const emit = options.journal ?? (() => {});
   const journal = (kind: RacoonsJournalKind, fields: Record<string, unknown>): void => {
@@ -1719,8 +1798,9 @@ export function createRacoonsMount(options: {
    * model-change event, so each boundary re-reads it here instead of trusting a
    * mount-time snapshot. The floor is refreshed and stamped with the
    * provider/model it came from; a change is named in `model-refresh`. The
-   * window is a mount option (model-independent), and the main-wire seed is
-   * invalidated at the ask when its own capture names a different model.
+   * window is resolved separately (`refreshBoundaryWindow`, ADR-0071), and the
+   * main-wire seed is invalidated at the ask when its own capture names a
+   * different model.
    */
   function refreshModelParameters(entry: RacoonsSessionEntry): void {
     const route = resolveRoute(entry.host);
@@ -1746,9 +1826,120 @@ export function createRacoonsMount(options: {
     entry.engine.updateConfig(engineConfig(config, next));
     journal('model-refresh', { sessionId: entry.sessionId, from,
       to: { provider, model, floorBytes: next },
-      window: 'mount-option', seed: 'invalidated-on-model-mismatch' });
+      window: config.contextWindowTokens === null ? 'host-model-info' : 'mount-option',
+      seed: 'invalidated-on-model-mismatch' });
+  }
+
+  /**
+   * ADR-0071 / ADR-0072: put the depth latch on the routed model's own window.
+   * A configured window is authoritative and needs no lookup. Otherwise the
+   * exact provider/model answers the host's model-info seam once per mount,
+   * and the answer is cached. A route change re-resolves, re-arms the latch
+   * from the next reading, and persists that state. A lookup that cannot
+   * answer writes one `window-unresolved` per route and leaves the latch off;
+   * it never invents a number.
+   */
+  async function refreshBoundaryWindow(entry: RacoonsSessionEntry,
+    signal?: AbortSignal): Promise<void> {
+    const route = resolveRoute(entry.host);
+    if (route === null || route.provider.length === 0 || route.model.length === 0) return;
+    // A configured window is authoritative and never asks the host, but a route
+    // change still re-arms the latch (ADR-0072 decision 5).
+    const configured = config.contextWindowTokens;
+    if (configured !== null) {
+      if (entry.windowProvider === route.provider && entry.windowModel === route.model) return;
+      applyResolvedWindow(entry, route, configured, 'config');
+      return;
+    }
+    const sameRoute = entry.windowProvider === route.provider
+      && entry.windowModel === route.model;
+    if (sameRoute && entry.windowTokens !== null) return;
+    if (signal?.aborted === true) return;
+    const key = `${route.provider}\u0000${route.model}`;
+    const cached = modelWindows.get(key);
+    if (cached !== undefined) {
+      // A route another session already resolved still gets this session's own
+      // line once, so the record names the window it acted under.
+      journal('window-resolved', { sessionId: entry.sessionId,
+        provider: route.provider, model: route.model, window: cached,
+        source: 'host-model-info-cache' });
+      applyResolvedWindow(entry, route, cached, 'host-model-info');
+      return;
+    }
+    const host = options.llm;
+    const resolveInfo = host?.resolveModelInfo;
+    if (typeof resolveInfo !== 'function') {
+      noteWindowUnresolved(entry, route, 'no-model-info-seam',
+        'the host exposes no model-info seam');
+      applyResolvedWindow(entry, route, null, 'unresolved');
+      return;
+    }
+    try {
+      const answer = await resolveInfo.call(host, route.provider, route.model, signal);
+      const candidate = answer?.context?.contextWindow;
+      if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate > 0) {
+        modelWindows.set(key, candidate);
+        entry.windowUnresolved.delete(key);
+        journal('window-resolved', { sessionId: entry.sessionId,
+          provider: route.provider, model: route.model, window: candidate,
+          source: 'host-model-info' });
+        applyResolvedWindow(entry, route, candidate, 'host-model-info');
+        return;
+      }
+      noteWindowUnresolved(entry, route, 'no-positive-context-window',
+        'the host model-info answer carried no positive contextWindow');
+      applyResolvedWindow(entry, route, null, 'unresolved');
+    } catch (error) {
+      if (isAborted(signal)) return;
+      noteWindowUnresolved(entry, route, 'model-info-failed', messageOf(error));
+      applyResolvedWindow(entry, route, null, 'unresolved');
+    }
+  }
+
+  /** Record one route's unresolved line, once per session (ADR-0071). */
+  function noteWindowUnresolved(entry: RacoonsSessionEntry, route: JudgeRoute,
+    reason: string, message: string): void {
+    const key = `${route.provider}\u0000${route.model}`;
+    if (entry.windowUnresolved.has(key)) return;
+    entry.windowUnresolved.add(key);
+    journal('window-unresolved', { sessionId: entry.sessionId,
+      provider: route.provider, model: route.model, reason, message });
+  }
+
+  /**
+   * Install one resolved (or unresolved) window on the entry and the latch.
+   * A route CHANGE re-arms the latch from the next reading and persists it
+   * (ADR-0072); the first resolution only enables the window.
+   */
+  function applyResolvedWindow(entry: RacoonsSessionEntry, route: JudgeRoute,
+    window: number | null, source: 'config' | 'host-model-info' | 'unresolved'): void {
+    const from = { provider: entry.windowProvider, model: entry.windowModel,
+      window: entry.windowTokens };
+    const switched = from.provider !== null
+      && (from.provider !== route.provider || from.model !== route.model);
+    entry.windowTokens = window;
+    entry.windowProvider = route.provider;
+    entry.windowModel = route.model;
+    if (from.window !== window) entry.pruneTrigger.setWindowTokens(window);
+    if (!switched) return;
+    entry.pruneTrigger.noteColdBoundary();
+    const target = targets.get(entry.sessionId);
+    if (target !== undefined) {
+      writePruneRound(target, entry.pruneRounds, journal, entry.sessionId,
+        entry.pruneTrigger.snapshot());
+    }
+    journal('model-switch', { sessionId: entry.sessionId, from,
+      to: { provider: route.provider, model: route.model, window },
+      windowSource: source });
   }
   const sessions = new Map<string, RacoonsSessionEntry>();
+  /**
+   * Exact-route context windows resolved from the host's model-info seam
+   * (ADR-0071), keyed by `provider\0model`. Successes only: a failed route is
+   * retried at the next boundary, and its one journal line per session rides
+   * `windowUnresolved`.
+   */
+  const modelWindows = new Map<string, number>();
   /**
    * First opens still in flight per session id (ISSUE-500). The session map is
    * populated only after the ledger open and the engine build complete, so two
@@ -1771,13 +1962,21 @@ export function createRacoonsMount(options: {
    */
   const pruneRequests = new Set<string>();
   /**
+   * Sessions with a pass in progress, whichever trigger started it (ISSUE-545).
+   * A second command or typed request reports busy instead of queueing another
+   * pass behind the one already running.
+   */
+  const passRunning = new Set<string>();
+  /**
    * Record one typed `/cremate` message's request; the next `agent/pre-step`
    * runs it. A second typed message for a session already waiting is a no-op.
    * The registered command does not use this seam: its pass is scoped to the
    * marker turn that runs it ({@link beginCremate}, ISSUE-535).
    */
   function requestPrune(sessionId: string, seq: number | undefined): void {
-    if (pruneRequests.has(sessionId)) return;
+    if (pruneRequests.has(sessionId) || passRunning.has(sessionId)
+        || cremateRunning.has(sessionId)
+        || (cremateRequests.get(sessionId)?.size ?? 0) > 0) return;
     pruneRequests.add(sessionId);
     journal('prune-requested', { sessionId, seq });
   }
@@ -1794,6 +1993,7 @@ export function createRacoonsMount(options: {
     settle(result: CrematePassResult): void;
   }
   interface CremateRequest {
+    readonly sessionId: string;
     readonly messageId: string;
     readonly commandId: string | undefined;
     /** The host turn that claimed the marker; null until the claim. */
@@ -1801,40 +2001,61 @@ export function createRacoonsMount(options: {
     readonly waiters: PruneWaitEntry[];
   }
   const cremateRequests = new Map<string, Map<string, CremateRequest>>();
+  /**
+   * Sessions whose command pass has been taken and not settled. A second
+   * command between the take and the settle must report busy instead of
+   * queueing another pass (ISSUE-545).
+   */
+  const cremateRunning = new Set<string>();
 
   /** Register one command invocation's request and its awaited outcome. */
   function beginCremate(sessionId: string, messageId: string,
-    commandId: string | undefined): CremateWait {
+    commandId: string | undefined): CremateWait | null {
     let resolveResult!: (result: CrematePassResult) => void;
     const result = new Promise<CrematePassResult>((resolve) => { resolveResult = resolve; });
-    const entry: PruneWaitEntry = {
+    const waiter: PruneWaitEntry = {
       done: false,
       settle(next) {
-        if (entry.done) return;
-        entry.done = true;
+        if (waiter.done) return;
+        waiter.done = true;
         resolveResult(next);
       },
     };
     const byMessage = cremateRequests.get(sessionId) ?? new Map<string, CremateRequest>();
     const existing = byMessage.get(messageId);
-    if (existing === undefined) {
-      byMessage.set(messageId, { messageId, commandId, turn: null, waiters: [entry] });
-      cremateRequests.set(sessionId, byMessage);
-      journal('prune-requested', { sessionId, seq: undefined, source: 'command',
-        messageId, commandId });
-    } else {
+    if (existing !== undefined) {
       // One invocation per message id; a repeat joins the same request.
-      existing.waiters.push(entry);
+      existing.waiters.push(waiter);
+      return cremateWait(sessionId, messageId, waiter, result);
     }
+    // Busy is a report, not a queue: no marker turn is opened, so no second
+    // pass can follow this one (native `/compact` reports the same way).
+    if (byMessage.size > 0 || cremateRunning.has(sessionId)
+        || passRunning.has(sessionId) || pruneRequests.has(sessionId)) {
+      journal('prune-requested', { sessionId, seq: undefined, source: 'command',
+        messageId, commandId, busy: true });
+      return null;
+    }
+    byMessage.set(messageId, { sessionId, messageId, commandId, turn: null,
+      waiters: [waiter] });
+    cremateRequests.set(sessionId, byMessage);
+    journal('prune-requested', { sessionId, seq: undefined, source: 'command',
+      messageId, commandId });
+    return cremateWait(sessionId, messageId, waiter, result);
+  }
+
+  /** The one wait handle a registered request hands its command. */
+  function cremateWait(sessionId: string, messageId: string,
+    waiter: PruneWaitEntry, result: Promise<CrematePassResult>): CremateWait {
     return {
       result,
       abandon: (message: string) => {
-        entry.settle({ status: 'failed', message });
+        waiter.settle({ status: 'failed', code: 'cancelled', message });
         // An abandoned card also drops its pending request, so the marker turn
         // that follows runs no pass the card already reported as cancelled.
         const pending = cremateRequests.get(sessionId);
         const request = pending?.get(messageId);
-        if (request === undefined || !request.waiters.every(waiter => waiter.done)) return;
+        if (request === undefined || !request.waiters.every(entry => entry.done)) return;
         pending?.delete(messageId);
         if (pending?.size === 0) cremateRequests.delete(sessionId);
       },
@@ -1848,6 +2069,7 @@ export function createRacoonsMount(options: {
     if (byMessage === undefined || request === undefined) return undefined;
     byMessage.delete(messageId);
     if (byMessage.size === 0) cremateRequests.delete(sessionId);
+    cremateRunning.add(sessionId);
     return request;
   }
 
@@ -1855,12 +2077,15 @@ export function createRacoonsMount(options: {
   function settleCremate(request: CremateRequest | undefined,
     result: CrematePassResult): void {
     if (request === undefined) return;
+    cremateRunning.delete(request.sessionId);
     for (const waiter of request.waiters) waiter.settle(result);
   }
 
   /** Drop one command request: the host discarded its marker or the open failed. */
   function cancelCremate(sessionId: string, messageId: string, message: string): void {
-    settleCremate(takeCremate(sessionId, messageId), { status: 'failed', message });
+    const request = takeCremate(sessionId, messageId);
+    if (request === undefined) return;
+    settleCremate(request, { status: 'failed', code: 'cancelled', message });
   }
 
   /** Bind a request to the turn that claimed its marker message. */
@@ -1890,7 +2115,9 @@ export function createRacoonsMount(options: {
     const byMessage = cremateRequests.get(sessionId);
     if (byMessage === undefined) return;
     cremateRequests.delete(sessionId);
-    for (const request of byMessage.values()) settleCremate(request, { status: 'failed', message });
+    for (const request of byMessage.values()) {
+      settleCremate(request, { status: 'failed', code: 'cancelled', message });
+    }
   }
 
   /** The request a marker names, if the host has not claimed its turn yet. */
@@ -2623,6 +2850,10 @@ export function createRacoonsMount(options: {
       publications, host: host ?? null, pruneRounds: persistedRound,
       pruneTrigger: new PruneWindowTrigger(config.contextWindowTokens,
         config.pruneThresholdTokens),
+      windowTokens: config.contextWindowTokens,
+      windowProvider: null,
+      windowModel: null,
+      windowUnresolved: new Set<string>(),
       requestEstimate: null, usageSeen: new Set<string>(), pendingForgets, floorBytes,
       floorProvider: (config.floorBytes === undefined || config.floorBytes === null)
         ? (openingRoute?.provider ?? null) : null,
@@ -3544,6 +3775,9 @@ export function createRacoonsMount(options: {
     // apply below then refuses by name instead of recording a receipt for an
     // array the host rewrote.
     const askGeneration = entry.compactionGeneration;
+    // ISSUE-548: the host's own counters, snapshotted at the same moment. They
+    // catch a surface rewrite that never emitted `compaction/start|end`.
+    const askSurface = surfaceStampOf(session);
     // ISSUE-422: a forked/inherited session's first step can land a result
     // before the child's own main request is captured (the parent's request is
     // not this session's seed). Refusing `no-seed` there is a false refusal:
@@ -3661,6 +3895,27 @@ export function createRacoonsMount(options: {
             retried: outcome.retried, turns: outcome.turns.length,
             reason: 'the host compacted during the ask, so the answer names an array that no longer exists; '
               + 'the exchange was not appended and the unit keeps' });
+        }
+        return;
+      }
+      // ISSUE-548: another plugin's replacement, or any rewrite that did not
+      // emit the host's compaction events, still invalidates the array this
+      // answer describes. The host's monotonic surface counters catch it; a
+      // host that exposes none keeps the check above only.
+      if (askSurface !== null && surfaceAdvanced(session, askSurface)) {
+        const now = surfaceStampOf(session);
+        cardText = { kind: 'error', text: 'entry ask refused: surface-generation-changed' };
+        for (const row of live) {
+          journal('entry-ask-refused', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+            callId: row.capture.item.callId, unitId: row.unitId,
+            code: 'surface-generation-changed',
+            askReplaceGeneration: askSurface.replaceGeneration,
+            replaceGeneration: now?.replaceGeneration ?? null,
+            askContentGeneration: askSurface.contentGeneration,
+            contentGeneration: now?.contentGeneration ?? null,
+            retried: outcome.retried, turns: outcome.turns.length,
+            reason: 'the host surface changed during the ask without a compaction event, so the answer '
+              + 'names an array that no longer exists; the exchange was not appended and the unit keeps' });
         }
         return;
       }
@@ -4028,7 +4283,7 @@ export function createRacoonsMount(options: {
     const cremate = cremateMessageId === undefined
       ? undefined : takeCremate(session.id, cremateMessageId);
     let passResult: CrematePassResult =
-      { status: 'failed', message: 'the prune pass did not settle' };
+      { status: 'failed', code: 'failed', message: 'the prune pass did not settle' };
     try {
       const outcome = await runPruneOutcome(session, existing, signal,
         (result) => { passResult = result; });
@@ -4048,6 +4303,9 @@ export function createRacoonsMount(options: {
     // boundary uses. Re-entering `sessionFor` here would hit the ISSUE-416
     // closing guard on a step that was already in flight at close.
     const entry = existing ?? await sessionFor(session.id, session);
+    // A direct `runPrune` may reach this path without a preceding `runStep`.
+    // ADR-0071 needs the resolved window before the apply leg reads it.
+    await refreshBoundaryWindow(entry, signal);
     pruneRequests.delete(session.id);
     syncPass(entry, session);
     const snapshot = await entry.port.snapshot();
@@ -4060,6 +4318,7 @@ export function createRacoonsMount(options: {
     let pruneWindowOpen = false;
     let cardText: { kind: 'success' | 'error'; text: string } =
       { kind: 'error', text: 'the prune pass did not settle' };
+    passRunning.add(session.id);
     try {
       // The paid ask is refused before it is sent when the write it depends on
       // cannot land (ISSUE-426): a refusing ledger, a recovery-pending intent, or
@@ -4069,7 +4328,8 @@ export function createRacoonsMount(options: {
       if (standdown !== null) {
         journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
           reason: standdown });
-        note({ status: 'failed', message: `the pass stood down: ${standdown}` });
+        note({ status: 'failed', code: 'ask-refused',
+          message: `the pass stood down: ${standdown}` });
         return null;
       }
       card = openAskCard(session);
@@ -4078,6 +4338,8 @@ export function createRacoonsMount(options: {
       // the pass's baseline mid-flight; the ask's own generation decides whether
       // the document may still apply.
       const passGeneration = entry.compactionGeneration;
+      // ISSUE-548: snapshot the host's own surface counters with the generation.
+      const passSurface = surfaceStampOf(session);
       entry.pruneWindows += 1;
       pruneWindowOpen = true;
       const outcome: RecordOnlyPruneOutcome = await runRecordOnlyPrune({
@@ -4128,7 +4390,8 @@ export function createRacoonsMount(options: {
         // No request left the seam for this pass: the card names the refusal,
         // never the ask's success text.
         cardText = { kind: 'error', text: `prune ask refused: ${outcome.refusedFor}` };
-        note({ status: 'failed', message: `prune ask refused: ${outcome.refusedFor}` });
+        note({ status: 'failed', code: 'ask-refused',
+          message: `prune ask refused: ${outcome.refusedFor}` });
       } else if (outcome.plan.askRows.length === 0) {
         // A pass with nothing to ask makes no model call. The card is still the
         // pass's visible trace, so it says exactly that (ISSUE-404).
@@ -4145,12 +4408,29 @@ export function createRacoonsMount(options: {
         journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
           reason: 'compaction-generation-changed', passGeneration,
           compactionGeneration: entry.compactionGeneration });
-        note({ status: 'failed', message: 'prune ask refused: compaction-generation-changed' });
+        note({ status: 'failed', code: 'changed',
+          message: 'prune ask refused: compaction-generation-changed' });
+        return null;
+      }
+      // ISSUE-548: the host's counters catch a rewrite that emitted no
+      // compaction events. The pass itself appends nothing to the surface
+      // between this snapshot and the apply, so any move here is external.
+      if (passSurface !== null && surfaceAdvanced(session, passSurface)) {
+        const now = surfaceStampOf(session);
+        cardText = { kind: 'error', text: 'prune ask refused: surface-generation-changed' };
+        journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
+          reason: 'surface-generation-changed',
+          askReplaceGeneration: passSurface.replaceGeneration,
+          replaceGeneration: now?.replaceGeneration ?? null,
+          askContentGeneration: passSurface.contentGeneration,
+          contentGeneration: now?.contentGeneration ?? null });
+        note({ status: 'failed', code: 'changed',
+          message: 'prune ask refused: surface-generation-changed' });
         return null;
       }
       const applied = await applyPrunePass({ sessionId: entry.sessionId, engine: entry.engine,
         application: outcome.application, round: outcome.plan.round,
-        windowTokens: config.contextWindowTokens, journal,
+        windowTokens: entry.windowTokens, journal,
         // Read for the journal line only: the engine decides, and its answer is
         // what the line reports (CRITIC-022 P2 #8).
         enforcement: config.enforcement,
@@ -4161,13 +4441,24 @@ export function createRacoonsMount(options: {
       }
       // The command card counts what the apply leg actually landed: a pass the
       // engine skipped (no window, record-only, nothing planned) removed
-      // nothing, whatever the plan proposed.
+      // nothing, whatever the plan proposed. An unresolved window is named as
+      // the reason instead of reading as a successful no-op (ADR-0071).
+      const planned = outcome.application?.removals.length ?? 0;
       if (outcome.refusedFor === null) {
-        note({
-          status: 'finished',
-          removed: applied !== null && applied.status === 'applied'
-            ? outcome.application?.removals.length ?? 0 : 0,
-        });
+        if (planned > 0 && entry.windowTokens === null) {
+          note({ status: 'failed', code: 'no-window',
+            message: 'the model context window is unknown' });
+        } else if (planned > 0 && applied === null) {
+          note({ status: 'failed', code: 'failed',
+            message: 'the apply leg produced no result' });
+        } else {
+          note({
+            status: 'finished',
+            removed: applied !== null && applied.status === 'applied' ? planned : 0,
+            bytesRemoved: applied !== null && applied.status === 'applied'
+              ? applied.removedBytes ?? 0 : 0,
+          });
+        }
       }
       if (outcome.refusedFor === null && outcome.plan.askRows.length > 0) {
         // The pass's own totals: rows still refused after the one re-ask, and
@@ -4178,7 +4469,8 @@ export function createRacoonsMount(options: {
         cardText = unsettled > 0
           ? { kind: 'error', text: 'prune rows left undecided' }
           : { kind: 'success', text: 'prune ask settled' };
-        if (unsettled > 0) note({ status: 'failed', message: 'prune rows left undecided' });
+        if (unsettled > 0) note({ status: 'failed', code: 'ask-refused',
+          message: 'prune rows left undecided' });
       }
       // ISSUE-462: the card reads the APPLY result too, not the ask totals
       // alone. Planned removals the engine refused did not settle, so the
@@ -4190,7 +4482,7 @@ export function createRacoonsMount(options: {
           ? applied.validation.issues.map(issue => String(issue.code)) : [];
         cardText = { kind: 'error', text: `prune apply ${applied.status}`
           + (codes.length === 0 ? '' : `: ${codes.join(', ')}`) };
-        note({ status: 'failed', message: cardText.text });
+        note({ status: 'failed', code: 'failed', message: cardText.text });
       }
       return outcome;
     } catch (error) {
@@ -4201,9 +4493,10 @@ export function createRacoonsMount(options: {
       // ISSUE-404: an apply/host failure is the card's outcome, not a
       // success that hides the failed leg.
       cardText = { kind: 'error', text: `prune pass failed: ${messageOf(error)}` };
-      note({ status: 'failed', message: `prune pass failed: ${messageOf(error)}` });
+      note({ status: 'failed', code: 'failed', message: `prune pass failed: ${messageOf(error)}` });
       return null;
     } finally {
+      passRunning.delete(session.id);
       // CRITIC-022 P1-1: a pass ends here whether it applied, refused or threw,
       // and every ending re-arms the latch. The next observation — the pass's
       // post-removal reading — is the new baseline, so the next fire needs one
@@ -4504,6 +4797,9 @@ export function createRacoonsMount(options: {
     const entry = await sessionFor(session.id, session);
     if (known) entry.retryInstallIdentity?.();
     await recoverResumedEntry(entry, session);
+    // ADR-0071/0070: put the latch on the routed model's own window before the
+    // boundary observes it. A configured window returns without a host call.
+    await refreshBoundaryWindow(entry, signal);
     // Retry any append an earlier boundary committed but never landed
     // (ISSUE-342): a failed publishAppend stays queued until it succeeds.
     try { flushAppends(session, entry, config); }
@@ -4609,7 +4905,11 @@ export function createRacoonsMount(options: {
     // in flight arrives after this boundary. The local estimate is only the
     // pre-first-usage fallback; it omits tool-call arguments and ran at ~0.56
     // of the host meter on the 078 run, so it cannot be the steady-state bar.
-    const reading = entry.pruneTrigger.enabled
+    // ADR-0071: an explicit bar alone arms the latch, but without a window the
+    // apply leg cannot plan. Until the routed model's window resolves, no
+    // automatic observation runs; the manual command still reports `no-window`.
+    const windowReady = config.contextWindowTokens !== null || entry.windowTokens !== null;
+    const reading = entry.pruneTrigger.enabled && windowReady
       ? entry.billedPromptTokens ?? estimate.totalTokens : null;
     const crossed = reading !== null && entry.pruneTrigger.observe(reading);
     // The automatic prune trigger (ISSUE-022 chunk 6; ADR-0050 decision 1–3):
@@ -4631,6 +4931,9 @@ export function createRacoonsMount(options: {
         estimate: prefix === null ? 'content' : 'content+prefix',
         barReading: entry.billedPromptTokens === null ? 'local-estimate' : 'host-billed-prompt',
         threshold: entry.pruneTrigger.threshold,
+        window: entry.windowTokens,
+        windowSource: config.contextWindowTokens !== null ? 'config'
+          : entry.windowTokens === null ? null : 'host-model-info',
         skipAt: entry.pruneTrigger.skipThreshold, crossed });
     }
     // A `/cremate` message seen during this step runs here, after the at-rest
@@ -4673,6 +4976,10 @@ export function createRacoonsMount(options: {
     const entry = await sessionFor(session.id, session);
     if (known) entry.retryInstallIdentity?.();
     await recoverResumedEntry(entry, session);
+    // The turn-end boundary is the last chance to notice a route change in a
+    // one-shot run; it re-arms and persists, but it never fires a pass
+    // (ADR-0072).
+    await refreshBoundaryWindow(entry);
     try { flushAppends(session, entry, config); }
     catch (error) {
       journal('append-publish-failed', { sessionId: entry.sessionId,
@@ -5454,7 +5761,8 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
     name: CREMATOR_PLUGIN_NAME,
     inject: CREMATOR_PLUGIN_INJECT,
     async apply(ctx, rawConfig) {
-      const config = resolvePluginConfig({ ...options.config, ...rawConfig });
+      const config = resolvePluginConfig({ ...options.config, ...rawConfig },
+        { hostModelInfo: typeof ctx.llm?.resolveModelInfo === 'function' });
       const storage = resolveStorage(options.storage, config.crematorStorageRoot);
       /**
        * ISSUE-424 / ADR-0066 / ISSUE-498: one live apply per durable root. The
@@ -5524,6 +5832,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         prune: config.contextWindowTokens === null && config.pruneThresholdTokens === null
           ? 'command' : 'command+threshold',
         window: config.contextWindowTokens,
+        windowSource: config.contextWindowTokens === null ? 'unresolved' : 'config',
         pruneThreshold: config.pruneThresholdTokens,
         // What the threshold counts (ISSUE-092): the host's own billed prompt
         // from the last `usage` row (`input + cacheRead + cacheWrite`), one step
@@ -5672,6 +5981,13 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         return next();
       });
 
+      // ISSUE-549: the 75% skip line assumes the latch observes a step before
+      // the host's own compactor runs. Cordis orders listeners by registration,
+      // and the two plugins' activation order is a boot-time race (the base
+      // composition says row order carries no load semantics), so this listener
+      // prepends. It still calls `next()` on every ordinary step, so the host
+      // compactor runs after it; only the command's marker step returns without
+      // `next()`, and that step never enters the model.
       ctx.on('agent/pre-step', async (payload: {
         agent?: {
           session?: DshMountSession;
@@ -5721,7 +6037,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         // so rejecting this turn loses no user work.
         restoreClaimed(payload.agent, payload.messages, marker.id);
         return { kind: 'reject' };
-      });
+      }, { prepend: true });
       // The last seal opportunity in a one-shot run: the loop appends `turn/end`
       // right after this serial hook, and no pre-step follows. Dispatching a
       // serial hook is not the `session/event` boundary, so appending is legal.

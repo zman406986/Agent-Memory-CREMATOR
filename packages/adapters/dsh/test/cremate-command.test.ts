@@ -1,12 +1,13 @@
 /**
  * The `/cremate` host command and the dsh bundle manifest (ADR-0068,
- * ISSUE-526, ISSUE-535).
+ * ISSUE-526, ISSUE-535, ISSUE-545).
  *
- * The command factory is pure: the handler records its request, opens the
- * marker turn, and reports the pass that turn settles. The mount's typed
- * request marker is tested directly; plugin apply is tested with a stub
- * context that carries the host command registry. The manifest test pins the
- * shipped bundle route so a later edit cannot silently drop it.
+ * The command factory is pure: the handler rejects arguments before any work,
+ * reports busy without opening a turn, then records its request, opens the
+ * marker turn, and reports the pass that turn settles with the closed failure
+ * vocabulary. The mount's typed request marker is tested directly; plugin apply
+ * is tested with a stub context that carries the host command registry. The
+ * manifest test pins the shipped bundle route so a later edit cannot drop it.
  */
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -14,10 +15,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  CREMATE_COMMAND_DESCRIPTION, CREMATE_COMMAND_NAME, CREMATE_FAILED_PREFIX,
-  CREMATE_MESSAGE_SOURCE, CREMATE_NO_SESSION, createCremateCommand,
+  CREMATE_CANCELLED, CREMATE_COMMAND_DESCRIPTION, CREMATE_COMMAND_NAME,
+  CREMATE_FAILED_PREFIX, CREMATE_MESSAGE_SOURCE, CREMATE_NO_SESSION, cremateCardFor,
+  createCremateCommand,
 } from '../src/cremate-command.js';
-import type { CrematePassResult, CremateWait, DshCommand } from '../src/cremate-command.js';
+import type {
+  CremateFailureCode, CrematePassResult, CremateWait, DshCommand,
+} from '../src/cremate-command.js';
 import {
   createRacoonsMount, createRacoonsPlugin, resolvePluginConfig, resolveStorage,
 } from '../src/plugin.js';
@@ -31,15 +35,27 @@ function fakeSession(id: string, seq?: number): DshMountSession {
   } as unknown as DshMountSession;
 }
 
-/** A wait the test resolves by hand. */
-function deferredWait(): { wait: CremateWait; settle(result: CrematePassResult): void } {
+/** A wait the test settles, rejects or abandons by hand. */
+function deferredWait(): {
+  wait: CremateWait;
+  settle(result: CrematePassResult): void;
+  reject(error: unknown): void;
+  abandons: string[];
+} {
   let resolveResult!: (result: CrematePassResult) => void;
+  let rejectResult!: (error: unknown) => void;
+  const abandons: string[] = [];
   return {
     wait: {
-      result: new Promise<CrematePassResult>((resolve) => { resolveResult = resolve; }),
-      abandon: () => {},
+      result: new Promise<CrematePassResult>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = reject;
+      }),
+      abandon: (message: string) => { abandons.push(message); },
     },
     settle(next) { resolveResult(next); },
+    reject(error) { rejectResult(error); },
+    abandons,
   };
 }
 
@@ -47,6 +63,28 @@ function deferredWait(): { wait: CremateWait; settle(result: CrematePassResult):
 function flush(): Promise<void> {
   return new Promise((resolve) => { setImmediate(resolve); });
 }
+
+test('the /cremate command rejects extra text before opening anything', async () => {
+  const begins: unknown[] = [];
+  const followups: unknown[] = [];
+  const cancels: unknown[] = [];
+  const command = createCremateCommand({
+    begin: (...args) => { begins.push(args); return deferredWait().wait; },
+    cancel: (...args) => { cancels.push(args); },
+  });
+  const agent = {
+    session: fakeSession('session-usage'),
+    followup: (message: unknown) => { followups.push(message); },
+  };
+  assert.deepEqual(await command.handler({ rawInput: ' please ', agent }),
+    { kind: 'error', text: 'Use /cremate with no extra text.' });
+  assert.deepEqual(await command.handler({ rawInput: 'please' }),
+    { kind: 'error', text: 'Use /cremate with no extra text.' },
+    'the usage card wins over the no-session card');
+  assert.equal(begins.length, 0, 'no request is recorded');
+  assert.equal(followups.length, 0, 'no turn is opened');
+  assert.equal(cancels.length, 0, 'nothing was recorded, so nothing is dropped');
+});
 
 test('the /cremate command opens one marker turn and returns the awaited pass card', async () => {
   const hand = deferredWait();
@@ -66,6 +104,7 @@ test('the /cremate command opens one marker turn and returns the awaited pass ca
 
   let done = false;
   const pending = Promise.resolve(command.handler({
+    rawInput: '   ',
     commandId: 'command-1',
     agent: {
       session: fakeSession('session-command-1', 11),
@@ -74,9 +113,9 @@ test('the /cremate command opens one marker turn and returns the awaited pass ca
   })).finally(() => { done = true; });
   await flush();
   assert.equal(done, false, 'the card waits for the pass');
-  hand.settle({ status: 'finished', removed: 2 });
+  hand.settle({ status: 'finished', removed: 2, bytesRemoved: 4096 });
   assert.deepEqual(await pending,
-    { kind: 'success', text: 'Cremation finished; 2 results removed.' });
+    { kind: 'success', text: 'Cremation finished; 2 results removed, 4096 bytes removed.' });
 
   assert.equal(begins.length, 1);
   assert.equal(begins[0]?.sessionId, 'session-command-1');
@@ -96,25 +135,86 @@ test('the /cremate command opens one marker turn and returns the awaited pass ca
     'the typed /cremate trigger must never see this message');
 });
 
-test('a failed or empty pass becomes its named card', async () => {
-  const rows: { pass: CrematePassResult; card: { kind: string; text: string } }[] = [
-    { pass: { status: 'finished', removed: 0 },
-      card: { kind: 'success', text: 'Cremation finished; nothing removed.' } },
-    { pass: { status: 'failed', message: 'prune ask refused: no-llm-service' },
-      card: { kind: 'error',
-        text: `${CREMATE_FAILED_PREFIX}prune ask refused: no-llm-service` } },
+test('a busy begin returns the busy card and opens no turn', async () => {
+  const followups: unknown[] = [];
+  const cancels: unknown[] = [];
+  const command = createCremateCommand({
+    begin: () => null,
+    cancel: (...args) => { cancels.push(args); },
+  });
+  assert.deepEqual(await command.handler({
+    commandId: 'command-busy',
+    agent: {
+      session: fakeSession('session-busy'),
+      followup: (message) => { followups.push(message); },
+    },
+  }), { kind: 'error', text: 'A cremation pass is already running in this chat.' });
+  assert.equal(followups.length, 0, 'the busy card opens no marker turn');
+  assert.equal(cancels.length, 0, 'no request was recorded, so none is dropped');
+});
+
+test('the cremate card names results, bytes, nothing removed, and every failure code', () => {
+  const finished: { pass: CrematePassResult; text: string }[] = [
+    { pass: { status: 'finished', removed: 1, bytesRemoved: 17 },
+      text: 'Cremation finished; 1 result removed, 17 bytes removed.' },
+    { pass: { status: 'finished', removed: 2, bytesRemoved: 4096 },
+      text: 'Cremation finished; 2 results removed, 4096 bytes removed.' },
+    { pass: { status: 'finished', removed: 0, bytesRemoved: 0 },
+      text: 'Cremation finished; nothing removed.' },
   ];
-  for (const row of rows) {
-    const hand = deferredWait();
-    hand.settle(row.pass);
-    const command = createCremateCommand({
-      begin: () => hand.wait,
-      cancel: () => {},
-    });
-    assert.deepEqual(await command.handler({
-      agent: { session: fakeSession('session-command-2'), followup: () => {} },
-    }), row.card);
+  for (const row of finished) {
+    assert.deepEqual(cremateCardFor(row.pass), { kind: 'success', text: row.text });
   }
+  const failures: { code: CremateFailureCode; text: string }[] = [
+    { code: 'busy', text: 'A cremation pass is already running in this chat.' },
+    { code: 'cancelled', text: 'Cremation cancelled.' },
+    { code: 'no-window',
+      text: "Cremation could not apply because the model's context window is unknown." },
+    { code: 'changed',
+      text: 'The conversation changed during the pass; nothing was removed. Try again.' },
+    { code: 'ask-refused',
+      text: 'Cremation could not get a usable answer; nothing was removed.' },
+    { code: 'failed', text: `${CREMATE_FAILED_PREFIX}ask stream died` },
+  ];
+  for (const row of failures) {
+    assert.deepEqual(
+      cremateCardFor({ status: 'failed', code: row.code, message: 'ask stream died' }),
+      { kind: 'error', text: row.text },
+      `code ${row.code} has one fixed sentence`);
+  }
+});
+
+test('a wait that rejects becomes the failed card with the error detail', async () => {
+  const hand = deferredWait();
+  const command = createCremateCommand({
+    begin: () => hand.wait,
+    cancel: () => {},
+  });
+  const pending = command.handler({
+    agent: { session: fakeSession('session-reject'), followup: () => {} },
+  });
+  await flush();
+  hand.reject(new Error('ledger closed'));
+  assert.deepEqual(await pending,
+    { kind: 'error', text: `${CREMATE_FAILED_PREFIX}ledger closed` });
+});
+
+test('an abort signal returns the cancelled card and abandons the request', async () => {
+  const hand = deferredWait();
+  const controller = new AbortController();
+  const command = createCremateCommand({
+    begin: () => hand.wait,
+    cancel: () => {},
+  });
+  const pending = command.handler({
+    signal: controller.signal,
+    agent: { session: fakeSession('session-cancel'), followup: () => {} },
+  });
+  await flush();
+  controller.abort();
+  assert.deepEqual(await pending, { kind: 'error', text: 'Cremation cancelled.' });
+  assert.deepEqual(hand.abandons, [CREMATE_CANCELLED],
+    'the abandoned request names the cancellation the pass may still hit');
 });
 
 test('the /cremate command refuses an invocation with no live session', async () => {

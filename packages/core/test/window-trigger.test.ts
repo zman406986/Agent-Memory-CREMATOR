@@ -79,3 +79,36 @@ test("the snapshot carries the excursion mark; restore refuses garbage by name",
     { lastFireUsage: null, belowSinceFire: false, baselinePending: 1 } as never),
   /baselinePending/u);
 });
+
+// ADR-0071/0070: the mount may resolve the window after the session opened,
+// and a routed-model change re-arms the latch without firing a pass.
+
+test("a resolved window replaces a null one and re-arms the skip line", () => {
+  const withBar = new PruneWindowTrigger(null, 60_000);
+  assert.equal(withBar.enabled, true, "the explicit bar arms the latch without a window");
+  assert.equal(withBar.skipThreshold, null, "no window means no 75% line");
+  withBar.setWindowTokens(200_000);
+  assert.equal(withBar.skipThreshold, 150_000, "the resolved window arms the skip line");
+  withBar.setWindowTokens(null);
+  assert.equal(withBar.skipThreshold, null, "an unresolved window disarms it again");
+  assert.throws(() => withBar.setWindowTokens(0), /contextWindowTokens/u);
+  const half = new PruneWindowTrigger(null);
+  assert.equal(half.enabled, false, "no bar and no window is off");
+  half.setWindowTokens(400_000);
+  assert.equal(half.threshold, 200_000, "the deprecated half-window path follows the resolved value");
+});
+
+test("a cold boundary makes the next reading the baseline, not a fire", () => {
+  // Window 400k keeps every reading below the 300k skip line, so the latch's
+  // own bar is the only guard under test.
+  const trigger = new PruneWindowTrigger(400_000, 60_000);
+  trigger.notePassCompleted();
+  assert.equal(trigger.observe(100_000), false, "the pass baseline is 100k");
+  trigger.noteColdBoundary();
+  assert.equal(trigger.observe(120_000), false,
+    "the first reading after the switch is the new baseline");
+  assert.equal(trigger.observe(160_000), false,
+    "one bar above the old baseline is not one bar above the new one");
+  assert.equal(trigger.observe(180_000), true,
+    "one bar of growth above the switch baseline fires");
+});

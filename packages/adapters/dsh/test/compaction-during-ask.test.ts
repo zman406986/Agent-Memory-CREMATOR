@@ -38,19 +38,28 @@ const HOST_MAIN = {
 interface FakeSession extends DshMountSession {
   readonly log: DshMountEvent[];
   readonly surfaceNodes: number[];
+  /** One external surface replacement, without a compaction event (ISSUE-548). */
+  bumpSurface(): void;
   on(listener: (session: FakeSession, event: DshMountEvent) => void): () => void;
 }
 
-function fakeSession(id: string): FakeSession {
+function fakeSession(id: string, counters = true): FakeSession {
   const log: DshMountEvent[] = [];
   const surfaceNodes: number[] = [];
+  let replaceGeneration = 0;
+  let contentGeneration = 0;
   const listeners = new Set<(session: FakeSession, event: DshMountEvent) => void>();
   const session: FakeSession = {
     id,
     get seq() { return log.length; },
-    get surface() { return { nodes: surfaceNodes } as const; },
+    get surface() {
+      return counters
+        ? { nodes: surfaceNodes, replaceGeneration, contentGeneration } as const
+        : { nodes: surfaceNodes } as const;
+    },
     get log() { return log; },
     get surfaceNodes() { return surfaceNodes; },
+    bumpSurface() { replaceGeneration += 1; contentGeneration += 1; },
     requestHeader: () => ({ config: { provider: ROUTE.provider, model: ROUTE.model } }),
     eventAt: (seq: number) => log[seq],
     append(type: string, data: unknown, options: Record<string, unknown> = {}) {
@@ -163,8 +172,8 @@ function resultText(session: FakeSession, callId: string): string | null {
 }
 
 function harness(params: { readonly id: string; readonly answer: string;
-  readonly gated: boolean }) {
-  const session = fakeSession(params.id);
+  readonly gated: boolean; readonly counters?: boolean }) {
+  const session = fakeSession(params.id, params.counters ?? true);
   const journal: JournalLine[] = [];
   const mainWire = createMainWireCapture();
   mainWire.note({ sessionId: session.id, ...HOST_MAIN });
@@ -262,6 +271,112 @@ test('ISSUE-423: a compaction inside the prune window defers the latch and refus
         assert.equal(resultText(h.session, callId), bodies[index],
           'every result keeps its bytes');
       }
+    } finally {
+      await h.mount.close();
+    }
+  });
+
+test('ISSUE-548: a surface replacement without a compaction event refuses the entry apply',
+  async () => {
+    const h = harness({ id: 's-surface-entry', answer: KEEPALL, gated: true });
+    const llm = h.llm;
+    assert.ok(llm !== undefined);
+    try {
+      h.mount.observeWire({ sessionId: h.session.id, provider: ROUTE.provider,
+        model: ROUTE.model, ...HOST_MAIN });
+      const body = oversizedBody('SURFACE-ENTRY');
+      seedRead(h.session, { turn: 1, callId: 'c1', target: 'big.txt', body });
+      const nodesBefore = h.session.surfaceNodes.length;
+
+      const pending = h.mount.runStep(h.session, { turn: 1, step: 2 });
+      await llm.opened;
+      // Another plugin replaced a node; no compaction/start|end was emitted.
+      h.session.bumpSurface();
+      llm.release();
+      const outcome = await pending;
+
+      assert.equal(outcome.deliveries.length, 1, 'the result was delivered once');
+      assert.equal(llm.calls.length, 1, 'the ask still left the seam');
+      const refused = kinds(h.journal, 'entry-ask-refused');
+      assert.equal(refused.length, 1, 'the answer was refused, not applied');
+      assert.equal(refused[0]?.['code'], 'surface-generation-changed',
+        'the refusal names the surface counter that moved');
+      assert.equal(refused[0]?.['askReplaceGeneration'], 0, 'the ask saw generation 0');
+      assert.equal(refused[0]?.['replaceGeneration'], 1, 'one replacement landed under it');
+      assert.equal(refused[0]?.['askContentGeneration'], 0, 'the ask saw content generation 0');
+      assert.equal(refused[0]?.['contentGeneration'], 1, 'the content counter moved too');
+      assert.equal(kinds(h.journal, 'entry-ask').length, 0, 'no exchange was recorded');
+      assert.equal(kinds(h.journal, 'entry-apply').length, 0, 'no receipt was recorded');
+      assert.equal(h.session.surfaceNodes.length, nodesBefore,
+        'no ask/answer turn pair was appended after the replacement');
+      assert.equal(resultText(h.session, 'c1'), body, 'the result keeps every byte');
+    } finally {
+      await h.mount.close();
+    }
+  });
+
+test('ISSUE-548: a surface replacement without a compaction event refuses the prune pass',
+  async () => {
+    const h = harness({ id: 's-surface-prune', answer: FORGET_ONE, gated: true });
+    const llm = h.llm;
+    assert.ok(llm !== undefined);
+    try {
+      h.mount.observeWire({ sessionId: h.session.id, provider: ROUTE.provider,
+        model: ROUTE.model, ...HOST_MAIN });
+      const bodies = ['SURFACE-ONE', 'SURFACE-TWO', 'SURFACE-THREE']
+        .map(tag => oversizedBody(tag));
+      seedRead(h.session, { turn: 1, callId: 'c1', target: 'one.txt', body: bodies[0] ?? '' });
+      seedRead(h.session, { turn: 2, callId: 'c2', target: 'two.txt', body: bodies[1] ?? '' });
+      seedRead(h.session, { turn: 3, callId: 'c3', target: 'three.txt', body: bodies[2] ?? '' });
+
+      const pending = h.mount.runPrune(h.session);
+      await llm.opened;
+      h.session.bumpSurface();
+      llm.release();
+      const outcome = await pending;
+
+      assert.equal(outcome, null, 'the pass did not settle into an application');
+      assert.equal(kinds(h.journal, 'prune-apply').length, 0,
+        'no receipt was recorded for the pre-ask array');
+      const off = kinds(h.journal, 'prune-off')
+        .find(line => line['reason'] === 'surface-generation-changed');
+      assert.ok(off !== undefined, 'the refused pass is named by its surface counter');
+      assert.equal(off['askReplaceGeneration'], 0);
+      assert.equal(off['replaceGeneration'], 1);
+      assert.equal(off['askContentGeneration'], 0);
+      assert.equal(off['contentGeneration'], 1);
+      for (const [index, callId] of ['c1', 'c2', 'c3'].entries()) {
+        assert.equal(resultText(h.session, callId), bodies[index],
+          'every result keeps its bytes');
+      }
+    } finally {
+      await h.mount.close();
+    }
+  });
+
+test('ISSUE-548: a host without surface counters keeps the compaction check only',
+  async () => {
+    const h = harness({ id: 's-no-surface-counters', answer: KEEPALL, gated: true,
+      counters: false });
+    const llm = h.llm;
+    assert.ok(llm !== undefined);
+    try {
+      h.mount.observeWire({ sessionId: h.session.id, provider: ROUTE.provider,
+        model: ROUTE.model, ...HOST_MAIN });
+      const body = oversizedBody('NO-COUNTERS');
+      seedRead(h.session, { turn: 1, callId: 'c1', target: 'big.txt', body });
+
+      const pending = h.mount.runStep(h.session, { turn: 1, step: 2 });
+      await llm.opened;
+      llm.release();
+      const outcome = await pending;
+
+      assert.equal(outcome.deliveries.length, 1);
+      assert.equal(kinds(h.journal, 'entry-ask').length, 1,
+        'the answered ask is recorded normally');
+      assert.equal(kinds(h.journal, 'entry-ask-refused').length, 0,
+        'no counter means no surface refusal');
+      assert.equal(resultText(h.session, 'c1'), body, 'a keep keeps every byte');
     } finally {
       await h.mount.close();
     }

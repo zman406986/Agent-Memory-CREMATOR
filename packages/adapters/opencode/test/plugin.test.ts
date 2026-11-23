@@ -468,13 +468,14 @@ function fakeHost(
       options,
       session: {
         hook: async (
-          name: 'context' | 'experimental.idle',
+          name: 'context' | 'compaction' | 'generate' | 'experimental.idle',
           callback: ((input: OpencodeSessionContext) => Promise<void> | void)
             | ((input: OpencodeIdleHookInput) => Promise<void> | void),
         ) => {
           // This fake predates the awaited idle seam: the registration is
           // refused, so these rows exercise the event-path fallback. The
-          // wired-hook lane lives in idle-block.test.ts (ISSUE-373).
+          // wired-hook lane lives in idle-block.test.ts (ISSUE-373). It also
+          // predates ADR-0074's request hooks, so those are refused too.
           if (name !== 'context') throw new Error('unexpected session hook');
           host.contextHook = callback as (input: OpencodeSessionContext) => Promise<void> | void;
           return {};
@@ -3061,7 +3062,8 @@ test('ISSUE-359: a thrown batch build leaves the crossing live on step, idle and
       const entry = commandMount.sessions.get(sessionId);
       assert.ok(entry !== undefined, 'the session is mounted');
       entry.passRound = -1;
-      assert.equal(await commandMount.cremate(sessionId), false, 'the thrown command fired nothing');
+      assert.equal((await commandMount.cremate(sessionId)).fired, false,
+        'the thrown command fired nothing');
       const err = commandLines.of('ask-error')
         .find(line => line['origin'] === 'command' && line['stage'] === 'rows');
       assert.ok(err !== undefined, 'the command build throw is journaled');
@@ -3816,7 +3818,7 @@ test('a /cremate fire re-arms from its post-removal surface, not the next pre-ap
     try {
       const { messages } = await rearmSetup(mount);
       assert.equal(calls.length, 0, 'the shipped request is below the bar');
-      const fired = await mount.cremate(sessionId);
+      const { fired } = await mount.cremate(sessionId);
       assert.equal(fired, true, 'the manual command asks');
       assert.equal(calls.length, 1, 'one table is sent');
       assert.equal(messages.some(message => message.id === 'msg_doomed'), true,
@@ -4678,7 +4680,8 @@ test('the /cremate command runs the table pass on demand, below the bar', async 
   });
   try {
     await offMount.transform(sessionId, largeHostMessages());
-    assert.equal(await offMount.cremate(sessionId), false, 'the ask-off command fires nothing');
+    assert.equal((await offMount.cremate(sessionId)).fired, false,
+      'the ask-off command fires nothing');
     assert.equal(offLines.of('cremate').at(-1)?.['reason'], 'ask-off',
       'the journal names the missing ask');
   } finally { await offMount.close(); }
@@ -4718,7 +4721,7 @@ test('ISSUE-412: /cremate under the ask lock does not consume the depth latch', 
     assert.equal(entry.askInFlight, true, 'the step ask holds the lane');
     const before = entry.pruneTrigger.snapshot();
 
-    assert.equal(await mount.cremate(sessionId), false, 'the manual pass cannot run');
+    assert.equal((await mount.cremate(sessionId)).fired, false, 'the manual pass cannot run');
     assert.deepEqual(entry.pruneTrigger.snapshot(), before,
       'the refused manual pass leaves the depth latch exactly as it was');
     const skip = lines.of('cremate').at(-1);
@@ -4765,7 +4768,7 @@ test('ISSUE-447: a prepared-only ledger stands every ask lane down before genera
       // The idle lane reads the same health.
       await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
       // The manual command reads it too, and is not gated by the latch.
-      assert.equal(await mount.cremate(sessionId), false,
+      assert.equal((await mount.cremate(sessionId)).fired, false,
         'the command runs no pass against an unhealthy ledger');
       assert.equal(calls.length, 0, 'no ask lane paid the host');
       const standdowns = lines.of('ask-standdown');
@@ -4835,7 +4838,7 @@ test('the /cremate command tables a unit first carried by the last sent request'
     assert.ok(entry.pendingSeenNodeIds.size > 0,
       'the transform recorded the unit its request shipped');
     assert.equal(entry.seenNodeIds.size, 0, 'no later request promoted it yet');
-    const fired = await mount.cremate(sessionId);
+    const { fired } = await mount.cremate(sessionId);
     assert.equal(fired, true, 'the command tables the last sent request\'s unit');
     const ask = lines.of('ask').at(-1);
     assert.equal(ask?.['rowCount'], 1, 'the command table names that unit');
@@ -5502,7 +5505,8 @@ test('ISSUE-409: an unapplied verdict survives a restart and applies without re-
         const messages = largeHostMessages();
         await first.transform(sessionId, messages);
         assert.equal(calls.length, 0, 'the carrying request tables nothing');
-        assert.equal(await first.cremate(sessionId), true, 'the command fires the table pass');
+        assert.equal((await first.cremate(sessionId)).fired, true,
+          'the command fires the table pass');
         const entry = first.sessions.get(sessionId);
         assert.ok(entry !== undefined, 'the first mount built the session');
         assert.equal(calls.length, 1, 'the command asked once');
@@ -5629,7 +5633,8 @@ test('ISSUE-467: an ask-off mount durably drops the verdicts and claims it names
       try {
         await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
         await first.transform(sessionId, largeHostMessages());
-        assert.equal(await first.cremate(sessionId), true, 'the command fires the table pass');
+        assert.equal((await first.cremate(sessionId)).fired, true,
+          'the command fires the table pass');
         const entry = first.sessions.get(sessionId);
         assert.ok(entry !== undefined, 'the first mount built the session');
         assert.equal(entry.askVerdicts.size, 1, 'the verdict is stored durably');
@@ -5780,7 +5785,8 @@ test('ISSUE-483: an ask-off drop never reports a clear that failed', async () =>
     try {
       await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
       await first.transform(sessionId, largeHostMessages());
-      assert.equal(await first.cremate(sessionId), true, 'the command stores the verdict');
+      assert.equal((await first.cremate(sessionId)).fired, true,
+        'the command stores the verdict');
     } finally { await first.close(); }
 
     /**
@@ -6126,7 +6132,7 @@ test('ISSUE-486: a restored durable unit claim is named, not no-eligible', async
         .every(record => !/none was suppressed/u.test(String(record['reason'] ?? ''))),
       'the crossing writes no empty-crossing reason');
       // The command lane names the same suppression.
-      assert.equal(await second.cremate(sessionId), false, 'the command fires nothing');
+      assert.equal((await second.cremate(sessionId)).fired, false, 'the command fires nothing');
       assert.equal(lines.of('cremate').at(-1)?.['reason'], 'claimed-unit',
         'the command reason is the unit claim, not no-rows');
     } finally { await second.close(); }

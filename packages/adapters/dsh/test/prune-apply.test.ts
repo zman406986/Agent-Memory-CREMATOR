@@ -145,6 +145,9 @@ function seedFixture(session: ReturnType<typeof fakeSession>): void {
 interface FakeLlm {
   readonly calls: DshLlmStreamOptions[];
   stream(options: DshLlmStreamOptions): AsyncIterable<DshLlmChunk>;
+  /** Present when the test wants the host model-info seam (ADR-0071). */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal):
+    Promise<{ context?: { contextWindow?: number } }>;
 }
 
 function fakeLlm(answer: string): FakeLlm {
@@ -172,7 +175,7 @@ function collector(): { records: { kind: string; [field: string]: unknown }[];
 async function mounted(params: {
   id: string; answer?: string; window?: number | null; bar?: number; root?: string;
   seedTurnCount?: number; backstop?: boolean; enforcement?: 'apply' | 'record-only';
-  mainSystem?: string; capture?: boolean;
+  mainSystem?: string; capture?: boolean; windowFromHost?: number;
 }) {
   const session = fakeSession(params.id);
   if (params.seedTurnCount === undefined) seedFixture(session);
@@ -189,12 +192,17 @@ async function mounted(params: {
       ...(params.mainSystem === undefined ? {} : { system: params.mainSystem }) });
   }
   const llm = params.answer === undefined ? undefined : fakeLlm(params.answer);
+  const hostWindow = params.windowFromHost;
+  if (llm !== undefined && hostWindow !== undefined) {
+    llm.resolveModelInfo = async () => ({ context: { contextWindow: hostWindow } });
+  }
   const mount = createRacoonsMount({
     config: resolvePluginConfig({ barBytes: 64,
       ...(params.window === undefined ? {} : { contextWindowTokens: params.window }),
       ...(params.bar === undefined ? {} : { pruneThresholdTokens: params.bar }),
       ...(params.enforcement === undefined ? {} : { enforcement: params.enforcement }),
-      ...(params.backstop === undefined ? {} : { nativeCompactionBackstop: params.backstop }) }),
+      ...(params.backstop === undefined ? {} : { nativeCompactionBackstop: params.backstop }) },
+    { hostModelInfo: params.windowFromHost !== undefined }),
     storage: params.root === undefined
       ? resolveStorage(undefined) : resolveStorage({ root: params.root }, params.root),
     journal: records.sink, mainWire,
@@ -296,6 +304,28 @@ test('an unknown cache applies a prune pass once: one revert, one epoch break', 
     assert.match(receipt.recordId, /^racoons:/u, 'and carries its receipt identity');
     assert.match(new TextDecoder().decode(receipt.bytes), /recall:sha256:/u,
       'the receipt names the recall id that can restore the bytes');
+  } finally {
+    await env.mount.close();
+  }
+});
+
+test('a resolved host window reaches the apply leg and the removed-byte count', async () => {
+  const env = await mounted({ id: 's-apply-host-window', window: null, bar: 1_000_000,
+    windowFromHost: 200_000,
+    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
+  try {
+    const outcome = await env.mount.runPrune(env.session);
+    assert.ok(outcome !== null, 'the pass settled');
+    const applied = env.records.records.find(record => record['kind'] === 'prune-apply');
+    assert.ok(applied !== undefined, 'the pass reached the engine');
+    assert.equal(applied['status'], 'applied', JSON.stringify(applied['issues']));
+    assert.equal(applied['window'], 200_000,
+      'the apply planned against the window resolved from the host (ADR-0071)');
+    assert.equal(typeof applied['removedBytes'], 'number',
+      'the applied result reports the removed bytes');
+    assert.ok((applied['removedBytes'] as number) > 0);
+    assert.equal(env.records.records.some(record => record['kind'] === 'window-resolved'), true);
+    assert.equal(env.records.records.some(record => record['kind'] === 'window-unresolved'), false);
   } finally {
     await env.mount.close();
   }

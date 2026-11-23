@@ -123,6 +123,7 @@ export async function applyPrunePass(options: PruneApplyOptions): Promise<Engine
   journal('prune-apply', { sessionId, eventId, round, window: windowTokens,
     removals: application.removals.length, status: result.status,
     intentId: result.intentId,
+    ...(result.removedBytes === undefined ? {} : { removedBytes: result.removedBytes }),
     ...(options.enforcement === undefined ? {} : { enforcement: options.enforcement }),
     ...(options.revertHistory === undefined ? {} : { revertHistory: options.revertHistory }),
     issues: result.validation?.ok === false ? result.validation.issues : [] });

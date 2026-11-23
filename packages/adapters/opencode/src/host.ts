@@ -160,6 +160,18 @@ export interface OpencodeSessionContext {
   readonly [field: string]: unknown;
 }
 
+/**
+ * The `compaction` hook's payload (`SessionCompaction` in 2.4.0):
+ * `SessionContext` plus the host's own summary slot. Setting `result` supplies
+ * the summary and skips the model call — the one thing this product must never
+ * do — so the mount reads the field never and sets it never (ADR-0074 decision
+ * 5). The type states it so the omission is deliberate, not an oversight.
+ */
+export interface OpencodeCompactionContext extends OpencodeSessionContext {
+  /** The host's summary override. Never read, never set. */
+  readonly result?: unknown;
+}
+
 /** The execution context a registered tool receives. */
 export interface OpencodeToolContext {
   readonly sessionID: string;
@@ -326,6 +338,27 @@ export interface OpencodeCommandDomain {
 }
 
 /**
+ * The event channel a registration returns (`RpcRegistration.events` in
+ * `@opencode/plugin@2.4.0`; ADR-0073). The mount calls `emit` with a name the
+ * definition declares and that event's payload, and never awaits it.
+ */
+export interface OpencodeRpcEvents {
+  emit(name: string, data: Readonly<Record<string, unknown>>): Promise<void>;
+}
+
+/**
+ * What `rpc.register` answers. `events` is optional in this structural shape
+ * because a host (or a test's fake) may answer without a channel: the mount
+ * guards the result and publishes nothing, and never throws because the seam
+ * is absent.
+ */
+export interface OpencodeRpcRegistration {
+  readonly events?: OpencodeRpcEvents;
+  /** The host's own registration cleanup; present on the 2.4.0 RPC service. */
+  dispose?(): Promise<void> | void;
+}
+
+/**
  * The server-wide RPC seam (`Context.rpc` in 2.4.0). The menu parts call it
  * because `context.command.transform` registers a command for the server's
  * own location only; a session in another folder cannot see that command.
@@ -335,7 +368,7 @@ export interface OpencodeRpcDomain {
     definition: Readonly<Record<string, unknown>>,
     handlers: Readonly<Record<string,
       (input: unknown, context: unknown) => Promise<unknown> | unknown>>,
-  ): Promise<unknown>;
+  ): Promise<OpencodeRpcRegistration>;
 }
 
 /**
@@ -400,6 +433,26 @@ export interface OpencodePluginContext {
   readonly session: {
     hook(
       name: 'context',
+      callback: (input: OpencodeSessionContext) => Promise<void> | void,
+    ): Promise<unknown>;
+    /**
+     * 2.4.0's checkpoint-summary hook (`SessionHooks['compaction']`, ADR-0074).
+     * The payload is the same `SessionContext` plus the host's `result` slot;
+     * the mount applies settled removals to `messages` and leaves `result`
+     * unset, so the host's own summary prompt and model still run.
+     */
+    hook(
+      name: 'compaction',
+      callback: (input: OpencodeCompactionContext) => Promise<void> | void,
+    ): Promise<unknown>;
+    /**
+     * 2.4.0's transient-request hook (`SessionHooks['generate']`, ADR-0074): the
+     * `session.generate` request the bench-only ask makes. A host that predates
+     * the hook refuses the registration; the mount journals the refusal and
+     * keeps mounting.
+     */
+    hook(
+      name: 'generate',
       callback: (input: OpencodeSessionContext) => Promise<void> | void,
     ): Promise<unknown>;
     /**

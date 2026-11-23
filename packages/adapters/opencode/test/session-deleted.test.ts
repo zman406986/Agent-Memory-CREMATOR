@@ -352,7 +352,7 @@ test('ISSUE-407: close refuses cremate and idle with a named journal reason', as
     await closingStarted;
 
     // Dispose has begun: neither the command nor the idle hook may start work.
-    assert.equal(await mount.cremate(SES_A), false, 'cremate refuses during close');
+    assert.equal((await mount.cremate(SES_A)).fired, false, 'cremate refuses during close');
     await mount.idle(SES_A);
     assert.equal(lines.of('cremate').at(-1)?.['reason'], 'closing',
       'the command names the refusal reason');

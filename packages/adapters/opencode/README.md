@@ -89,6 +89,15 @@ which runs the same pass. A session needs one request since this process loaded 
 hold its array; `/cremate` before that first request reports `no-session`, because the plugin seam
 exposes stored messages but not the assembled request the pass plans against.
 
+### Status surface
+
+The manual pass is observable on the host's RPC event channel (ADR-0073): `started`, `ended`,
+`failed`, and `applied` for first-time judged removals. A refusal is a named reason, not a silent
+`fired:false`. The desktop part contributes a composer pill showing context fill and the last
+applied pass, and its row runs the same `/cremate` RPC. The terminal part shows the lifecycle as
+toasts and puts the last pass in the command label. This is display-only: no background pass, no
+extra model call, and the terminal footer slot stays deferred (ADR-0062 D4).
+
 ## What the mount does
 
 Per primary request, on `context.session.hook("context", ...)`, before the host converts the

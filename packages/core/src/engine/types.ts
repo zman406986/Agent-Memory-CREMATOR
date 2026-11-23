@@ -230,6 +230,12 @@ export interface EngineResult {
    * application for.
    */
   readonly committed?: boolean;
+  /**
+   * Bytes the application removed, from the same `applicationMeasurements`
+   * reading the `application` telemetry row carries. Present only on an
+   * applied result; absent on every other status, never a zero claim.
+   */
+  readonly removedBytes?: number;
   readonly validation: ValidationResult | null;
   /**
    * The write invalidation the pass planned against; `null` when the pass

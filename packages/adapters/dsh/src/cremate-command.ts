@@ -44,6 +44,12 @@ export const CREMATE_TURN_TEXT = 'cremator: cremate';
 export const CREMATE_NO_SESSION =
   'Could not find this chat. Run /cremate from a live session.';
 
+/** The refusal when the invocation carries any text after `/cremate`. */
+const CREMATE_USAGE_TEXT = 'Use /cremate with no extra text.';
+
+/** The card when another cremate request is pending or its pass is running. */
+const CREMATE_BUSY_TEXT = 'A cremation pass is already running in this chat.';
+
 /** The failure when the host cannot queue the marker turn. */
 export const CREMATE_NO_FOLLOWUP = 'this host cannot open the turn the pass needs';
 
@@ -53,10 +59,18 @@ export const CREMATE_CANCELLED = 'the command was cancelled before the pass ran'
 /** The card prefix every failure carries. */
 export const CREMATE_FAILED_PREFIX = 'Cremation failed: ';
 
+/**
+ * The closed failure vocabulary one pass reports (ISSUE-545). Every code but
+ * `failed` has one fixed card sentence; `failed` keeps the unexpected error's
+ * detail after the shared prefix.
+ */
+export type CremateFailureCode =
+  | 'busy' | 'cancelled' | 'no-window' | 'changed' | 'ask-refused' | 'failed';
+
 /** One pass's outcome as the command card reports it. */
 export type CrematePassResult =
-  | { readonly status: 'finished'; readonly removed: number }
-  | { readonly status: 'failed'; readonly message: string };
+  | { readonly status: 'finished'; readonly removed: number; readonly bytesRemoved: number }
+  | { readonly status: 'failed'; readonly code: CremateFailureCode; readonly message: string };
 
 /** The command's one-shot wait for its pass. */
 export interface CremateWait {
@@ -107,9 +121,11 @@ export interface CremateCommandOptions {
   /**
    * Register this command invocation's pass request and return its waiter.
    * The request runs only in the turn that claims `messageId`, so the command
-   * card reports that pass and no other.
+   * card reports that pass and no other. `null` means another cremate request
+   * is already pending or a pass is running for this session.
    */
-  begin(sessionId: string, messageId: string, commandId: string | undefined): CremateWait;
+  begin(sessionId: string, messageId: string, commandId: string | undefined):
+    CremateWait | null;
   /** Drop the request when the turn could not be opened or was cancelled. */
   cancel(sessionId: string, messageId: string, message: string): void;
 }
@@ -119,17 +135,36 @@ let turnOrdinal = 0;
 
 /** The card one settled pass produces. */
 export function cremateCardFor(result: CrematePassResult): DshCommandResult {
-  if (result.status === 'failed') {
-    return { kind: 'error', text: `${CREMATE_FAILED_PREFIX}${result.message}` };
+  if (result.status === 'finished') {
+    if (result.removed === 0) {
+      return { kind: 'success', text: 'Cremation finished; nothing removed.' };
+    }
+    return {
+      kind: 'success',
+      text: `Cremation finished; ${String(result.removed)} result`
+        + `${result.removed === 1 ? '' : 's'} removed, `
+        + `${String(result.bytesRemoved)} bytes removed.`,
+    };
   }
-  if (result.removed === 0) {
-    return { kind: 'success', text: 'Cremation finished; nothing removed.' };
+  return { kind: 'error', text: cremateFailureText(result.code, result.message) };
+}
+
+/** One fixed sentence per expected failure; `failed` keeps the detail. */
+function cremateFailureText(code: CremateFailureCode, message: string): string {
+  switch (code) {
+    case 'busy':
+      return CREMATE_BUSY_TEXT;
+    case 'cancelled':
+      return 'Cremation cancelled.';
+    case 'no-window':
+      return "Cremation could not apply because the model's context window is unknown.";
+    case 'changed':
+      return 'The conversation changed during the pass; nothing was removed. Try again.';
+    case 'ask-refused':
+      return 'Cremation could not get a usable answer; nothing was removed.';
+    case 'failed':
+      return `${CREMATE_FAILED_PREFIX}${message}`;
   }
-  return {
-    kind: 'success',
-    text: `Cremation finished; ${String(result.removed)} result`
-      + `${result.removed === 1 ? '' : 's'} removed.`,
-  };
 }
 
 /** Whether one value names a CREMATOR command marker, and its identity. */
@@ -156,6 +191,11 @@ export function createCremateCommand(options: CremateCommandOptions): DshCommand
     name: CREMATE_COMMAND_NAME,
     description: CREMATE_COMMAND_DESCRIPTION,
     async handler(invocation) {
+      // `/cremate` takes no arguments (ISSUE-545): any text after it is a
+      // usage mistake, rejected before a session lookup, a request or a turn.
+      if ((invocation.rawInput ?? '').trim().length > 0) {
+        return { kind: 'error', text: CREMATE_USAGE_TEXT };
+      }
       const session = invocation.agent?.session;
       if (session === undefined) {
         return { kind: 'error', text: CREMATE_NO_SESSION };
@@ -182,6 +222,11 @@ export function createCremateCommand(options: CremateCommandOptions): DshCommand
           ...(commandId === undefined ? {} : { commandId }) },
       };
       const wait = options.begin(sessionId, message.id, commandId);
+      if (wait === null) {
+        // Another request is pending or its pass is running: report busy and
+        // open no turn, the way native `/compact` refuses without queueing.
+        return { kind: 'error', text: CREMATE_BUSY_TEXT };
+      }
       try {
         // Call on the agent: the host method uses `this.send`.
         await followup.call(agent, message);
@@ -203,11 +248,13 @@ export function createCremateCommand(options: CremateCommandOptions): DshCommand
 function waitOrAbort(wait: CremateWait, signal: AbortSignal | undefined,
 ): Promise<CrematePassResult> {
   const pending = wait.result.catch(
-    (error: unknown): CrematePassResult => ({ status: 'failed', message: messageOf(error) }));
+    (error: unknown): CrematePassResult =>
+      ({ status: 'failed', code: 'failed', message: messageOf(error) }));
   if (signal === undefined) return pending;
   if (signal.aborted) {
     wait.abandon(CREMATE_CANCELLED);
-    return Promise.resolve({ status: 'failed', message: CREMATE_CANCELLED });
+    return Promise.resolve(
+      { status: 'failed', code: 'cancelled', message: CREMATE_CANCELLED });
   }
   return new Promise<CrematePassResult>((resolve) => {
     let settled = false;
@@ -219,7 +266,7 @@ function waitOrAbort(wait: CremateWait, signal: AbortSignal | undefined,
     };
     const onAbort = (): void => {
       wait.abandon(CREMATE_CANCELLED);
-      done({ status: 'failed', message: CREMATE_CANCELLED });
+      done({ status: 'failed', code: 'cancelled', message: CREMATE_CANCELLED });
     };
     signal.addEventListener('abort', onAbort, { once: true });
     void pending.then(done);
