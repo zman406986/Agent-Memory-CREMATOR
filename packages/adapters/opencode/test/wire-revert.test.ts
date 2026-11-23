@@ -1,4 +1,4 @@
-// The wire-level proof gate for `revertHistory` on 2.2.5 (ISSUE-192; ADR-0044;
+// The wire-level proof gate for `revertHistory` on 2.4.0 (ISSUE-192; ADR-0044;
 // ADR-0017; ISSUE-010). This file is the evidence that flips the flag, so every
 // assertion here is one of the six acceptance criteria, named:
 //
@@ -66,7 +66,7 @@ const RECEIPT_TEXT = '[not retained] NOTES.md · necromancy recall:sha256:ab'.co
 const BIG_BODY = `# Note\n\n${'body line\n'.repeat(1100)}`;
 
 /**
- * The wire fixture, shaped like a real 2.2.5 request: one prompt, one assistant
+ * The wire fixture, shaped like a real 2.4.0 request: one prompt, one assistant
  * step that read a file (the text part precedes the call, so no declaration
  * stand-in is needed), the result in its own `role: tool` message, a second
  * prompt and a closing answer.
@@ -196,7 +196,7 @@ function receiptText(message: OpencodeMessage): string {
     .join('');
 }
 
-/** One receipt message in the host's 2.2.5 shape. */
+/** One receipt message in the host's 2.4.0 shape. */
 function receiptMessage(
   intentId: string, index: number, noteId: string, textValue: string, forgotten: string,
 ): OpencodeMessage {

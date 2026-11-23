@@ -1,4 +1,4 @@
-// Port gate for the 2.2.5 message model (ISSUE-192; ADR-0015; ADR-0044). The
+// Port gate for the 2.4.0 message model (ISSUE-192; ADR-0015; ADR-0044). The
 // port is record-only: with the shipped flags `apply` refuses every mode and
 // never touches the request messages, and an unseen intent answers `unknown`
 // rather than `not-applied`.

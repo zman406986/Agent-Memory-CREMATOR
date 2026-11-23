@@ -17,7 +17,7 @@ import {
   toolMessage, toolResult, userMessage,
 } from './fixtures.js';
 
-/** One large tableable read and one tiny read, in the shipped 2.2.5 shape. */
+/** One large tableable read and one tiny read, in the shipped 2.4.0 shape. */
 function largeMessages(): OpencodeMessage[] {
   return [
     userMessage('msg_u1', [text('Read the note.')]),

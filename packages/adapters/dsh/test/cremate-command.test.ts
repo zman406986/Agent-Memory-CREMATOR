@@ -1,11 +1,12 @@
 /**
  * The `/cremate` host command and the dsh bundle manifest (ADR-0068,
- * ISSUE-526).
+ * ISSUE-526, ISSUE-535).
  *
- * The command factory is pure; the mount's request marker is tested directly;
- * plugin apply is tested with a stub context that carries the host command
- * registry. The manifest test pins the shipped bundle route so a later edit
- * cannot silently drop it.
+ * The command factory is pure: the handler records its request, opens the
+ * marker turn, and reports the pass that turn settles. The mount's typed
+ * request marker is tested directly; plugin apply is tested with a stub
+ * context that carries the host command registry. The manifest test pins the
+ * shipped bundle route so a later edit cannot silently drop it.
  */
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -13,99 +14,136 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  CREMATE_COMMAND_CARD_TEXT, CREMATE_COMMAND_DESCRIPTION, CREMATE_COMMAND_NAME,
-  CREMATE_NO_SESSION, createCremateCommand,
+  CREMATE_COMMAND_DESCRIPTION, CREMATE_COMMAND_NAME, CREMATE_FAILED_PREFIX,
+  CREMATE_MESSAGE_SOURCE, CREMATE_NO_SESSION, createCremateCommand,
 } from '../src/cremate-command.js';
-import type { DshCommand } from '../src/cremate-command.js';
+import type { CrematePassResult, CremateWait, DshCommand } from '../src/cremate-command.js';
 import {
   createRacoonsMount, createRacoonsPlugin, resolvePluginConfig, resolveStorage,
 } from '../src/plugin.js';
 import type { DshMountContext, DshMountSession } from '../src/plugin.js';
 
-/** The session slice a command handler receives; only `id` and `append` are used. */
+/** The session slice a command handler receives; only `id` and `seq` are used. */
 function fakeSession(id: string, seq?: number): DshMountSession {
   return {
     id,
     ...(seq === undefined ? {} : { seq }),
-    append: () => ({ type: 'test', seq: 0 }),
   } as unknown as DshMountSession;
 }
 
-test('the /cremate command names itself and opens one /cremate turn', async () => {
-  const requests: { sessionId: string; seq: number | undefined }[] = [];
+/** A wait the test resolves by hand. */
+function deferredWait(): { wait: CremateWait; settle(result: CrematePassResult): void } {
+  let resolveResult!: (result: CrematePassResult) => void;
+  return {
+    wait: {
+      result: new Promise<CrematePassResult>((resolve) => { resolveResult = resolve; }),
+      abandon: () => {},
+    },
+    settle(next) { resolveResult(next); },
+  };
+}
+
+/** Let the handler's microtasks run without moving the clock. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => { setImmediate(resolve); });
+}
+
+test('the /cremate command opens one marker turn and returns the awaited pass card', async () => {
+  const hand = deferredWait();
+  const begins: { sessionId: string; messageId: string; commandId: string | undefined }[] = [];
   const followups: unknown[] = [];
   const command = createCremateCommand({
-    request: (sessionId, seq) => { requests.push({ sessionId, seq }); },
+    begin: (sessionId, messageId, commandId) => {
+      begins.push({ sessionId, messageId, commandId });
+      return hand.wait;
+    },
+    cancel: () => {},
   });
   assert.equal(command.name, CREMATE_COMMAND_NAME);
   assert.equal(command.name, 'cremate');
   assert.equal(command.description, CREMATE_COMMAND_DESCRIPTION);
   assert.equal(typeof command.handler, 'function');
 
-  const result = await command.handler({
+  let done = false;
+  const pending = Promise.resolve(command.handler({
+    commandId: 'command-1',
     agent: {
       session: fakeSession('session-command-1', 11),
       followup: (message) => { followups.push(message); },
     },
-  });
-  assert.deepEqual(result, { kind: 'success', text: CREMATE_COMMAND_CARD_TEXT });
-  assert.deepEqual(requests, [{ sessionId: 'session-command-1', seq: 11 }]);
+  })).finally(() => { done = true; });
+  await flush();
+  assert.equal(done, false, 'the card waits for the pass');
+  hand.settle({ status: 'finished', removed: 2 });
+  assert.deepEqual(await pending,
+    { kind: 'success', text: 'Cremation finished; 2 results removed.' });
+
+  assert.equal(begins.length, 1);
+  assert.equal(begins[0]?.sessionId, 'session-command-1');
+  assert.equal(begins[0]?.commandId, 'command-1');
   assert.equal(followups.length, 1, 'one turn is opened');
   const message = followups[0] as {
-    role?: string; source?: { kind?: string }; content?: { type?: string; text?: string }[];
+    id?: string; role?: string; content?: { type?: string; text?: string }[];
+    source?: { kind?: string; commandId?: string };
   };
+  assert.equal(message.id, begins[0]?.messageId, 'the turn carries the request\'s marker id');
   assert.equal(message.role, 'user');
-  assert.equal(message.source?.kind, 'user');
-  assert.deepEqual(message.content, [{ type: 'text', text: '/cremate' }],
-    'the turn carries the same text the typed trigger uses');
+  assert.equal(message.source?.kind, CREMATE_MESSAGE_SOURCE,
+    'the marker is CREMATOR-attributed, not a typed /cremate message');
+  assert.equal(message.source?.commandId, 'command-1',
+    'the marker names the command, as native compaction names sourceCommandId');
+  assert.notEqual(message.content?.[0]?.text, '/cremate',
+    'the typed /cremate trigger must never see this message');
+});
+
+test('a failed or empty pass becomes its named card', async () => {
+  const rows: { pass: CrematePassResult; card: { kind: string; text: string } }[] = [
+    { pass: { status: 'finished', removed: 0 },
+      card: { kind: 'success', text: 'Cremation finished; nothing removed.' } },
+    { pass: { status: 'failed', message: 'prune ask refused: no-llm-service' },
+      card: { kind: 'error',
+        text: `${CREMATE_FAILED_PREFIX}prune ask refused: no-llm-service` } },
+  ];
+  for (const row of rows) {
+    const hand = deferredWait();
+    hand.settle(row.pass);
+    const command = createCremateCommand({
+      begin: () => hand.wait,
+      cancel: () => {},
+    });
+    assert.deepEqual(await command.handler({
+      agent: { session: fakeSession('session-command-2'), followup: () => {} },
+    }), row.card);
+  }
 });
 
 test('the /cremate command refuses an invocation with no live session', async () => {
-  let called = false;
-  const command = createCremateCommand({ request: () => { called = true; } });
-  const result = await command.handler({});
-  assert.deepEqual(result, { kind: 'error', text: CREMATE_NO_SESSION });
-  assert.equal(called, false, 'no request is recorded without a session');
+  let begun = false;
+  const command = createCremateCommand({
+    begin: () => { begun = true; return deferredWait().wait; },
+    cancel: () => {},
+  });
+  assert.deepEqual(await command.handler({}), { kind: 'error', text: CREMATE_NO_SESSION });
+  assert.equal(begun, false, 'no request is recorded without a session');
 });
 
-test('a throwing followup never loses the recorded request', async () => {
-  const requests: string[] = [];
+test('a throwing followup returns a named error card and cancels the request', async () => {
+  const hand = deferredWait();
+  const cancels: { sessionId: string; messageId: string; message: string }[] = [];
+  let started = '';
   const command = createCremateCommand({
-    request: (sessionId) => { requests.push(sessionId); },
+    begin: (_sessionId, messageId) => { started = messageId; return hand.wait; },
+    cancel: (sessionId, messageId, message) => { cancels.push({ sessionId, messageId, message }); },
   });
-  const result = await command.handler({
+  assert.deepEqual(await command.handler({
     agent: {
-      session: fakeSession('session-command-2'),
+      session: fakeSession('session-command-3'),
       followup: () => { throw new Error('host followup failed'); },
     },
-  });
-  assert.equal(result.kind, 'success');
-  assert.deepEqual(requests, ['session-command-2']);
-});
-
-test('a command with a run callback executes the pass directly', async () => {
-  let ran: DshMountSession | undefined;
-  const command = createCremateCommand({
-    request: () => { throw new Error('the queue path must not run'); },
-    run: async (session) => {
-      ran = session;
-      return { kind: 'success', text: 'Cremation finished; 2 results removed.' };
-    },
-  });
-  const session = fakeSession('session-command-5', 5);
-  const result = await command.handler({ agent: { session } });
-  assert.deepEqual(result, { kind: 'success', text: 'Cremation finished; 2 results removed.' });
-  assert.equal(ran?.id, 'session-command-5');
-});
-
-test('a throwing direct run returns an error card', async () => {
-  const command = createCremateCommand({
-    request: () => {},
-    run: async () => { throw new Error('prune failed'); },
-  });
-  const result = await command.handler({ agent: { session: fakeSession('session-command-6') } });
-  assert.equal(result.kind, 'error');
-  assert.match(result.text, /prune failed/u);
+  }), { kind: 'error',
+    text: `${CREMATE_FAILED_PREFIX}could not open the cremation turn: host followup failed` });
+  assert.deepEqual(cancels, [{ sessionId: 'session-command-3', messageId: started,
+    message: 'could not open the cremation turn: host followup failed' }]);
 });
 
 test('the mount records one prune request per session, however it arrives', async () => {
@@ -116,12 +154,12 @@ test('the mount records one prune request per session, however it arrives', asyn
     journal: (record) => { records.push(record); },
   });
   try {
-    mount.requestPrune('session-command-3', 3);
-    mount.requestPrune('session-command-3', 4);
+    mount.requestPrune('session-command-4', 3);
+    mount.requestPrune('session-command-4', 4);
     const requests = records.filter(record => record.kind === 'prune-requested');
     assert.equal(requests.length, 1, 'a second request for a waiting session is a no-op');
-    assert.equal(requests[0]?.['sessionId'], 'session-command-3');
-    mount.requestPrune('session-command-4', 5);
+    assert.equal(requests[0]?.['sessionId'], 'session-command-4');
+    mount.requestPrune('session-command-5', 5);
     assert.equal(records.filter(record => record.kind === 'prune-requested').length, 2,
       'a different session is its own request');
   } finally {
@@ -171,7 +209,7 @@ test('the package ships a dsh bundle patch that inserts the mount', () => {
     'the patch ships with the package');
 
   const patchUrl = new URL('../cordis.patch.yml', import.meta.url);
-  assert.ok(existsSync(patchUrl), 'the declared patch file exists');
+  assert.ok(existsSync(patchUrl), 'the declared patch exists');
   const patch = readFileSync(patchUrl, 'utf8');
   assert.match(patch, /id:\s*cremator\b/);
   assert.match(patch, /name:\s*'cremator-dsh\/plugin'/);

@@ -1,7 +1,7 @@
 /**
  * The additive tool surface (ISSUE-192; plan §2, §7 C5; ISSUE-300 item 19).
  *
- * 2.2.5 registers a tool through `context.tool.transform(editor => editor.add({
+ * 2.4.0 registers a tool through `context.tool.transform(editor => editor.add({
  * name, description, input, output?, execute }))`. `input` is JSON Schema
  * (`Tool.ValueSchema` accepts a plain JsonSchema object), so the adapter's
  * existing `ToolSpec.parameters` is passed through and no schema library is
@@ -188,7 +188,7 @@ function recallIdArg(input: unknown): RecallId {
 }
 
 /**
- * The one tool 2.2.5's editor receives. `execute` returns `{content}`: the host
+ * The one tool 2.4.0's editor receives. `execute` returns `{content}`: the host
  * wraps it into the model's tool result, and a record that failed its id check
  * never reaches the model. An unknown or malformed id surfaces as a rejection
  * (the ledger's `not-found`, or the id check above), never as fabricated text.

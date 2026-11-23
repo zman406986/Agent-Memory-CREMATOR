@@ -1,7 +1,7 @@
-// Shared fixtures for the 2.2.5 suite (ISSUE-192). Host-shaped messages are
+// Shared fixtures for the 2.4.0 suite (ISSUE-192). Host-shaped messages are
 // built here rather than in each test so a shape is stated once; the replay
 // corpus is read from `fixtures/replay-messages.json`, which records a
-// 2.2.5-shaped request with every body replaced by a placeholder.
+// 2.4.0-shaped request with every body replaced by a placeholder.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';

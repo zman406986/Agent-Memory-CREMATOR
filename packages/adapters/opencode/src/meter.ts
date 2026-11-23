@@ -1,10 +1,10 @@
 /**
- * Step usage → the core's reconciliation row (ISSUE-192; 2.2.5 seam map).
+ * Step usage → the core's reconciliation row (ISSUE-192; 2.4.0 seam map).
  *
  * The host has exactly one per-request place where an authoritative count exists:
  * the `session.step.ended` event. Its `data` carries `{sessionID,
  * assistantMessageID, finish, cost, tokens}` and `tokens` is
- * `{input, output, reasoning, cache: {read, write}}` (`@opencode/schema@2.2.5`
+ * `{input, output, reasoning, cache: {read, write}}` (`@opencode/schema@2.4.0`
  * `dist/event-manifest.d.ts`, `session.step.ended`; `TokenUsage.Info` has the
  * same shape). This module maps that event onto the core's `ApiUsage` and
  * nothing else; when the mount hands the value to `engine.observe` is the
@@ -147,7 +147,7 @@ export const ASK_STEP_REQUEST_KINDS: readonly string[] = Object.freeze(['ask', '
 
 /**
  * The request kind a `session.step.ended` row names, when the host states one.
- * 2.2.5's declared payload has no kind field, so this reads the open shape (and
+ * 2.4.0's declared payload has no kind field, so this reads the open shape (and
  * the open `native` bag) without assuming it exists: an absent or unknown value
  * is `null`, which is a main request. A host that does not state a kind gets the
  * old accounting; a host that does state `generate`/`ask` gets the filter.
@@ -174,11 +174,11 @@ export function stepRequestKindOf(data: unknown): string | null {
 }
 
 /**
- * The request kinds this mount accounts, declared once. 2.2.5's
+ * The request kinds this mount accounts, declared once. 2.4.0's
  * `session.step.ended` payload does not declare a kind field; the mount reads
  * the open shape defensively and journals what it read. A host that states
  * `ask`/`generate` gets the ask filter; a host that states nothing is accounted
- * as a main turn (the shipped 2.2.5 shape), and the journal line says
+ * as a main turn (the shipped 2.4.0 shape), and the journal line says
  * `requestKind: 'unstated'` so the assumption is visible rather than implied
  * (ISSUE-300 item 16). The one exception is the mount's own nested ask: while
  * an ask is in flight, an unstated row is the ask lane's and never consumes a

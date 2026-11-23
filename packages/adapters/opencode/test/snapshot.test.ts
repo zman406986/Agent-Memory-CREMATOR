@@ -1,4 +1,4 @@
-// Snapshot gate for the 2.2.5 message model (ISSUE-192; ADR-0044):
+// Snapshot gate for the 2.4.0 message model (ISSUE-192; ADR-0044):
 // host `Message[]` → core `SessionSnapshot`.
 //
 // Table 1 owns identity, units and ordering: which host id (or position) becomes
@@ -6,7 +6,7 @@
 // become one unit, and how turn and step advance. Table 2 owns content: what each
 // content part becomes — bytes on a node, or evidence attached to its neighbour.
 // Table 3 owns the revision. The corpus stays its own test, because its claim is
-// total accounting of a 2.2.5-shaped request rather than one shape.
+// total accounting of a 2.4.0-shaped request rather than one shape.
 //
 // Every assertion names its row, so a red run says which shape broke.
 

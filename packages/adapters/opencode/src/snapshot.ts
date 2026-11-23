@@ -1,5 +1,5 @@
 /**
- * Snapshot derivation: the 2.2.5 request's `Message[]` → core `SessionSnapshot`
+ * Snapshot derivation: the 2.4.0 request's `Message[]` → core `SessionSnapshot`
  * (ISSUE-192; ADR-0044).
  *
  * The host rebuilds the request before every model call and hands the `context`
@@ -24,9 +24,9 @@
  *     every unit one line and made a partial `keeplines` unaddressable
  *     (ISSUE-509). The call id names the node, not the bytes, so identical
  *     result texts hash identically. The call and result are one unit even
- *     though 2.2.5 puts them in two content parts (usually two messages);
+ *     though 2.4.0 puts them in two content parts (usually two messages);
  *   - a `tool-call` part with no result → no node; attached as evidence on the
- *     nearest node. 2.2.5 has no `pending`/`running` state, so "no result yet"
+ *     nearest node. 2.4.0 has no `pending`/`running` state, so "no result yet"
  *     is the only not-finished fact;
  *   - a `tool-result` part whose call is absent → one `ToolResultNode` at its own
  *     position, bytes = the same decoded result text (no call id and no input: no

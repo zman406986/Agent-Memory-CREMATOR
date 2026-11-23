@@ -41,7 +41,7 @@ import {
 } from './fixtures.js';
 import type { Row } from './rows.js';
 import { runRows } from './rows.js';
-// The host's own pre-send normalizer (`@opencode/ai` 2.2.5, `dist/tool-history.js`).
+// The host's own pre-send normalizer (`@opencode/ai` 2.4.0, `dist/tool-history.js`).
 // `normalizeToolHistory` returns the request BY IDENTITY when it rewrites nothing,
 // which is the mock proof that the derived request is one the host would send.
 // Imported by path because the package's exports map does not publish it.

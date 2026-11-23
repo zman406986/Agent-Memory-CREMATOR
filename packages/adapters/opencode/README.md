@@ -1,6 +1,6 @@
 # cremator-opencode
 
-CREMATOR adapter for the [OpenCode](https://opencode.ai) 2.2.5 harness. Thin seam mapping, no
+CREMATOR adapter for the [OpenCode](https://opencode.ai) 2.4.0 harness. Thin seam mapping, no
 policy: it maps OpenCode's request `Message[]` onto the public seams of `@cremator/core` and
 applies what the core guard approved. Every removal is recorded in the trash ledger under a
 recall id. CREMATOR never summarizes.
@@ -9,8 +9,9 @@ recall id. CREMATOR never summarizes.
 in this package drives a duck-typed fake host: no OpenCode binary, no API key, no live call. Live
 2.2.5 runs are recorded in ISSUE-255 and ISSUE-256. No citable claim rests on them; a clean rerun is
 queued after the fixes. The package targets the installed
-`@opencode/cli` 2.2.5 family; the type-only devDependencies are `@opencode/plugin@2.2.5`,
-`@opencode/ai@2.2.5` and `@opencode/schema@2.2.5`. A version change is a new verification, not a
+`@opencode/cli` 2.4.0 family; the type-only devDependencies are `@opencode/plugin@2.4.0`,
+`@opencode/ai@2.4.0` and `@opencode/schema@2.4.0`. The 2.4.0 target is covered by the offline
+suite and typecheck; a live 2.4.0 run is pending. A version change is a new verification, not a
 drop-in test (ADR-0017 §4; ISSUE-192).
 
 ## Live-run warning
@@ -118,7 +119,7 @@ package writes no config. `compaction.auto` stays at its default `true` (ADR-004
 
 ### Subagent tool off for a test harness
 
-2.2.5 offers the subagent tool as `subagent` (the built-in `opencode.tool.subagent`; the
+2.4.0 offers the subagent tool as `subagent` (the built-in `opencode.tool.subagent`; the
 legacy name `task` is a display/permission alias the host normalizes). The host's `tool.use` policy stops a call at permission time but still offers the tool; to
 leave it out of the request, add the name to `excludeTools`:
 
@@ -145,7 +146,7 @@ arguments are part of the answer; for a text or reasoning part they are that par
 The id is verified against the ledger's manifest-derived id; invalid UTF-8 throws instead of
 substituting. `forget` ships as a declared spec only and is never registered. The tool is
 registered through `context.tool.transform` with the JSON Schema from the spec, so no schema
-library is imported. It carries `options.codemode: false`: 2.2.5 offers only tools with that exact
+library is imported. It carries `options.codemode: false`: 2.4.0 offers only tools with that exact
 flag as their own entries in a request's tool table, and folds every other registered tool into
 the code-mode catalog behind its `execute` tool.
 

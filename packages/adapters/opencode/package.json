@@ -4,7 +4,7 @@
   "private": false,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "CREMATOR adapter for the OpenCode 2.2.5 harness. Thin seam mapping, no policy.",
+  "description": "CREMATOR adapter for the OpenCode 2.4.0 harness. Thin seam mapping, no policy.",
   "keywords": [
     "context-management",
     "context-window",
@@ -41,10 +41,17 @@
     "./plugin": {
       "types": "./dist/plugin.d.ts",
       "default": "./dist/plugin.js"
+    },
+    "./tui": {
+      "default": "./ui/tui.js"
+    },
+    "./gui-experimental": {
+      "default": "./ui/gui-experimental.cjs"
     }
   },
   "files": [
     "dist",
+    "ui",
     "README.md",
     "LICENSE"
   ],
@@ -64,8 +71,8 @@
     "@cremator/core": "^0.1.0"
   },
   "devDependencies": {
-    "@opencode/ai": "2.2.5",
-    "@opencode/plugin": "2.2.5",
-    "@opencode/schema": "2.2.5"
+    "@opencode/ai": "2.4.0",
+    "@opencode/plugin": "2.4.0",
+    "@opencode/schema": "2.4.0"
   }
 }

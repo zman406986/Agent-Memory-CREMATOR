@@ -90,9 +90,14 @@ mount's flat knobs:
 ### The `/cremate` command
 
 When the host exposes its command registry (`commands`), the mount registers `cremate`; the slash
-menu lists `/cremate`. The registered command runs the pass directly and awaits it; the command card
-reports the result. A typed `/cremate` message keeps the queued path: it marks the request and opens a
-`/cremate` turn, so the next `agent/pre-step` runs the pass.
+menu lists `/cremate`. The command card reports the pass directly: the handler registers the
+request for a CREMATOR marker message, opens that marker turn through `agent.followup`, and awaits
+the pass the turn's `agent/pre-step` runs inside the open turn. The marker step is then rejected,
+so the model sees no `/cremate` message and the turn sends no request; the marker carries the
+command's id as `source.commandId`. The pass must run inside a turn because the host's session log
+accepts a tool-result surface replacement only with an open turn; running it from the handler
+corrupts the stored session (ISSUE-535). A typed `/cremate` message keeps its queued path: it marks
+the session and the next `agent/pre-step` runs the pass.
 
 Defaults that matter: `barBytes` 512 (ADR-0051), `enforcement` `apply` (ADR-0008; `record-only` is
 the explicit opt-out), `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall` (ADR-0056), and

@@ -1,5 +1,5 @@
 /**
- * The OpenCode 2.2.5 mount entry: the racoons engine, the port, the recall tool
+ * The OpenCode 2.4.0 mount entry: the racoons engine, the port, the recall tool
  * and the step meter wired onto the hooks the host exposes (ISSUE-192;
  * ADR-0044; ADR-0017).
  *
@@ -82,7 +82,7 @@
  * `context.options`. No config is written by this package and none disables
  * `compaction.auto` (ADR-0043).
  *
- * **Subagent off for a test harness.** 2.2.5 offers the subagent tool as
+ * **Subagent off for a test harness.** 2.4.0 offers the subagent tool as
  * `subagent` (the built-in `opencode.tool.subagent`; the legacy name `task` is a
  * display/permission alias the host normalizes). A `tool.use` deny policy stops
  * calls but still offers the tool; the mount's `excludeTools` option deletes the
@@ -155,11 +155,12 @@ import type { OpencodeStorageOptions, StorageSelection, StorageTarget } from './
 import {
   OPENCODE_RECALL_TOOL_NAME, createOpencodeForgetTool, createOpencodeTool,
 } from './tools.js';
+import { CREMATE_RPC_DEFINITION } from './cremate-rpc.js';
 
 /** Stable plugin identity a host log line can name. */
 export const OPENCODE_PLUGIN_NAME = 'cremator-opencode';
 
-/** The name 2.2.5 gives the subagent tool (the built-in `opencode.tool.subagent`). */
+/** The name 2.4.0 gives the subagent tool (the built-in `opencode.tool.subagent`). */
 export const OPENCODE_SUBAGENT_TOOL = 'subagent';
 
 /**
@@ -683,7 +684,7 @@ export interface OpencodeSessionEntry {
   /**
    * True once this session saw a step row for the ask lane — a declared
    * `ask`/`generate` kind, or an unstated row during a live ask (ISSUE-357).
-   * Vanilla 2.2.5 emits no generate step row, so it stays false there and the
+   * Vanilla 2.4.0 emits no generate step row, so it stays false there and the
    * ISSUE-396 abandoned-call guard never touches main accounting; a host that
    * emits ask rows opens the guard for its timed-out calls' late rows.
    */
@@ -1268,7 +1269,7 @@ function recallIdsByForgottenNode(
 }
 
 /**
- * The provider/model one request was built for (ISSUE-432), read from 2.2.5's
+ * The provider/model one request was built for (ISSUE-432), read from 2.4.0's
  * `Model.Ref` (`{id, providerID, variant?}`) on the context hook. A field is
  * null when the host named no value; it is never a guessed substitution.
  */
@@ -1309,7 +1310,7 @@ export interface OpencodeMountOptions {
   readonly pruneThresholdTokens?: number | null;
   /**
    * The context window the host declares for a model (ISSUE-432), read from
-   * 2.2.5's `context.model` catalog by `createOpencodePlugin`. It is used only
+   * 2.4.0's `context.model` catalog by `createOpencodePlugin`. It is used only
    * to name the window a mid-session switch would need; the configured window
    * above is never overridden.
    */
@@ -1327,7 +1328,7 @@ export interface OpencodeMountOptions {
    */
   readonly askGrammar?: OpencodeAskGrammar;
   /**
-   * The host seam the ask calls: 2.2.5's `session.generate`. Required when
+   * The host seam the ask calls: 2.4.0's `session.generate`. Required when
    * `askGrammar` is set; `createOpencodePlugin` supplies the host's own method
    * after checking it exists.
    */
@@ -1856,7 +1857,7 @@ function dedupeClassesOf(value: unknown): DedupeClasses | null {
 
 /**
  * The provider/model a context hook named, or null when it named none this
- * build can read (ISSUE-432). 2.2.5's `Model.Ref` is `{id, providerID,
+ * build can read (ISSUE-432). 2.4.0's `Model.Ref` is `{id, providerID,
  * variant?}`; any other shape leaves the provenance unset rather than being
  * guessed at, so the mount never stamps a model it did not read.
  */
@@ -2581,7 +2582,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
      * request's estimate with the generate step's tokens. The row is recorded
      * as unmeasured for this lane and the estimate stays queued.
      *
-     * Vanilla opencode 2.2.5 declares no kind, so the nested ask's row reads
+     * Vanilla opencode 2.4.0 declares no kind, so the nested ask's row reads
      * `unstated` (ISSUE-357). The mount's own in-flight ask is the fact that
      * identifies it: while `askInFlight` holds, an unstated row is the ask
      * lane's, never a main turn. A timed-out ask's abandoned call is the same
@@ -4256,7 +4257,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     }
     /**
      * ISSUE-496: the host's undo rewrites its store without a compaction event
-     * (2.2.5 registers `session.revert.staged`, `.cleared` and `.committed`
+     * (2.4.0 registers `session.revert.staged`, `.cleared` and `.committed`
      * beside `session.compaction.*`). The redone turn reuses the undone turn's
      * ordinal, so the pre-undo idle's turn-end fact would clamp up to the LIVE
      * turn and let the closed-episode lane evict that turn's miss bodies. A
@@ -4624,7 +4625,7 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           } catch { /* a journal sink must never change an outcome */ }
         }
         /**
-         * The manual `/cremate` command (2.2.5's `Context.command`, the seam the
+         * The manual `/cremate` command (2.4.0's `Context.command`, the seam the
          * audit named as unused). It runs the mount's same table pass on demand.
          * A host without the seam still mounts; a throwing registration is
          * journalled and leaves the hooks working.
@@ -4657,6 +4658,45 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           try {
             emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
               status: 'absent', reason: 'no-command-seam', name: OPENCODE_PRUNE_COMMAND }));
+          } catch { /* a journal sink must never change an outcome */ }
+        }
+        /**
+         * The server-wide door the menu parts use. A command registered through
+         * `context.command.transform` belongs to the server's own location; a
+         * session opened in another folder has an empty command list, so
+         * `session.command` answers `command not found`. The RPC service is not
+         * location-scoped; the handler runs the same manual pass.
+         */
+        if (context.rpc !== undefined) {
+          try {
+            await context.rpc.register(CREMATE_RPC_DEFINITION, {
+              cremate: async (input: unknown) => {
+                if (mount.disposed) return { ok: false };
+                const id = isRecord(input) && typeof input['sessionID'] === 'string'
+                  ? input['sessionID'] : '';
+                if (id === '') return { ok: false };
+                try {
+                  return { ok: true, fired: await mount.cremate(id) };
+                } catch {
+                  return { ok: false };
+                }
+              },
+            });
+            try {
+              emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
+                status: 'registered', name: 'cremate-rpc' }));
+            } catch { /* a journal sink must never change an outcome */ }
+          } catch (error) {
+            try {
+              emit(Object.freeze({ kind: 'command-error', atMs: Date.now(),
+                reason: 'rpc-register-failed',
+                message: error instanceof Error ? error.message : String(error) }));
+            } catch { /* a journal sink must never change an outcome */ }
+          }
+        } else {
+          try {
+            emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
+              status: 'absent', reason: 'no-rpc-seam', name: 'cremate-rpc' }));
           } catch { /* a journal sink must never change an outcome */ }
         }
         /**

@@ -1,4 +1,4 @@
-// Meter gate for the 2.2.5 event seam (ISSUE-192; plan §2.4; ADR-0044).
+// Meter gate for the 2.4.0 event seam (ISSUE-192; plan §2.4; ADR-0044).
 //
 // The one number this suite pins is the one that turns a warm call from a throw
 // into a reading: the host's `input` is already net of cache, so
@@ -31,7 +31,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** A `session.step.ended` data payload exactly as 2.2.5 declares it. */
+/** A `session.step.ended` data payload exactly as 2.4.0 declares it. */
 function stepEnded(
   assistantMessageID: string | undefined,
   tokens: Record<string, unknown> | undefined,

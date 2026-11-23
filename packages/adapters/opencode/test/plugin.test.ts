@@ -1,4 +1,4 @@
-// Mount gate for the 2.2.5 seams (ISSUE-192; plan §2; ADR-0017; ADR-0043).
+// Mount gate for the 2.4.0 seams (ISSUE-192; plan §2; ADR-0017; ADR-0043).
 //
 // The mount's whole job is the seam wiring, so every test here drives the hooks
 // the way the host does — a context hook over the request's own messages, an
@@ -138,7 +138,7 @@ function removalRequest(
   };
 }
 
-/** The receipt message a plan rendered, in the host's 2.2.5 shape. */
+/** The receipt message a plan rendered, in the host's 2.4.0 shape. */
 function receiptMessageFor(
   intentId: string, noteId: string, text: string, forgottenNodeId: string,
 ): OpencodeMessage {
@@ -957,7 +957,7 @@ const ACCOUNTING_ROWS: readonly Row[] = [
         await mount.transform(sessionId, hostMessages());
         const estimate = mount.sessions.get(sessionId)?.pendingEstimates.at(-1);
         assert.ok(estimate !== null && estimate !== undefined, at('the mount made an estimate'));
-        // 2.2.5 declares no request-kind field. An absent kind is a main turn,
+        // 2.4.0 declares no request-kind field. An absent kind is a main turn,
         // never an ask: the row consumes the pending estimate and the journal
         // says the kind was unstated rather than implying it.
         await mount.event({ type: 'session.step.ended', data: {
@@ -2827,7 +2827,7 @@ test('after an ask pass the post-removal reading is the baseline; the next fire 
 });
 
 test('ISSUE-357: an unstated nested-ask row never consumes a main estimate', async () => {
-  // Vanilla opencode 2.2.5 declares no requestKind, so the nested ask's own
+  // Vanilla opencode 2.4.0 declares no requestKind, so the nested ask's own
   // step row reads `unstated`. The mount knows its own ask is in flight: that
   // row is the ask lane's and must not shift a pending main estimate nor
   // reconcile the ask's small counts into the main meter. The main rows arrive
@@ -2896,7 +2896,7 @@ test('ISSUE-396: a late row from a timed-out ask never pairs a main estimate', a
     const est1 = mount.sessions.get(sessionId)?.pendingEstimates[0];
     assert.ok(est1 !== null && est1 !== undefined, 'the first request was estimated');
     // A host that emits ask step rows: one declared generate row is the
-    // evidence that opens the abandoned-call guard. Vanilla 2.2.5 emits no
+    // evidence that opens the abandoned-call guard. Vanilla 2.4.0 emits no
     // generate step row, so its main accounting stays untouched.
     const declared = stepUsage('msg_ask_declared', 9);
     await mount.event({ type: declared.type,

@@ -1,11 +1,11 @@
 /**
- * The 2.2.5 plugin module a host loads from its `plugins` list (ISSUE-192;
+ * The 2.4.0 plugin module a host loads from its `plugins` list (ISSUE-192;
  * ADR-0017).
  *
- * OpenCode 2.2.5's loader reads a default export as one of two variants —
+ * OpenCode 2.4.0's loader reads a default export as one of two variants —
  * `{ id, setup(context) }` or `{ id, effect }` — and refuses anything else with
  * `Plugin must export a default definition with an id and an effect or setup
- * function.` (loader schema in the installed binary; `@opencode/plugin@2.2.5`
+ * function.` (loader schema in the installed binary; `@opencode/plugin@2.4.0`
  * `dist/promise/plugin.d.ts` `Plugin`). This module is the `setup` variant, and
  * `package.json` maps `./server` to it.
  *
@@ -25,7 +25,7 @@
 import { OPENCODE_PLUGIN_NAME, createOpencodePlugin } from './plugin.js';
 import type { OpencodePluginContext, OpencodePluginDefinition } from './host.js';
 
-/** The default export's shape, as the 2.2.5 loader reads it. */
+/** The default export's shape, as the 2.4.0 loader reads it. */
 export type OpencodeServerModule = OpencodePluginDefinition;
 
 /**

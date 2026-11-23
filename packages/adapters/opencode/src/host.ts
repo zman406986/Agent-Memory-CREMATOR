@@ -1,8 +1,8 @@
 /**
- * Duck-typed OpenCode 2.2.5 host shapes (ISSUE-192; ADR-0044).
+ * Duck-typed OpenCode 2.4.0 host shapes (ISSUE-192; ADR-0044).
  *
  * Zero imports. These interfaces copy the field names of
- * `@opencode/plugin@2.2.5` / `@opencode/ai@2.2.5` / `@opencode/schema@2.2.5`:
+ * `@opencode/plugin@2.4.0` / `@opencode/ai@2.4.0` / `@opencode/schema@2.4.0`:
  * the `context` hook's `SessionContext`, `Message { id?, role, content[] }`, the
  * `tool.transform` editor, `tool.hook('execute.after')`, the event stream and
  * step usage. The host packages stay devDependencies used by tests only; the
@@ -35,7 +35,7 @@ export interface OpencodeTokenUsage {
   readonly [field: string]: unknown;
 }
 
-/** The provider message roles 2.2.5 declares. */
+/** The provider message roles 2.4.0 declares. */
 export type OpencodeMessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
 /**
@@ -97,7 +97,7 @@ export interface OpencodeToolContentFile {
 
 export type OpencodeToolContent = OpencodeToolContentText | OpencodeToolContentFile;
 
-/** The tagged result value 2.2.5 puts on a `tool-result` part. */
+/** The tagged result value 2.4.0 puts on a `tool-result` part. */
 export type OpencodeToolResultValue =
   | { readonly type: 'json'; readonly value: unknown }
   | { readonly type: 'text'; readonly value: unknown }
@@ -129,7 +129,7 @@ export interface OpencodeEffortPart extends OpencodeContentPart {
 }
 
 /**
- * One request message. `id` is optional in 2.2.5; a message without one is keyed
+ * One request message. `id` is optional in 2.4.0; a message without one is keyed
  * by its position (ADR-0044 decision 1). `content` is mutable because the port's
  * `commit()` splices the caller's own array.
  */
@@ -178,13 +178,13 @@ export interface OpencodeToolResult {
 
 /**
  * The `options` a registered tool may carry (`Tool.Options` in
- * `@opencode/schema@2.2.5`).
+ * `@opencode/schema@2.4.0`).
  *
  * `codemode` is not cosmetic. When the agent may run code, the host offers only
  * tools whose `options.codemode` is exactly `false` as their own entries; every
  * other tool is folded into the single code-mode tool's catalog. A tool added
  * without this key is accepted by the editor and then never named in the
- * request (`Tool.snapshot` in the 2.2.5 binary).
+ * request (`Tool.snapshot` in the 2.4.0 binary).
  */
 export interface OpencodeToolOptions {
   readonly codemode?: boolean;
@@ -232,7 +232,7 @@ export interface OpencodeAfterToolInput {
 }
 
 /**
- * The kind a `session.step.ended` row may declare for its request. 2.2.5's
+ * The kind a `session.step.ended` row may declare for its request. 2.4.0's
  * declared payload states none; `generate`/`ask` are the names a host that
  * reports the transient lane uses, and the mount reads them defensively
  * (`meter.ts` `requestKindOf`) instead of assuming the field exists.
@@ -256,11 +256,11 @@ export interface OpencodeHostEvent {
 }
 
 /**
- * One transient generation request (`session.generate` in 2.2.5's promise API).
+ * One transient generation request (`session.generate` in 2.4.0's promise API).
  * It reads the active session context, appends `prompt`, makes one model
  * request and returns the reply text; it mutates no session history.
  *
- * 2.2.5 takes no `AbortSignal` here, so the mount cannot cancel the call. The
+ * 2.4.0 takes no `AbortSignal` here, so the mount cannot cancel the call. The
  * host-reachable cancellation seam is the event stream instead:
  * `session.execution.interrupted` with `{sessionID, reason}` (ISSUE-413). The
  * mount subscribes to it and stops waiting; the call itself is abandoned.
@@ -274,7 +274,7 @@ export interface OpencodeGenerateOutput {
   readonly text: string;
   /**
    * The provider's usage for this transient request, when the host reports one.
-   * 2.2.5's `session.generate` returns text only and prints no `step_finish`
+   * 2.4.0's `session.generate` returns text only and prints no `step_finish`
    * row, so this field is absent there; a host or a bench mock that states it
    * lets the mount journal the ask lane's own reading instead of leaving it
    * unmeasured. Shape: `TokenUsage.Info` (`input`, `output`, `reasoning`,
@@ -285,7 +285,7 @@ export interface OpencodeGenerateOutput {
 }
 
 /**
- * One manual command invocation (`context.command.execute` in 2.2.5). The host
+ * One manual command invocation (`context.command.execute` in 2.4.0). The host
  * names the live session; `prompt` and `delivery` are the host's own payload
  * and are never read by this adapter.
  */
@@ -308,7 +308,7 @@ export interface OpencodeCommandEditor {
 }
 
 /**
- * The optional command seam (`CommandDomain` in 2.2.5's promise API). A host
+ * The optional command seam (`CommandDomain` in 2.4.0's promise API). A host
  * that predates it simply has no `command` field; the mount then registers no
  * manual command and still mounts.
  */
@@ -319,7 +319,20 @@ export interface OpencodeCommandDomain {
 }
 
 /**
- * The `experimental.idle` hook's payload (`SessionIdle` in 2.2.5): the session
+ * The server-wide RPC seam (`Context.rpc` in 2.4.0). The menu parts call it
+ * because `context.command.transform` registers a command for the server's
+ * own location only; a session in another folder cannot see that command.
+ */
+export interface OpencodeRpcDomain {
+  register(
+    definition: Readonly<Record<string, unknown>>,
+    handlers: Readonly<Record<string,
+      (input: unknown, context: unknown) => Promise<unknown> | unknown>>,
+  ): Promise<unknown>;
+}
+
+/**
+ * The `experimental.idle` hook's payload (`SessionIdle` in 2.4.0): the session
  * about to go idle, and the background work still running. The host awaits the
  * hook inside its single drain before queued input runs (ADR-0062 D2). The
  * mount reads only `sessionID`; `background` stays open evidence.
@@ -330,14 +343,14 @@ export interface OpencodeIdleHookInput {
   readonly [field: string]: unknown;
 }
 
-/** The model-catalog slice this mount reads (`Model.Info` in 2.2.5). */
+/** The model-catalog slice this mount reads (`Model.Info` in 2.4.0). */
 export interface OpencodeModelInfo {
   readonly limit?: { readonly context?: number };
   readonly [field: string]: unknown;
 }
 
 /**
- * 2.2.5's model catalog seam (`Context.model`). The mount reads it only to name
+ * 2.4.0's model catalog seam (`Context.model`). The mount reads it only to name
  * the context window a newly selected model declares (ISSUE-432); it never
  * overrides a window the operator configured. Optional: a host that lacks it
  * mounts and still observes a switch.
@@ -347,7 +360,7 @@ export interface OpencodeModelCatalog {
 }
 
 /**
- * The part of the 2.2.5 setup context this adapter uses. Structural, so the
+ * The part of the 2.4.0 setup context this adapter uses. Structural, so the
  * real `Context` satisfies it without the adapter importing the host at runtime.
  *
  * `session.generate` is optional because it is only needed by the bench-only
@@ -362,7 +375,7 @@ export interface OpencodePluginContext {
       callback: (input: OpencodeSessionContext) => Promise<void> | void,
     ): Promise<unknown>;
     /**
-     * 2.2.5's awaited idle seam (`SessionHooks['experimental.idle']`). A host
+     * 2.4.0's awaited idle seam (`SessionHooks['experimental.idle']`). A host
      * that predates it refuses the registration; the mount then keeps the
      * `session.idle` event path for the idle-origin ask (ISSUE-373).
      */
@@ -370,7 +383,7 @@ export interface OpencodePluginContext {
       name: 'experimental.idle',
       callback: (input: OpencodeIdleHookInput) => Promise<void> | void,
     ): Promise<unknown>;
-    /** 2.2.5's transient generation seam; absent on a host that predates it. */
+    /** 2.4.0's transient generation seam; absent on a host that predates it. */
     generate?(
       input: OpencodeGenerateInput,
     ): Promise<OpencodeGenerateOutput>;
@@ -383,16 +396,22 @@ export interface OpencodePluginContext {
     ): Promise<unknown>;
   };
   /**
-   * The manual-command seam 2.2.5 exposes as `Context.command`. Optional: a
+   * The manual-command seam 2.4.0 exposes as `Context.command`. Optional: a
    * host that lacks it mounts without a `/cremate` command, and the mount says
    * so on the journal instead of failing every hook.
    */
   readonly command?: OpencodeCommandDomain;
   /**
-   * The model catalog 2.2.5 exposes as `Context.model` (ISSUE-432). Optional:
+   * The model catalog 2.4.0 exposes as `Context.model` (ISSUE-432). Optional:
    * a host that lacks it still mounts, and a switch is named without a window.
    */
   readonly model?: OpencodeModelCatalog;
+  /**
+   * The server-wide RPC seam 2.4.0 exposes as `Context.rpc`. The menu parts
+   * call it because a plugin command is scoped to the server's own location,
+   * while sessions opened in another folder get an empty command list.
+   */
+  readonly rpc?: OpencodeRpcDomain;
   readonly event: {
     subscribe(options?: { readonly types?: readonly string[] }): AsyncIterable<OpencodeHostEvent>;
   };
@@ -400,7 +419,7 @@ export interface OpencodePluginContext {
 
 export type OpencodeCleanup = () => Promise<void> | void;
 
-/** The default export 2.2.5's loader accepts. */
+/** The default export 2.4.0's loader accepts. */
 export interface OpencodePluginDefinition {
   readonly id: string;
   readonly setup: (context: OpencodePluginContext) => Promise<OpencodeCleanup>;

@@ -1,6 +1,6 @@
-// Recall-tool gate for the 2.2.5 editor seam (ISSUE-192; plan §7 C5).
+// Recall-tool gate for the 2.4.0 editor seam (ISSUE-192; plan §7 C5).
 //
-// 2.2.5 registers a tool through `context.tool.transform(editor => editor.add({
+// 2.4.0 registers a tool through `context.tool.transform(editor => editor.add({
 // name, description, input, output?, execute }))`; `input` is JSON Schema, not a
 // zod shape. This suite proves the adapter's declared JSON Schema is the schema
 // the host's `Tool.ValueSchema` accepts, that a record restores its exact banked
@@ -31,7 +31,7 @@ import type { OpencodeToolSources } from '../src/tools.js';
 import { runRows } from './rows.js';
 import type { Row } from './rows.js';
 
-// Type-only conformance with 2.2.5's own schema: the JSON Schema object the
+// Type-only conformance with 2.4.0's own schema: the JSON Schema object the
 // adapter builds is a value `Tool.ValueSchema` accepts, and the result the
 // execute returns is a `Tool.Result`. Nothing from the host is loaded at run
 // time; a host type that drifts on a pin bump fails `tsc` here.
@@ -164,7 +164,7 @@ const ROWS: readonly Row[] = [
     assert.deepEqual(Object.keys(tool.input['properties'] as Record<string, unknown>), ['id'],
       at('the schema names one id property'));
     assert.equal(tool.output, undefined, at('no output schema is claimed'));
-    // The value is one 2.2.5 accepts through Tool.ValueSchema.
+    // The value is one 2.4.0 accepts through Tool.ValueSchema.
     assert.doesNotThrow(() => hostSchemaAccepts(tool.input),
       at('the JSON Schema is accepted by the host type'));
   } },

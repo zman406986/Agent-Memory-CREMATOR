@@ -60,8 +60,9 @@ import { captureMainRequest, createMainWireCapture, seedRouteStale } from './mai
 import type { MainWireCapture } from './main-wire.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
-import { createCremateCommand } from './cremate-command.js';
-import type { DshCommandRegistry } from './cremate-command.js';
+import { createCremateCommand, cremateMarkerOf } from './cremate-command.js';
+import type { CrematePassResult, CremateWait, DshCommandRegistry }
+  from './cremate-command.js';
 import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
   readPruneRound, readPruneTriggerState, readTableAskFired,
   writeEntryAskFired, writePendingAppends,
@@ -855,25 +856,46 @@ export interface RacoonsMount {
   observe(session: DshMountSession, event: DshMountEvent): DshToolResultItem | null;
   /**
    * Record one manual prune request for a session; the next `agent/pre-step`
-   * runs it. The typed `/cremate` message and the registered host command
-   * (ADR-0068) both land here, so a command that opens its own `/cremate` turn
-   * journals one request, not two.
+   * runs it. The typed `/cremate` message lands here; the registered host
+   * command uses {@link beginCremate} instead, because its pass must run in the
+   * turn that claims its marker message (ISSUE-535).
    */
   requestPrune(sessionId: string, seq?: number): void;
   /**
-   * Record one request the host's `llm/stream` waterfall dispatched as main's
+   * Register the `/cremate` command's pass request for one marker message
+   * (ISSUE-535) and return the card's one-shot waiter. The request runs only at
+   * the `agent/pre-step` that claims `messageId`, inside that open turn; its
+   * waiter settles with that pass's outcome, or by name if the host cancels the
+   * request before the pass runs.
+   */
+  beginCremate(sessionId: string, messageId: string, commandId: string | undefined): CremateWait;
+  /** Bind a command request to the host turn that claimed its marker. */
+  claimCremate(sessionId: string, messageId: string, turn: number): void;
+  /** Drop one command request by name; its waiter reports the failure. */
+  cancelCremate(sessionId: string, messageId: string, message: string): void;
+  /**
+   * Fail every command request this session still holds (agent disposal,
+   * session eviction, mount close). Lifecycle failure only — no cap, no LRU,
+   * no timeout (standing rule 7 / ADR-0060).
+   */
+  abandonCremateWaits(sessionId: string, message: string): void;
+  /** Record one request the host's `llm/stream` waterfall dispatched as main's
    * last sent request for its session (ISSUE-026 chunk 3). A request this
    * package sent itself is ignored, so an ask never becomes a seed.
    */
   observeWire(options: unknown): void;
+  /**
+   * One step boundary. `cremateMessageId` names the command marker the host
+   * claimed for this step; the pass runs only inside such a step (ISSUE-535).
+   */
   runStep(session: DshMountSession, ordinals: { turn: number; step: number },
-    signal?: AbortSignal): Promise<StepOutcome>;
+    signal?: AbortSignal, cremateMessageId?: string): Promise<StepOutcome>;
   runTurnEnd(session: DshMountSession, turn: number): Promise<TurnEndOutcome>;
   /**
-   * Run one record-only prune pass now (ISSUE-022 chunk 5). The `/cremate`
-   * command reaches it from `runStep`, and a test or a rig may call it
-   * directly. Nothing is applied or archived; the only appends are the
-   * log-only command-card pair that shows the ask's status (ISSUE-372).
+   * Run one prune pass now (ISSUE-022 chunk 5). A test or a rig may call it
+   * directly; a step reaches the same pass through `runPrunePass`. With no
+   * window configured nothing is applied; the pass's appends are the surface
+   * writes the engine decides and the log-only ask card (ISSUE-372).
    */
   runPrune(session: DshMountSession, signal?: AbortSignal): Promise<RecordOnlyPruneOutcome | null>;
   /**
@@ -1758,14 +1780,131 @@ export function createRacoonsMount(options: {
    */
   const pruneRequests = new Set<string>();
   /**
-   * Record one manual prune request. The typed message and the registered
-   * `/cremate` command both call this; a second call for a session already
-   * waiting is a no-op, so the command's followup turn cannot journal twice.
+   * Record one typed `/cremate` message's request; the next `agent/pre-step`
+   * runs it. A second typed message for a session already waiting is a no-op.
+   * The registered command does not use this seam: its pass is scoped to the
+   * marker turn that runs it ({@link beginCremate}, ISSUE-535).
    */
   function requestPrune(sessionId: string, seq: number | undefined): void {
     if (pruneRequests.has(sessionId)) return;
     pruneRequests.add(sessionId);
     journal('prune-requested', { sessionId, seq });
+  }
+  /**
+   * The registered `/cremate` command's pass requests, by session and marker
+   * message id (ISSUE-535). A command handler runs outside a turn, so it cannot
+   * run the pass itself: the pass appends `tool/result` surface replacements,
+   * and the host's session format accepts those only inside an open turn. Each
+   * request therefore names the marker message whose `agent/pre-step` runs it,
+   * and owns the one-shot wait the command card awaits.
+   */
+  interface PruneWaitEntry {
+    done: boolean;
+    settle(result: CrematePassResult): void;
+  }
+  interface CremateRequest {
+    readonly messageId: string;
+    readonly commandId: string | undefined;
+    /** The host turn that claimed the marker; null until the claim. */
+    turn: number | null;
+    readonly waiters: PruneWaitEntry[];
+  }
+  const cremateRequests = new Map<string, Map<string, CremateRequest>>();
+
+  /** Register one command invocation's request and its awaited outcome. */
+  function beginCremate(sessionId: string, messageId: string,
+    commandId: string | undefined): CremateWait {
+    let resolveResult!: (result: CrematePassResult) => void;
+    const result = new Promise<CrematePassResult>((resolve) => { resolveResult = resolve; });
+    const entry: PruneWaitEntry = {
+      done: false,
+      settle(next) {
+        if (entry.done) return;
+        entry.done = true;
+        resolveResult(next);
+      },
+    };
+    const byMessage = cremateRequests.get(sessionId) ?? new Map<string, CremateRequest>();
+    const existing = byMessage.get(messageId);
+    if (existing === undefined) {
+      byMessage.set(messageId, { messageId, commandId, turn: null, waiters: [entry] });
+      cremateRequests.set(sessionId, byMessage);
+      journal('prune-requested', { sessionId, seq: undefined, source: 'command',
+        messageId, commandId });
+    } else {
+      // One invocation per message id; a repeat joins the same request.
+      existing.waiters.push(entry);
+    }
+    return {
+      result,
+      abandon: (message: string) => {
+        entry.settle({ status: 'failed', message });
+        // An abandoned card also drops its pending request, so the marker turn
+        // that follows runs no pass the card already reported as cancelled.
+        const pending = cremateRequests.get(sessionId);
+        const request = pending?.get(messageId);
+        if (request === undefined || !request.waiters.every(waiter => waiter.done)) return;
+        pending?.delete(messageId);
+        if (pending?.size === 0) cremateRequests.delete(sessionId);
+      },
+    };
+  }
+
+  /** Take one request for the pass that claimed its marker; the pass settles it. */
+  function takeCremate(sessionId: string, messageId: string): CremateRequest | undefined {
+    const byMessage = cremateRequests.get(sessionId);
+    const request = byMessage?.get(messageId);
+    if (byMessage === undefined || request === undefined) return undefined;
+    byMessage.delete(messageId);
+    if (byMessage.size === 0) cremateRequests.delete(sessionId);
+    return request;
+  }
+
+  /** Settle an already-taken request's waiters exactly once. */
+  function settleCremate(request: CremateRequest | undefined,
+    result: CrematePassResult): void {
+    if (request === undefined) return;
+    for (const waiter of request.waiters) waiter.settle(result);
+  }
+
+  /** Drop one command request: the host discarded its marker or the open failed. */
+  function cancelCremate(sessionId: string, messageId: string, message: string): void {
+    settleCremate(takeCremate(sessionId, messageId), { status: 'failed', message });
+  }
+
+  /** Bind a request to the turn that claimed its marker message. */
+  function claimCremate(sessionId: string, messageId: string, turn: number): void {
+    const request = cremateRequests.get(sessionId)?.get(messageId);
+    if (request !== undefined) request.turn = turn;
+  }
+
+  /**
+   * One turn ended. A request whose marker that turn claimed but whose pass
+   * never ran fails by name instead of leaving the card pending: a prior
+   * pre-step listener may have rejected the step (whereas this mount rejects
+   * the marker step only after running the pass).
+   */
+  function failCremateTurn(sessionId: string, turn: number): void {
+    const byMessage = cremateRequests.get(sessionId);
+    if (byMessage === undefined) return;
+    for (const request of [...byMessage.values()]) {
+      if (request.turn !== turn) continue;
+      cancelCremate(sessionId, request.messageId,
+        'the turn ended before the cremation pass ran');
+    }
+  }
+
+  /** Every request this session still holds fails: disposal, eviction, close. */
+  function abandonCremateWaits(sessionId: string, message: string): void {
+    const byMessage = cremateRequests.get(sessionId);
+    if (byMessage === undefined) return;
+    cremateRequests.delete(sessionId);
+    for (const request of byMessage.values()) settleCremate(request, { status: 'failed', message });
+  }
+
+  /** The request a marker names, if the host has not claimed its turn yet. */
+  function cremateRequestOf(sessionId: string, messageId: string): CremateRequest | undefined {
+    return cremateRequests.get(sessionId)?.get(messageId);
   }
   /**
    * Main's last dispatched request per session (ISSUE-026 chunk 3, ADR-0010).
@@ -2705,6 +2844,14 @@ export function createRacoonsMount(options: {
       const list = calls.get(session.id) ?? new Map<string, CallFacts>();
       list.set(data['callId'], { name: data['name'], arguments: data['arguments'] });
       calls.set(session.id, list);
+      return null;
+    }
+    // A turn closed. A `/cremate` command request whose marker that turn
+    // claimed but whose pass never ran fails by name here (ISSUE-535), so the
+    // card cannot wait on a turn that is already gone. A pass that ran already
+    // took and settled its request, so this is a no-op for it.
+    if (event.type === 'turn/end' && typeof data['turn'] === 'number') {
+      failCremateTurn(session.id, data['turn']);
       return null;
     }
     // The `/cremate` command (ISSUE-022 chunk 5; ADR-0068 adds the registered
@@ -3862,6 +4009,38 @@ export function createRacoonsMount(options: {
    */
   async function runPrune(session: DshMountSession,
     existing?: RacoonsSessionEntry, signal?: AbortSignal): Promise<RecordOnlyPruneOutcome | null> {
+    return (await runPrunePass(session, existing, signal)).outcome;
+  }
+
+  /**
+   * One pass plus the command-card outcome for it (ISSUE-535). A `/cremate`
+   * command's request is taken here, by marker message id, and its waiter is
+   * settled on every exit — finished with the applied removal count, or failed
+   * with the pass's own named failure — so the card can never outlive the pass.
+   */
+  async function runPrunePass(session: DshMountSession,
+    existing?: RacoonsSessionEntry, signal?: AbortSignal,
+    cremateMessageId?: string): Promise<{
+      readonly outcome: RecordOnlyPruneOutcome | null;
+      readonly result: CrematePassResult;
+    }> {
+    const cremate = cremateMessageId === undefined
+      ? undefined : takeCremate(session.id, cremateMessageId);
+    let passResult: CrematePassResult =
+      { status: 'failed', message: 'the prune pass did not settle' };
+    try {
+      const outcome = await runPruneOutcome(session, existing, signal,
+        (result) => { passResult = result; });
+      return { outcome, result: passResult };
+    } finally {
+      settleCremate(cremate, passResult);
+    }
+  }
+
+  /** The pass itself; `note` records its command-card outcome at every exit. */
+  async function runPruneOutcome(session: DshMountSession,
+    existing: RacoonsSessionEntry | undefined, signal: AbortSignal | undefined,
+    note: (result: CrematePassResult) => void): Promise<RecordOnlyPruneOutcome | null> {
     // Reached from `runStep` (which hands its own entry in, ISSUE-401/416) or
     // directly by a rig/test, where a retryable open surfaces as
     // `RacoonsStorageRetryError` to the caller — the same seam every other
@@ -3889,6 +4068,7 @@ export function createRacoonsMount(options: {
       if (standdown !== null) {
         journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
           reason: standdown });
+        note({ status: 'failed', message: `the pass stood down: ${standdown}` });
         return null;
       }
       card = openAskCard(session);
@@ -3951,6 +4131,7 @@ export function createRacoonsMount(options: {
         // No request left the seam for this pass: the card names the refusal,
         // never the ask's success text.
         cardText = { kind: 'error', text: `prune ask refused: ${outcome.refusedFor}` };
+        note({ status: 'failed', message: `prune ask refused: ${outcome.refusedFor}` });
       } else if (outcome.plan.askRows.length === 0) {
         // A pass with nothing to ask makes no model call. The card is still the
         // pass's visible trace, so it says exactly that (ISSUE-404).
@@ -3967,6 +4148,7 @@ export function createRacoonsMount(options: {
         journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
           reason: 'compaction-generation-changed', passGeneration,
           compactionGeneration: entry.compactionGeneration });
+        note({ status: 'failed', message: 'prune ask refused: compaction-generation-changed' });
         return null;
       }
       const applied = await applyPrunePass({ sessionId: entry.sessionId, engine: entry.engine,
@@ -3980,6 +4162,16 @@ export function createRacoonsMount(options: {
       if (applied !== null && applied.status === 'applied') {
         collectSettledReceipt(entry, applied.intentId);
       }
+      // The command card counts what the apply leg actually landed: a pass the
+      // engine skipped (no window, record-only, nothing planned) removed
+      // nothing, whatever the plan proposed.
+      if (outcome.refusedFor === null) {
+        note({
+          status: 'finished',
+          removed: applied !== null && applied.status === 'applied'
+            ? outcome.application?.removals.length ?? 0 : 0,
+        });
+      }
       if (outcome.refusedFor === null && outcome.plan.askRows.length > 0) {
         // The pass's own totals: rows still refused after the one re-ask, and
         // rows a halt left undecided (ISSUE-177 — a dead stream defers, it
@@ -3989,6 +4181,7 @@ export function createRacoonsMount(options: {
         cardText = unsettled > 0
           ? { kind: 'error', text: 'prune rows left undecided' }
           : { kind: 'success', text: 'prune ask settled' };
+        if (unsettled > 0) note({ status: 'failed', message: 'prune rows left undecided' });
       }
       // ISSUE-462: the card reads the APPLY result too, not the ask totals
       // alone. Planned removals the engine refused did not settle, so the
@@ -4000,6 +4193,7 @@ export function createRacoonsMount(options: {
           ? applied.validation.issues.map(issue => String(issue.code)) : [];
         cardText = { kind: 'error', text: `prune apply ${applied.status}`
           + (codes.length === 0 ? '' : `: ${codes.join(', ')}`) };
+        note({ status: 'failed', message: cardText.text });
       }
       return outcome;
     } catch (error) {
@@ -4010,6 +4204,7 @@ export function createRacoonsMount(options: {
       // ISSUE-404: an apply/host failure is the card's outcome, not a
       // success that hides the failed leg.
       cardText = { kind: 'error', text: `prune pass failed: ${messageOf(error)}` };
+      note({ status: 'failed', message: `prune pass failed: ${messageOf(error)}` });
       return null;
     } finally {
       // CRITIC-022 P1-1: a pass ends here whether it applied, refused or threw,
@@ -4305,7 +4500,8 @@ export function createRacoonsMount(options: {
    * the live session.
    */
   async function runStep(session: DshMountSession,
-    ordinals: { turn: number; step: number }, signal?: AbortSignal): Promise<StepOutcome> {
+    ordinals: { turn: number; step: number }, signal?: AbortSignal,
+    cremateMessageId?: string): Promise<StepOutcome> {
     // ISSUE-439: a mount whose install-identity write failed retries it at the
     // NEXT boundary, before any pass classifies the session (ADR-0065
     // Decision 4). The boundary that created the entry already attempted it.
@@ -4445,9 +4641,14 @@ export function createRacoonsMount(options: {
     // A `/cremate` message seen during this step runs here, after the at-rest
     // pass: that pass leaves the entry's state settled, and a prune reads that
     // state without writing any.
-    if (pruneRequests.has(session.id) || crossed) {
+    // A `/cremate` command's request is scoped to the turn that claims its
+    // marker message (ISSUE-535), so it cannot be consumed by an earlier turn's
+    // step; the typed trigger keeps the session-wide request above.
+    const commandPrune = cremateMessageId !== undefined
+      && cremateRequestOf(session.id, cremateMessageId) !== undefined;
+    if (pruneRequests.has(session.id) || crossed || commandPrune) {
       try {
-        await runPrune(session, entry, signal);
+        await runPrunePass(session, entry, signal, cremateMessageId);
         // A pass that applied changed the transcript the next request sends.
         // Re-read the estimate rather than leave the pre-pass number standing
         // (G8, ISSUE-045 D1): the row that answers the NEXT request is measured
@@ -4455,6 +4656,10 @@ export function createRacoonsMount(options: {
         const afterPrune = await entry.port.snapshot();
         estimate = measureRequest(entry, afterPrune, prefix);
       } catch (error) {
+        if (cremateMessageId !== undefined) {
+          cancelCremate(entry.sessionId, cremateMessageId,
+            `prune pass failed: ${messageOf(error)}`);
+        }
         journal('prune-error', { sessionId: entry.sessionId,
           message: error instanceof Error ? error.message : String(error) });
       }
@@ -4550,6 +4755,9 @@ export function createRacoonsMount(options: {
     // a later reopen of the same id. `runPrune` already cleared its own on
     // consumption, so an evicted-but-consumed request leaves nothing here.
     pruneRequests.delete(sessionId);
+    // A command card waiting on a vanished session fails by name instead of
+    // waiting on state this eviction is releasing (ISSUE-535).
+    abandonCremateWaits(sessionId, 'the session was released before the cremation pass ran');
     mainWire.evict(sessionId);
     openFailures.delete(sessionId);
     unavailable.delete(sessionId);
@@ -4565,8 +4773,8 @@ export function createRacoonsMount(options: {
    */
   function observedSessionIds(): string[] {
     return [...new Set([...sessions.keys(), ...calls.keys(), ...buffers.keys(),
-      ...targets.keys(), ...pruneRequests, ...openFailures.keys(), ...unavailable,
-      ...planned, ...mainWire.sessionIds()])];
+      ...targets.keys(), ...pruneRequests, ...cremateRequests.keys(),
+      ...openFailures.keys(), ...unavailable, ...planned, ...mainWire.sessionIds()])];
   }
 
   /**
@@ -4753,13 +4961,14 @@ export function createRacoonsMount(options: {
   }
 
   return { sessions, counters, observedSessionIds, sessionFor, syncTranscript, observe, requestPrune,
+    beginCremate, claimCremate, cancelCremate, abandonCremateWaits,
     observeWire,
     // Each public boundary registers its work so a concurrent `endSession`
     // waits it out before releasing (ISSUE-397). Internal calls (the tail
     // prune inside a step) ride the outer boundary's registration.
     runStep: (session: DshMountSession, ordinals: { turn: number; step: number },
-      signal?: AbortSignal) =>
-      trackBoundary(session.id, () => runStep(session, ordinals, signal)),
+      signal?: AbortSignal, cremateMessageId?: string) =>
+      trackBoundary(session.id, () => runStep(session, ordinals, signal, cremateMessageId)),
     runTurnEnd: (session: DshMountSession, turn: number) =>
       trackBoundary(session.id, () => runTurnEnd(session, turn)),
     runPrune: (session: DshMountSession, signal?: AbortSignal) =>
@@ -4984,6 +5193,33 @@ function sessionError(name: string, message: string): Error {
   const error = new Error(message);
   error.name = name;
   return error;
+}
+
+/**
+ * Re-queue every claimed message except one (ISSUE-535). A rejected pre-step
+ * drops its whole claimed batch, so the mount puts the other messages back for
+ * the next step — the same restore dsh's goal-round driver performs before it
+ * rejects a step. `agent.send(..., 'next-step', true)` is preferred because it
+ * also wakes the driver, so a restored user message still runs after the
+ * command's turn closes; the plain prepend is the structural fallback and
+ * keeps the original order.
+ */
+function restoreClaimed(agent: {
+  readonly inbox?: { prepend?(target: string, message: unknown): void };
+  send?(message: unknown, target: string, wakeup: boolean): void;
+} | undefined, messages: readonly unknown[] | undefined, skipId: string): void {
+  const restored = (messages ?? []).filter((message) => {
+    const id = isRecord(message) ? message['id'] : undefined;
+    return typeof id !== 'string' || id !== skipId;
+  });
+  const send = agent?.send;
+  if (typeof send === 'function') {
+    for (const message of restored) send.call(agent, message, 'next-step', true);
+    return;
+  }
+  const prepend = agent?.inbox?.prepend;
+  if (typeof prepend !== 'function') return;
+  for (const message of [...restored].reverse()) prepend.call(agent?.inbox, 'next-step', message);
 }
 
 /** How many live sessions the host reports; a direct mount counts its own. */
@@ -5353,27 +5589,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         }
       }
 
-      // The host command menu's `/cremate` (ADR-0068). The handler records the
-      // same request the typed message records, then opens a `/cremate` user
-      // turn so the next pre-step runs the pass. A host without a command
-      // registry mounts unchanged; the typed-message path still works.
+      // The host command menu's `/cremate` (ADR-0068, ISSUE-535). A command
+      // handler runs outside a turn, and the host's session format accepts a
+      // `tool/result` surface replacement only inside one, so the handler owns
+      // no pass: it registers a request for a CREMATOR marker message and opens
+      // the marker turn through `agent.followup`. The turn's pre-step runs the
+      // pass inside it, then rejects the marker step (no model request, no
+      // `/cremate` text on the surface), and the handler returns the card the
+      // pass settled. A host without a command registry mounts unchanged; the
+      // typed-message path still works.
       const commands = ctx.commands;
       if (commands !== undefined && typeof commands.register === 'function') {
         const command = createCremateCommand({
-          request: (sessionId, seq) => { mount.requestPrune(sessionId, seq); },
-          run: async (session) => {
-            const outcome = await mount.runPrune(session);
-            if (outcome === null) {
-              return { kind: 'success', text: 'Cremation finished; nothing needed removal.' };
-            }
-            const removed = outcome.application?.removals.length ?? 0;
-            return {
-              kind: 'success',
-              text: removed === 0
-                ? 'Cremation finished; nothing removed.'
-                : `Cremation finished; ${String(removed)} result${removed === 1 ? '' : 's'} removed.`,
-            };
-          },
+          begin: (sessionId, messageId, commandId) =>
+            mount.beginCremate(sessionId, messageId, commandId),
+          cancel: (sessionId, messageId, message) =>
+            mount.cancelCremate(sessionId, messageId, message),
         });
         try {
           if (ctx.effect !== undefined) {
@@ -5399,6 +5630,40 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         }
       });
 
+      // A `/cremate` command request is bound to the turn that claims its
+      // marker message (ISSUE-535). The claim names the turn, so a turn that
+      // closes without the pass fails the card by name instead of leaving it
+      // pending; a discarded or disposed request fails the same way.
+      ctx.on('agent/inbox/claimed', (payload: {
+        agent?: { session?: DshMountSession };
+        message?: { id?: unknown };
+        turn?: number;
+      }) => {
+        const session = payload?.agent?.session;
+        const id = payload?.message?.id;
+        if (session === undefined || typeof id !== 'string'
+          || typeof payload?.turn !== 'number') return;
+        mount.claimCremate(String(session.id), id, payload.turn);
+      });
+      ctx.on('agent/inbox/discarded', (payload: {
+        agent?: { session?: DshMountSession };
+        message?: { id?: unknown };
+      }) => {
+        const session = payload?.agent?.session;
+        const id = payload?.message?.id;
+        if (session === undefined || typeof id !== 'string') return;
+        mount.cancelCremate(String(session.id), id,
+          'the command was discarded before its turn ran');
+      });
+      ctx.on('agent/disposed', (payload: {
+        agent?: { session?: DshMountSession };
+      }) => {
+        const session = payload?.agent?.session;
+        if (session === undefined) return;
+        mount.abandonCremateWaits(String(session.id),
+          'the agent was disposed before the cremation pass ran');
+      });
+
       // Main's outgoing request, captured where the runtime dispatches it
       // (ISSUE-026 chunk 3 / ADR-0010). The waterfall listener must call
       // `next()`: it is an observer, never an interceptor. The host hands over
@@ -5413,7 +5678,12 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       });
 
       ctx.on('agent/pre-step', async (payload: {
-        agent?: { session?: DshMountSession };
+        agent?: {
+          session?: DshMountSession;
+          inbox?: { prepend?(target: string, message: unknown): void };
+          send?(message: unknown, target: string, wakeup: boolean): void;
+        };
+        messages?: readonly unknown[];
         turn?: number;
         step?: number;
         signal?: AbortSignal;
@@ -5425,10 +5695,13 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         // validates it and falls back to no signal rather than throwing the
         // step out on a malformed payload.
         const signal = payload.signal instanceof AbortSignal ? payload.signal : undefined;
+        // A command's marker message is claimed by exactly one step (ISSUE-535).
+        // That step is where the command's pass runs, inside the open turn.
+        const marker = cremateMarkerOf(payload.messages);
         try {
           const stepResult = await mount.runStep(session,
             { turn: Number(payload.turn ?? 0), step: Number(payload.step ?? 0) },
-            signal);
+            signal, marker?.id);
           if (stepResult.appendRequest !== null) {
             try { flushAppends(session, stepResult.entry, config); }
             catch (error) {
@@ -5436,13 +5709,23 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
             }
           }
         } catch (error) {
+          if (marker !== undefined) {
+            mount.cancelCremate(String(session.id), marker.id,
+              `cremation pass could not start: ${messageOf(error)}`);
+          }
           // A retryable storage open already warned inside the mount; the
           // boundary is simply skipped and the next one tries again.
           if (!(error instanceof RacoonsStorageRetryError)) {
             warn(`pre-step: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        return next();
+        if (marker === undefined) return next();
+        // The pass is done; the marker step never enters the model. The host
+        // drops the claimed marker message, and every other claimed message is
+        // re-queued for the next step (dsh's goal-round driver does the same),
+        // so rejecting this turn loses no user work.
+        restoreClaimed(payload.agent, payload.messages, marker.id);
+        return { kind: 'reject' };
       });
       // The last seal opportunity in a one-shot run: the loop appends `turn/end`
       // right after this serial hook, and no pre-step follows. Dispatching a

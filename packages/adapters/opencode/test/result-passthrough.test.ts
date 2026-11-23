@@ -2,7 +2,7 @@
 //
 // The product never caps, shortens or rewrites a tool result. This suite drives
 // the settlement seam with a 200 KB result and then models the host's own
-// `ToolOutput.truncate` exactly as the installed 2.2.5 binary runs it: head
+// `ToolOutput.truncate` as the installed 2.2.5 binary ran it: head
 // only, 2,000 lines or 50 KiB, full text saved to a file, `metadata.truncated`
 // and `outputPath` written by the host. No binary, no API key, no live call.
 

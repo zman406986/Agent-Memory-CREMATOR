@@ -4,7 +4,7 @@
 // runtime-import scanner's own separation of value imports from type imports is
 // pinned by the last test, so the scan itself cannot pass vacuously.
 //
-// The 2.2.5 family is `@opencode/*`; `@opencode-ai/*` is the retired 1.x family
+// The 2.4.0 family is `@opencode/*`; `@opencode-ai/*` is the retired 1.x family
 // and is scanned too, so a regression cannot creep back in.
 
 import assert from 'node:assert/strict';
