@@ -4188,6 +4188,8 @@ test('the /cremate command runs the table pass on demand, below the bar', async 
     assert.equal(command?.name, OPENCODE_PRUNE_COMMAND, 'the command is /cremate');
     assert.match(String(command?.description), /table pass/u,
       'the command says what it runs');
+    assert.ok(lines.records.some(record => record.kind === 'command-registration'
+      && record['status'] === 'registered'), 'the journal names the registered command');
     // Two revisions carry the unit; neither crosses the 60k bar.
     await host.contextHook?.(sessionContext(largeHostMessages()));
     await host.contextHook?.(sessionContext(largeHostMessages()));

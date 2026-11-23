@@ -252,6 +252,9 @@ export type OpencodeJournalKind =
   // build failure.
   | 'prune-outcome'
   | 'command-error'
+  // ADR-0068 / ISSUE-531: the host command seam was present or absent, so a
+  // journal can tell a missing `/cremate` menu entry from a failed registration.
+  | 'command-registration'
   | 'cremate'
   | 'forget-scheduled'
   | 'forget'
@@ -4542,6 +4545,10 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
                 },
               });
             });
+            try {
+              emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
+                status: 'registered', name: OPENCODE_PRUNE_COMMAND }));
+            } catch { /* a journal sink must never change an outcome */ }
           } catch (error) {
             try {
               emit(Object.freeze({ kind: 'command-error', atMs: Date.now(),
@@ -4549,6 +4556,11 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
                 message: error instanceof Error ? error.message : String(error) }));
             } catch { /* a journal sink must never change an outcome */ }
           }
+        } else {
+          try {
+            emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
+              status: 'absent', reason: 'no-command-seam', name: OPENCODE_PRUNE_COMMAND }));
+          } catch { /* a journal sink must never change an outcome */ }
         }
         /**
          * ISSUE-411: subscribe and start the consumer BEFORE the idle hook
