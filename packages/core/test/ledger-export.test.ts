@@ -191,6 +191,21 @@ function tableRows(document: Record<string, unknown>, name: string): Record<stri
 }
 
 /**
+ * An applied event's receipt as the archive carries it, edited for the
+ * receipt-shape rows. The archive digest is recomputed after the edit, so only
+ * `assertEventAgainstIntent` can refuse it (ISSUE-490).
+ */
+function editAppliedReceipt(
+  document: Record<string, unknown>, edit: (receipt: Record<string, unknown>) => void,
+): void {
+  const row = tableRows(document, "ledger_events").find(entry => entry["kind"] === "applied");
+  assert.ok(row !== undefined, "the fixture exports an applied event");
+  const payload = JSON.parse(String(row["payload_json"])) as { receipt: Record<string, unknown> };
+  edit(payload.receipt);
+  row["payload_json"] = JSON.stringify(payload);
+}
+
+/**
  * The audit reproduction (ISSUE-261): each edit corrupts a fact a reader reads —
  * a span hash, a part length, an event payload, an event sequence — and `forge`
  * recomputes the archive digest over the edit. The archive digest therefore
@@ -237,6 +252,18 @@ const FORGED_READER_ROWS: readonly {
       // missing-body branch is the one that refuses.
       first["recall_id"] = `recall:sha256:${forged}`;
     } },
+  // A receipt the engine's own reconciliation predicate can never accept
+  // (`receiptMatches`): it lands durably and `committedState` blocks every pass
+  // with no conflict row, so the boundary must refuse it by name (ISSUE-490).
+  { name: "an applied receipt whose result revision equals its base revision",
+    message: /receipt/iu,
+    edit: document => editAppliedReceipt(document, receipt => {
+      receipt["resultRevision"] = receipt["baseRevision"];
+    }) },
+  { name: "an applied receipt with an empty result revision", message: /receipt/iu,
+    edit: document => editAppliedReceipt(document, receipt => {
+      receipt["resultRevision"] = "";
+    }) },
 ];
 
 test("a forged archive that recomputes its digest is refused before it reports counts", async () => {

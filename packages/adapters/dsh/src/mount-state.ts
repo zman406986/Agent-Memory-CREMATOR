@@ -24,9 +24,14 @@
  * Each writer reads the current document, replaces only the fact it owns and
  * republishes the whole file atomically (temp + rename, the ISSUE-347 pattern),
  * so a kill mid-write tears only the temp and every other fact is preserved.
- * Reads are fail-open in the same direction as the round store: an absent or
- * corrupt document reads as "the in-memory state is the whole truth", never as
- * a licence to trust garbage.
+ *
+ * A failed read is not an absent file (ISSUE-499): an absent document reads as
+ * "the in-memory state is the whole truth", but a present document that cannot
+ * be read or parsed is named, and a writer refuses to republish a merged empty
+ * document over it — merging into `{}` would durably erase every sibling fact
+ * (ADR-0065 decision 4; the opencode ISSUE-484 refused-document protection). A
+ * malformed record inside a readable document is named too, instead of reading
+ * as an empty list with no cause; the read itself still fails open.
  */
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -83,14 +88,62 @@ function sessionDirOf(target: ResolvedRacoonsStorage): string | null {
   return target.databasePath === ':memory:' ? null : dirname(target.databasePath);
 }
 
-function readDoc(dir: string): MountDoc {
+/** A read's result: the usable document, and why a present one was refused. */
+interface DocRead {
+  readonly doc: MountDoc;
+  readonly reason?: string;
+}
+
+/** The sink a reader calls when a present document or record is refused (ISSUE-499). */
+type RejectionSink = (reason: string) => void;
+
+/**
+ * Read one document. An absent file is legitimately fresh; a present file this
+ * build cannot read — a transient `readFileSync` failure (Windows AV/EBUSY/
+ * EPERM/EMFILE on a just-renamed file), bad JSON, or not an object — is refused
+ * with its reason so the caller can name it (ISSUE-499; ADR-0065 decision 4).
+ */
+function readDoc(dir: string): DocRead {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(join(dir, MOUNT_STATE_FILE), 'utf8'));
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? parsed as MountDoc : {};
-  } catch {
-    return {};
+    raw = fs.readFileSync(join(dir, MOUNT_STATE_FILE), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { doc: {} };
+    return { doc: {}, reason: 'the mount-state file could not be read: '
+      + (error instanceof Error ? error.message : String(error)) };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { doc: {}, reason: 'the mount-state file is not valid JSON' };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { doc: {}, reason: 'the mount-state file is not a JSON object' };
+  }
+  return { doc: parsed as MountDoc };
+}
+
+/**
+ * Refuse a write over a document this build cannot read (ISSUE-499; ADR-0065
+ * decision 4). Merging into the discarded empty read would replace the other
+ * facts with this writer's version, so the refusal is named and the next
+ * boundary retries once the document reads again. The in-memory fact still
+ * serves this process; only its restart durability waits.
+ */
+function refuseWrite(dir: string, reason: string, journal: MountJournal, sessionId: string,
+  fields: Record<string, unknown>): false {
+  journal('mount-state-error', { sessionId, ...fields, refused: true,
+    reason: `refusing to overwrite ${join(dir, MOUNT_STATE_FILE)}: ${reason}` });
+  return false;
+}
+
+/** The named-rejection sink for one fact, or a no-op when the caller supplied none. */
+function rejectionOf(journal: MountJournal | undefined, sessionId: string | undefined,
+  fact: string): RejectionSink {
+  return (reason: string): void => {
+    journal?.('mount-state-error', { sessionId, fact, refused: true, reason });
+  };
 }
 
 /** Publish one complete document atomically; false when it could not be written. */
@@ -129,10 +182,23 @@ function readInstallOf(doc: MountDoc): DurableInstall | null {
     preInstallNodeIds: ids, ...(candidate.sessionId === undefined ? {} : { sessionId: candidate.sessionId }) };
 }
 
-/** The install identity this session's durable state carries, or null (fresh). */
-export function readInstall(target: ResolvedRacoonsStorage): DurableInstall | null {
+/**
+ * The install identity this session's durable state carries, or null (fresh).
+ * A present record this build cannot parse is named before it reads as fresh
+ * (ISSUE-499), so "no identity" is never silently the same as "unreadable".
+ */
+export function readInstall(target: ResolvedRacoonsStorage, journal?: MountJournal,
+  sessionId?: string): DurableInstall | null {
   const dir = sessionDirOf(target);
-  return dir === null ? null : readInstallOf(readDoc(dir));
+  if (dir === null) return null;
+  const read = readDoc(dir);
+  const reject = rejectionOf(journal, sessionId, 'install');
+  if (read.reason !== undefined) { reject(read.reason); return null; }
+  const install = readInstallOf(read.doc);
+  if (install === null && read.doc.install !== undefined) {
+    reject('the install record is structurally invalid; reading it as absent');
+  }
+  return install;
 }
 
 /** Record the mount identity/generation, preserving every other fact. */
@@ -140,9 +206,10 @@ export function writeInstall(target: ResolvedRacoonsStorage, install: DurableIns
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const doc = readDoc(dir);
-  return publishDoc(dir, { ...doc, install }, journal, sessionId,
-    { fact: 'install', generation: install.generation });
+  const read = readDoc(dir);
+  const fields = { fact: 'install', generation: install.generation };
+  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+  return publishDoc(dir, { ...read.doc, install }, journal, sessionId, fields);
 }
 
 function readForgetsOf(doc: MountDoc): DurableForget[] {
@@ -170,10 +237,28 @@ function readForgetsOf(doc: MountDoc): DurableForget[] {
   return out;
 }
 
-/** The accepted-but-unapplied forgets this session's state carries. */
-export function readPendingForgets(target: ResolvedRacoonsStorage): DurableForget[] {
+/**
+ * The accepted-but-unapplied forgets this session's state carries. A malformed
+ * record is named instead of reading as an empty queue (ISSUE-499): dropping
+ * it loses owed work, and a silent drop reads exactly like "nothing owed".
+ */
+export function readPendingForgets(target: ResolvedRacoonsStorage, journal?: MountJournal,
+  sessionId?: string): DurableForget[] {
   const dir = sessionDirOf(target);
-  return dir === null ? [] : readForgetsOf(readDoc(dir));
+  if (dir === null) return [];
+  const read = readDoc(dir);
+  const reject = rejectionOf(journal, sessionId, 'forgets');
+  if (read.reason !== undefined) { reject(read.reason); return []; }
+  const forgets = read.doc.forgets;
+  if (forgets !== undefined && !Array.isArray(forgets)) {
+    reject('the forgets record is not an array; reading it as absent');
+    return [];
+  }
+  const records = readForgetsOf(read.doc);
+  if (records.length === 0 && (forgets?.length ?? 0) > 0) {
+    reject('the forgets record is structurally invalid; reading it as absent');
+  }
+  return records;
 }
 
 /** Replace the owed-forget fact; an empty list removes it. */
@@ -181,10 +266,12 @@ export function writePendingForgets(target: ResolvedRacoonsStorage,
   forgets: readonly DurableForget[], journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const doc = readDoc(dir);
-  const { forgets: _prior, ...rest } = doc;
+  const read = readDoc(dir);
+  const fields = { fact: 'forgets', pending: forgets.length };
+  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+  const { forgets: _prior, ...rest } = read.doc;
   return publishDoc(dir, { ...rest, ...(forgets.length === 0 ? {} : { forgets }) },
-    journal, sessionId, { fact: 'forgets', pending: forgets.length });
+    journal, sessionId, fields);
 }
 
 function readReceiptsOf(doc: MountDoc): ApplyReceipt[] {
@@ -204,10 +291,28 @@ function readReceiptsOf(doc: MountDoc): ApplyReceipt[] {
   return out;
 }
 
-/** The host receipts a previous process minted for this session. */
-export function readDurableReceipts(target: ResolvedRacoonsStorage): ApplyReceipt[] {
+/**
+ * The host receipts a previous process minted for this session. A malformed
+ * record is named instead of reading as absent (ISSUE-499): losing one would
+ * block its recovery as `unknown` with no named cause.
+ */
+export function readDurableReceipts(target: ResolvedRacoonsStorage, journal?: MountJournal,
+  sessionId?: string): ApplyReceipt[] {
   const dir = sessionDirOf(target);
-  return dir === null ? [] : readReceiptsOf(readDoc(dir));
+  if (dir === null) return [];
+  const read = readDoc(dir);
+  const reject = rejectionOf(journal, sessionId, 'receipts');
+  if (read.reason !== undefined) { reject(read.reason); return []; }
+  const receipts = read.doc.receipts;
+  if (receipts !== undefined && !Array.isArray(receipts)) {
+    reject('the receipts record is not an array; reading it as absent');
+    return [];
+  }
+  const rows = readReceiptsOf(read.doc);
+  if (rows.length === 0 && (receipts?.length ?? 0) > 0) {
+    reject('the receipts record is structurally invalid; reading it as absent');
+  }
+  return rows;
 }
 
 /**
@@ -220,10 +325,12 @@ export function writeDurableReceipt(target: ResolvedRacoonsStorage, receipt: App
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const doc = readDoc(dir);
-  const prior = readReceiptsOf(doc).filter(row => row.intentId !== receipt.intentId);
-  return publishDoc(dir, { ...doc, receipts: [...prior, receipt] }, journal, sessionId,
-    { fact: 'receipts', intentId: receipt.intentId, count: prior.length + 1 });
+  const read = readDoc(dir);
+  const fields = { fact: 'receipts', intentId: receipt.intentId };
+  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+  const prior = readReceiptsOf(read.doc).filter(row => row.intentId !== receipt.intentId);
+  return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] }, journal, sessionId,
+    { ...fields, count: prior.length + 1 });
 }
 
 /**
@@ -238,11 +345,15 @@ export function removeDurableReceipt(target: ResolvedRacoonsStorage, intentId: s
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const doc = readDoc(dir);
-  const prior = readReceiptsOf(doc);
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    return refuseWrite(dir, read.reason, journal, sessionId,
+      { fact: 'receipts', collected: intentId });
+  }
+  const prior = readReceiptsOf(read.doc);
   const remaining = prior.filter(row => row.intentId !== intentId);
   if (remaining.length === prior.length) return true;
-  const { receipts: _prior, ...rest } = doc;
+  const { receipts: _prior, ...rest } = read.doc;
   return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) },
     journal, sessionId, { fact: 'receipts', collected: intentId, count: remaining.length });
 }

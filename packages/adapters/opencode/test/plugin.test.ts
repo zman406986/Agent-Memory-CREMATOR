@@ -440,6 +440,12 @@ interface FakeHost {
   readonly commands: OpencodeCommandDefinition[];
   /** Every `session.generate` call the mount made, in order. */
   readonly generateCalls: OpencodeGenerateInput[];
+  /**
+   * The `types` each `context.event.subscribe` call named, in order
+   * (ISSUE-496): the plugin's subscription list is a shipped claim, so a test
+   * reads it instead of driving every event the host might send.
+   */
+  readonly subscribedTypes: (readonly string[] | undefined)[];
   /** The reply text the next `generate` returns. */
   generateReply: string;
   /** When set, `generate` throws it instead of returning text. */
@@ -455,6 +461,7 @@ function fakeHost(
   const added: OpencodeToolDefinition[] = [];
   const commands: OpencodeCommandDefinition[] = [];
   const generateCalls: OpencodeGenerateInput[] = [];
+  const subscribedTypes: (readonly string[] | undefined)[] = [];
   const host: FakeHost = {
     context: {
       options,
@@ -502,12 +509,18 @@ function fakeHost(
           return {};
         },
       },
-      event: { subscribe: () => stream },
+      event: {
+        subscribe: (subscribeOptions?: { readonly types?: readonly string[] }) => {
+          subscribedTypes.push(subscribeOptions?.types);
+          return stream;
+        },
+      },
     },
     stream,
     added,
     commands,
     generateCalls,
+    subscribedTypes,
     generateReply: '{"1":{"forgetall":"mock ask answer"}}',
     generateError: null,
     contextHook: null,
@@ -1085,6 +1098,10 @@ const REGISTRATION_ROWS: readonly Row[] = [
           at('the registered after hook leaves an oversized result whole'));
         assert.equal(before.result?.metadata, undefined,
           at('the registered hook writes no metadata, so the host truncation can run'));
+        assert.deepEqual(
+          host.subscribedTypes[0]?.filter(type => type.startsWith('session.revert.')),
+          ['session.revert.staged', 'session.revert.committed'],
+          at('the plugin subscribes to both handled revert events, never the no-op cleared one'));
         assert.equal(typeof cleanupFn, 'function', at('setup returns a cleanup'));
       } finally { await cleanupFn(); }
     } },
@@ -2678,6 +2695,128 @@ test('ISSUE-353: a nested ask\'s idle never marks the live turn complete', async
       'the closed-episode family fires once the turn genuinely ended');
   } finally { await mount.close(); }
 });
+
+test('ISSUE-496: a revert drops the idle turn fact, so the redone turn stays live',
+  async () => {
+    /*
+     * The host's undo rewrites its store without a compaction event and the
+     * redone turn reuses the undone ordinal. The mount cleared the turn-end fact
+     * only on `session.compaction.ended`, so the redone turn's request carried
+     * the stale fact, the snapshot clamp raised it to `currentTurn` — the LIVE
+     * turn — and the closed-episode L1 lane evicted that turn's miss bodies
+     * while the model still needed them. The native `session.revert.*` events
+     * (verified against the installed 2.2.5 host binary) are the invalidation
+     * hook. The fixture holds one tableable read and one miss read in the SAME
+     * live turn, so a stale fact evicts the miss body and a genuine turn end
+     * still does — the survival below is the guard, not a dead rule.
+     */
+    const conversation = (): OpencodeMessage[] => [
+      userMessage('msg_u1', [text('Read the note and the missing one.')]),
+      assistantMessage('msg_a1', [toolCall('call_1', 'read', { filePath: 'NOTES.md' })]),
+      toolMessage('msg_t1', [toolResult('call_1', 'read',
+        textResult(`# Note\n\n${'body-'.repeat(180)}\n`))]),
+      assistantMessage('msg_a2', [toolCall('call_2', 'read', { filePath: 'GONE.md' })]),
+      toolMessage('msg_t2', [toolResult('call_2', 'read',
+        errorResult(`ENOENT: GONE.md\n\n${'no-such-file-'.repeat(70)}\n`))]),
+      assistantMessage('msg_a3', [text('One is missing.')]),
+    ];
+    const lines = journalLines();
+    const mount = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({ text: '{"1":{"keepall":true}}' }),
+      journal: record => lines.records.push(record),
+    });
+    try {
+      // Step 1 ships the units; step 2 tables them.
+      await mount.transform(sessionId, conversation());
+      const entry = mount.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first transform opened the session');
+      await mount.transform(sessionId, conversation());
+      // The turn ends: the idle records turn 0 as complete.
+      await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
+      assert.equal(entry.completedThroughTurnOrdinal, 0, 'the idle recorded turn 0');
+      // The user undoes the turn; the host rewrites its history without a
+      // compaction and the redone turn reuses ordinal 0. The native revert
+      // event must drop the fact the way a compaction already does.
+      await mount.event({ type: 'session.revert.staged', data: { sessionID: sessionId } });
+      const redone = conversation();
+      await mount.transform(sessionId, redone);
+      assert.equal(redone.some(message => message.id === 'msg_t2'), true,
+        'the redone turn\'s live miss body is not evicted');
+      assert.equal(lines.of('ask-apply').some(line => line['rule'] === 'closed-episode'), false,
+        'no closed-episode removal names the live turn');
+      assert.equal(entry.completedThroughTurnOrdinal, null,
+        'the revert drops the turn fact that names a rewritten turn');
+      // The redo's own idle, with no revert after it, still records the fact…
+      await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
+      assert.equal(entry.completedThroughTurnOrdinal, 0,
+        'a genuine turn-end idle still records the turn it ended');
+      // …and the next pass then closes the episode: the fixture can evict, so
+      // the survival above is the guard, not a dead rule.
+      const afterTurnEnd = conversation();
+      await mount.transform(sessionId, afterTurnEnd);
+      assert.equal(afterTurnEnd.some(message => message.id === 'msg_t2'), false,
+        'after the genuine turn end the closed episode\'s miss body leaves');
+      assert.equal(lines.of('ask-apply').some(line => line['rule'] === 'closed-episode'), true,
+        'the closed-episode family fires once the turn genuinely ended');
+    } finally {
+      await mount.close();
+    }
+  });
+
+test('ISSUE-496: a committed revert also drops the idle turn fact, so the redone turn stays live',
+  async () => {
+    /*
+     * ISSUE-496 follow-up: the shipped handler clears the fact on the staged
+     * AND committed revert, but the test above drives only `staged`. The host
+     * commits its undo as its own event (`session.revert.committed`), and a
+     * mount that missed it would carry the pre-undo fact into the redone turn
+     * exactly as the staged case describes. Same fixture as the test above —
+     * that test's genuine-turn-end case is the proof this fixture can evict.
+     */
+    const conversation = (): OpencodeMessage[] => [
+      userMessage('msg_u1', [text('Read the note and the missing one.')]),
+      assistantMessage('msg_a1', [toolCall('call_1', 'read', { filePath: 'NOTES.md' })]),
+      toolMessage('msg_t1', [toolResult('call_1', 'read',
+        textResult(`# Note\n\n${'body-'.repeat(180)}\n`))]),
+      assistantMessage('msg_a2', [toolCall('call_2', 'read', { filePath: 'GONE.md' })]),
+      toolMessage('msg_t2', [toolResult('call_2', 'read',
+        errorResult(`ENOENT: GONE.md\n\n${'no-such-file-'.repeat(70)}\n`))]),
+      assistantMessage('msg_a3', [text('One is missing.')]),
+    ];
+    const lines = journalLines();
+    const mount = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({ text: '{"1":{"keepall":true}}' }),
+      journal: record => lines.records.push(record),
+    });
+    try {
+      // Step 1 ships the units; step 2 tables them.
+      await mount.transform(sessionId, conversation());
+      const entry = mount.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first transform opened the session');
+      await mount.transform(sessionId, conversation());
+      // The turn ends: the idle records turn 0 as complete.
+      await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
+      assert.equal(entry.completedThroughTurnOrdinal, 0, 'the idle recorded turn 0');
+      // The host commits the undo; the history it rewrote reuses ordinal 0.
+      await mount.event({ type: 'session.revert.committed', data: { sessionID: sessionId } });
+      const redone = conversation();
+      await mount.transform(sessionId, redone);
+      assert.equal(redone.some(message => message.id === 'msg_t2'), true,
+        'the redone turn\'s live miss body is not evicted');
+      assert.equal(lines.of('ask-apply').some(line => line['rule'] === 'closed-episode'), false,
+        'no closed-episode removal names the live turn');
+      assert.equal(entry.completedThroughTurnOrdinal, null,
+        'the committed revert drops the turn fact that names a rewritten turn');
+      assert.equal(lines.of('reverted').at(-1)?.['phase'], 'committed',
+        'the committed event is journalled with the phase that dropped the fact');
+    } finally {
+      await mount.close();
+    }
+  });
 
 /**
  * The idle//cremate re-arm fixture: one kept read of 856,000 bytes (214k
@@ -5424,6 +5563,56 @@ test('ISSUE-485: a non-array receipts record is a named structural refusal',
           'a structural refusal never judges abandonment');
       } finally { await mount.close(); }
     } finally {
+      cleanup(dir);
+    }
+  });
+
+test('ISSUE-495: an applied receipt is collected, so one stored removal never grows the file',
+  async () => {
+    /*
+     * ISSUE-436 added this collection to the dsh adapter only. Here every
+     * committed apply wrote a crash-window receipt (ISSUE-448) and nothing ever
+     * dropped it once the ledger's own `applied` row superseded it. Under
+     * `rewriteHistory: false` the host rebuilds each request from its own store,
+     * so one banked removal re-applies per request: a new intent, a new receipt,
+     * a full-file rewrite, and a file that never shrinks.
+     */
+    const dir = scratch();
+    const root = join(dir, 'root');
+    const stateFile = join(root, 'sessions', sessionId, 'mount-state.json');
+    const receiptsOf = (): readonly unknown[] => {
+      try {
+        const parsed = JSON.parse(readFileSync(stateFile, 'utf8')) as { receipts?: unknown };
+        return Array.isArray(parsed.receipts) ? parsed.receipts : [];
+      } catch { return []; }
+    };
+    const mount = createOpencodeMount({
+      storage: { crematorStorageRoot: root }, journal: () => {},
+    });
+    try {
+      const store = staleReadMessages();
+      const counts: number[] = [];
+      let appliedRows = 0;
+      for (let request = 1; request <= 4; request += 1) {
+        // The host's own rebuild of the same stored history: same base revision,
+        // so the banked removal is re-applied on every request.
+        const messages = structuredClone(store);
+        await mount.transform(sessionId, messages);
+        assert.equal(messages.some(message => message.id === 'msg_t1'), false,
+          `request ${String(request)} landed the stale-read removal`);
+        counts.push(receiptsOf().length);
+      }
+      const entry = mount.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the mount built the session');
+      for await (const { event } of entry.ledger.events(sessionId)) {
+        if (event.kind === 'applied') appliedRows += 1;
+      }
+      assert.equal(appliedRows, counts.length,
+        'every request recorded its own applied row: the receipt each supersedes');
+      assert.deepEqual(counts, [0, 0, 0, 0],
+        'a receipt whose applied row is durable is collected; the file does not grow per request');
+    } finally {
+      await mount.close();
       cleanup(dir);
     }
   });

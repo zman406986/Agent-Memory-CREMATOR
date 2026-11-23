@@ -29,7 +29,7 @@ import {
 import { DatabaseSync } from 'node:sqlite';
 import { readPendingForgets, writePendingForgets } from '../src/mount-state.js';
 import { readEntryAskFired, readPruneRound, readPruneTriggerState, writeEntryAskFired,
-  writePendingAppends, writePendingEntryPublishes, writePruneRound } from '../src/prune-round-store.js';
+  writePendingAppends, writePruneRound } from '../src/prune-round-store.js';
 import { PREINSTALL_RECORD_FILE } from '../src/preinstall-record.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
 
@@ -702,49 +702,6 @@ test('ISSUE-475: a fork retry keeps a latch the child wrote over a bare parent r
       cleanup(fixture.dir);
     }
   });
-
-/**
- * ISSUE-476: the entry-publish queue is a fork-cleared fact. A file holding
- * the parent's queue alone must land a child file with no queue, and a child
- * restart must publish none of the parent's replacements.
- */
-test('ISSUE-476: a fork drops the parent\'s entry-publish queue and names it', async () => {
-  const fixture = await forkedFixture((root) => {
-    writePendingEntryPublishes(resolveSessionStorage(root, 'session-parent'),
-      [{ callId: 'c1', eventId: 'dsh:session-parent:result:c1',
-        bytesBase64: Buffer.from('parent replacement').toString('base64') }],
-      () => {}, 'session-parent');
-  });
-  const childTarget = resolveSessionStorage(fixture.root, 'session-child');
-  const roundFile = join(dirname(childTarget.databasePath), 'prune-round.json');
-  const journal: JournalLine[] = [];
-  const second = mountOn(fixture.root, journal);
-  const childJournal: JournalLine[] = [];
-  const third = mountOn(fixture.root, childJournal);
-  try {
-    await second.sessionFor(fixture.child.id, fixture.child);
-    const dropped = kinds(journal, 'fork-state-dropped').at(-1);
-    assert.equal(dropped?.['entryPublishes'], 1,
-      'the dropped parent queue is counted and named');
-    assert.deepEqual(JSON.parse(readFileSync(roundFile, 'utf8')), {},
-      'the child file holds no parent entry-publish queue');
-    await second.close();
-
-    // The child's later mount is a restart: it replays and publishes none of
-    // the parent's replacements.
-    const childAgain = inheritedSession('session-child', fixture.parent);
-    await third.sessionFor(childAgain.id, childAgain);
-    await third.runStep(childAgain, { turn: 2, step: 1 });
-    assert.equal(kinds(childJournal, 'entry-resume-recovered').length, 0,
-      'no entry-resume-recovered line carries the parent queue');
-    assert.equal(kinds(childJournal, 'entry-publish-failed').length, 0,
-      'no parent replacement is published into the child');
-  } finally {
-    await second.close();
-    await third.close();
-    cleanup(fixture.dir);
-  }
-});
 
 /**
  * ISSUE-478: withholding the fork identity is not the only durable marker of

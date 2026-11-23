@@ -24,9 +24,9 @@
  * because `hostDomain` is empty for this adapter, so RACOONS neither reads nor
  * bumps the host's version.
  */
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { FileBlobStore, MemoryBlobStore, SqliteLedger } from '@cremator/core';
 import type { Clock, Ledger } from '@cremator/core';
 
@@ -180,6 +180,125 @@ export function resolveStorage(raw: RacoonsStorageOptions | undefined,
     blobRoot: join(sessionDir, 'blobs'),
     root: configuredRoot,
   });
+}
+
+/**
+ * The one directory a durable root names (ISSUE-498; ADR-0066 decision 1).
+ *
+ * A session's ledger is `<root>/sessions/<id>/ledger.sqlite`, built with `join`,
+ * which collapses a trailing separator, `.` and `..`. The duplicate-apply key
+ * must describe the same directory the OS will open, or two applies over one
+ * ledger claim two keys — the dsh analogue of ISSUE-464/ISSUE-481, whose
+ * `normalizeMountRoot` in the opencode adapter this mirrors so both adapters
+ * agree on what one root is. `resolve` handles the lexical forms; the longest
+ * existing ancestor is resolved through `realpathSync.native` (a junction, a
+ * symlink, an extended-length spelling and a case-insensitive volume's own
+ * case); Windows' trailing dot and space trimming is applied per component;
+ * and the volume is asked whether it folds case before the whole key is folded,
+ * so the key cannot change the moment the first mount creates the root. A tail
+ * the filesystem does not hold yet is appended as typed.
+ */
+export function normalizeMountRoot(root: string): string {
+  const lexical = resolve(withoutExtendedPrefix(root));
+  const trimmed = process.platform === 'win32' ? trimWindowsTrailing(lexical) : lexical;
+  return canonicalRootDirectory(trimmed);
+}
+
+/**
+ * Strip the Windows extended-length prefix (ISSUE-481): `\\?\C:\store` and
+ * `\\?\UNC\server\share` name the same directory as their plain spellings.
+ */
+function withoutExtendedPrefix(root: string): string {
+  if (process.platform !== 'win32') return root;
+  if (root.startsWith('\\\\?\\UNC\\')) return `\\\\${root.slice('\\\\?\\UNC\\'.length)}`;
+  if (root.startsWith('\\\\?\\')) return root.slice('\\\\?\\'.length);
+  return root;
+}
+
+/**
+ * Windows ignores trailing dots and spaces on every component (ISSUE-481), so
+ * `C:\store.` and `C:\store ` open the same directory as `C:\store`. The
+ * lexical `resolve` keeps those characters; this trims them per component,
+ * never inside the volume root.
+ */
+function trimWindowsTrailing(resolvedPath: string): string {
+  const parsed = parse(resolvedPath);
+  const rest = resolvedPath.slice(parsed.root.length);
+  if (rest.length === 0) return resolvedPath;
+  const parts = rest.split(/[\\/]+/u).map(part => part.replace(/[. ]+$/u, ''))
+    .filter(part => part.length > 0);
+  return parts.length === 0 ? parsed.root : join(parsed.root, ...parts);
+}
+
+/**
+ * Resolve the real directory behind a lexical path (ISSUE-481), asking the
+ * filesystem for the longest existing ancestor: a junction or symlink and its
+ * target then yield one key, and the case is the directory's own, not the
+ * platform's guess. A not-yet-existing tail is appended as typed. The volume
+ * itself is asked whether it folds case, and the whole key is folded when it
+ * does.
+ */
+function canonicalRootDirectory(lexical: string): string {
+  const missing: string[] = [];
+  let current = lexical;
+  for (;;) {
+    try {
+      const real = realpathSync.native(current);
+      const canonical = missing.length === 0 ? real : join(real, ...missing);
+      return rootFoldsCase(real) ? canonical.toLowerCase() : canonical;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) {
+        // No ancestor exists (an absent drive, for example): the lexical form
+        // stays the fallback, folded on Windows like any unresolved path.
+        return process.platform === 'win32' ? lexical.toLowerCase() : lexical;
+      }
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Whether the volume holding an existing directory folds case (ISSUE-481).
+ * Case is observed, not guessed from `process.platform`: the nearest ancestor
+ * name that has a letter is asked for in the opposite case, and an answer whose
+ * file identity (volume serial and file index) equals the original's means the
+ * volume folds. Identity is used instead of comparing `realpathSync` strings:
+ * on macOS `realpath` echoes the caller's case, so a case-insensitive APFS
+ * volume resolved through a flipped spelling compared unequal to the real path.
+ */
+function rootFoldsCase(real: string): boolean {
+  let current = real;
+  for (;;) {
+    const parent = dirname(current);
+    const name = basename(current);
+    const flipped = name.replace(/[a-z]/giu, letter => (letter === letter.toUpperCase()
+      ? letter.toLowerCase() : letter.toUpperCase()));
+    if (parent !== current && flipped !== name) {
+      try { return sameEntryIdentity(current, join(parent, flipped)); }
+      catch { return false; }
+    }
+    // A drive or volume root with no letter-bearing component cannot be probed
+    // by spelling; keep Windows' folding default and treat posix roots as exact.
+    if (parent === current) return process.platform === 'win32';
+    current = parent;
+  }
+}
+
+/**
+ * Whether two spellings name one file or directory (ISSUE-481). The volume
+ * serial (`dev`) and file index (`ino`) are the identity the operating system
+ * itself uses, so a case-flipped spelling that resolves to the same entry on a
+ * case-insensitive volume compares equal. A missing flipped path throws and a
+ * distinct entry reports different identity, both meaning the volume does not
+ * fold. An unavailable index (`ino` 0 on some exotic volumes) is not treated as
+ * a match, so the guard fails toward keeping distinct roots distinct.
+ */
+function sameEntryIdentity(left: string, right: string): boolean {
+  const a = statSync(left, { bigint: true });
+  const b = statSync(right, { bigint: true });
+  return a.ino !== 0n && a.dev === b.dev && a.ino === b.ino;
 }
 
 /**

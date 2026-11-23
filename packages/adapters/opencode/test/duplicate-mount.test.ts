@@ -9,7 +9,9 @@
 // test-only.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { test } from 'node:test';
@@ -254,3 +256,104 @@ test('setup refuses a second plugin on the same durable configuration', async ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** One pid no process holds, so a claim naming it is a crashed mount's. */
+function deadPid(): number {
+  const alive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; }
+    catch { return false; }
+  };
+  for (let pid = 999_999; pid > 999_000; pid -= 1) if (!alive(pid)) return pid;
+  throw new Error('no dead pid found for the crash fixture');
+}
+
+/** The claim file a durable root carries (ISSUE-497). */
+const MOUNT_LOCK_FILE = 'mount.lock';
+
+/** The claim file one durable root carries, read as plain data. */
+function claimOf(root: string): Record<string, unknown> {
+  const raw = readFileSync(join(root, MOUNT_LOCK_FILE), 'utf8');
+  return JSON.parse(raw) as Record<string, unknown>;
+}
+
+test('ISSUE-497: a live claim from another process refuses the mount by name', async () => {
+  /*
+   * The registry above is a per-process Map, so it cannot see a second
+   * `opencode --resume` terminal on one root: both would open a ledger on one
+   * `ledger.sqlite` and two writers would republish one mount-state file. The
+   * root's claim file is the OS-level test-and-set; a live holder refuses this
+   * mount with the same named error as the in-process duplicate.
+   */
+  const dir = scratch();
+  const root = join(dir, 'store');
+  mkdirSync(root, { recursive: true });
+  const foreign = { pid: process.pid, atMs: Date.now(), token: 'the-other-process' };
+  writeFileSync(join(root, MOUNT_LOCK_FILE), JSON.stringify(foreign), 'utf8');
+  try {
+    assert.throws(() => createOpencodeMount({ storage: { crematorStorageRoot: root } }),
+      (error: unknown) => error instanceof OpencodeDuplicateMountError
+        && error.code === OPENCODE_DUPLICATE_MOUNT_CODE
+        && error.key === root
+        && String(error.message).includes(`pid ${String(process.pid)}`),
+      'the second process is refused by the named duplicate-mount error, naming the holder');
+    assert.deepEqual(claimOf(root), foreign,
+      'the refused mount neither takes nor rewrites the holding claim');
+    assert.equal(existsSync(join(root, 'sessions')), false,
+      'the refused mount opened no ledger and made no mount-state writer');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-497: the root claim is held for the mount and released on close', async () => {
+  const dir = scratch();
+  const root = join(dir, 'store');
+  const mount = createOpencodeMount({
+    storage: { crematorStorageRoot: root }, journal: () => {},
+  });
+  const lockPath = join(root, MOUNT_LOCK_FILE);
+  try {
+    // Taken at mount, before any session ledger can open.
+    const held = claimOf(root);
+    assert.equal(held['pid'], process.pid, 'the claim names this process');
+    assert.equal(typeof held['token'], 'string', 'the claim carries its own release token');
+    await mount.transform(sessionId, conversation());
+  } finally { await mount.close(); }
+  assert.equal(existsSync(lockPath), false, 'the close releases the root claim');
+  // The released root is free: no stale claim blocks the next mount.
+  const reopened = createOpencodeMount({ storage: { crematorStorageRoot: root } });
+  try {
+    await reopened.transform(sessionId, conversation());
+  } finally {
+    await reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-497: a claim whose process is gone is cleared, never a wedge', async () => {
+  /*
+   * The claim has no expiry (ADR-0066 decision 5), so it cannot be a lease: a
+   * crashed mount's file must not lock the root forever. The owner record is the
+   * fact —a claim naming a dead (or unreadable) process is evidence of a crash
+   * and is cleared once; a claim naming a live process is refused.
+   */
+  const dir = scratch();
+  const root = join(dir, 'store');
+  mkdirSync(root, { recursive: true });
+  const dead = deadPid();
+  writeFileSync(join(root, MOUNT_LOCK_FILE),
+    JSON.stringify({ pid: dead, atMs: Date.now(), token: 'crashed-mount' }), 'utf8');
+  const mount = createOpencodeMount({
+    storage: { crematorStorageRoot: root }, journal: () => {},
+  });
+  try {
+    const held = claimOf(root);
+    assert.equal(held['pid'], process.pid, "the dead claim is replaced by this mount's own");
+    assert.notEqual(held['token'], 'crashed-mount', 'the replacement carries a fresh token');
+    await mount.transform(sessionId, conversation());
+  } finally {
+    await mount.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

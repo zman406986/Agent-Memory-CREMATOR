@@ -216,6 +216,30 @@ export function writeDurableReceipt(
   return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] });
 }
 
+/**
+ * Drop one durable receipt once the ledger's own `applied` row supersedes it
+ * (ISSUE-495, the dsh adapter's ISSUE-436 collection). The receipt exists only
+ * for the crash window between the host write and that row (ISSUE-448); the
+ * ledger is the record of record (ADR-0015), so the copy has no further reader.
+ * Garbage collection of superseded state, not a cap: no count, age or budget is
+ * introduced, and an empty set removes the `receipts` field whole. A failed
+ * write is returned for the mount to journal, like every other mount-state
+ * write; a write that would not change the file does not touch it.
+ */
+export function removeDurableReceipt(
+  target: StorageTarget, intentId: string,
+): DurableWriteResult {
+  const dir = sessionDirOf(target);
+  if (dir === null) return { ok: true };
+  const read = readDoc(dir);
+  if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+  const prior = readReceiptsOf(read.doc);
+  const remaining = prior.filter(row => row.intentId !== intentId);
+  if (remaining.length === prior.length) return { ok: true };
+  const { receipts: _prior, ...rest } = read.doc;
+  return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) });
+}
+
 function isStringArray(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.every(item => typeof item === 'string');
 }

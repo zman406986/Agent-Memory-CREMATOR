@@ -46,6 +46,18 @@ export interface ProcessControl {
 /** What `process` accepts second: an options object, a signal, or a deadline. */
 export type ProcessControlInput = ProcessControl | AbortSignal | number;
 
+/**
+ * A controlled pass's cancellation token, carried on its own fenced options
+ * object (ISSUE-310) so the one seam that must refuse before it mutates
+ * anything — the session guard's in-memory breaker — can read it without
+ * threading the token through every planner. A symbol, so no host-visible
+ * option key can collide with it (ISSUE-489).
+ */
+const PASS_FENCE = Symbol('cremator.passFence');
+interface FencedOptions extends EngineOptions {
+  readonly [PASS_FENCE]?: { readonly cancelled: boolean };
+}
+
 const normalizeControl = (
   control: ProcessControlInput | undefined,
 ): ProcessControl | undefined => {
@@ -278,7 +290,8 @@ export class RacoonsEngine {
       ...(o.port.commit === undefined ? {}
         : { commit: () => { if (fence.cancelled) refuse(); return o.port.commit!(); } }),
     };
-    return { ...o, ledger, port };
+    const fenced: FencedOptions = { ...o, ledger, port, [PASS_FENCE]: fence };
+    return fenced;
   }
 
   private cancelled(input: EngineInput, message: string): EngineResult {
@@ -596,6 +609,15 @@ export class RacoonsEngine {
     state: BreakerState, sealedEpisodeIds: readonly EpisodeId[], nowMs: number,
   ): Promise<EngineResult> {
     const guard = this.guardFor(state);
+    // A cancelled pass's late run must not touch the session's one breaker:
+    // `validate` records success or failure on it, and the fenced append below
+    // would then throw, so the mutation never reaches the journal and the
+    // in-memory streak stops agreeing with the record the notice claims
+    // (ISSUE-489). Reads pass the fence, so reaching here cancelled is exactly
+    // that orphaned run.
+    if ((o as FencedOptions)[PASS_FENCE]?.cancelled === true) {
+      return this.cancelled(input, 'the pass was cancelled before validation');
+    }
     const validation = await guard.validate({ input, snapshot,
       capabilities: o.capabilities, config: o.config, plans,
       sealedEpisodeIds, nowMs });
@@ -606,6 +628,16 @@ export class RacoonsEngine {
       engineTurnOrdinal: snapshot.currentTurnOrdinal };
     this.emit({ kind: 'validation', eventId: input.eventId, ok: validation.ok,
       issues: validationEvent.issues, breaker: validation.breaker });
+    // A transient storage refusal is not the event's verdict (ISSUE-313 is the
+    // only source of the `ledger-io` code). Journaling it as an ok:false row
+    // would make the replay check below answer `rejected` for the event forever
+    // once storage recovered; skipping the row leaves the event retryable, and
+    // the pass answers the same retryable result the prepare-throw path does
+    // (ISSUE-488; ISSUE-309).
+    if (!validation.ok && validation.issues.length > 0
+      && validation.issues.every(issue => issue.code === 'ledger-io')) {
+      return result('recovery-pending', validation);
+    }
     if (!validation.ok) {
       await o.ledger.append(validationEvent);
       if (validation.breaker.disabled) {

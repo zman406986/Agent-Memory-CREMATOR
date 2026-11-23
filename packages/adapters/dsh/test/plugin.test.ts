@@ -501,7 +501,6 @@ const PUBLISH_ROWS: readonly {
       const before = session.log.length;
       const stepResult = await mount.runStep(session, { turn: 1, step: 2 });
       assert.equal(stepResult.deliveries.length, 0, at('nothing was delivered'));
-      assert.equal(stepResult.entryApplications.length, 0, at('no entry application ran'));
       assert.equal(stepResult.appendRequest, null, at('no append was requested'));
       assert.equal(session.log.length, before, at('nothing was appended for the failed result'));
       assert.equal(journal.some((line) => line['kind'] === 'publish'), false,
@@ -886,7 +885,7 @@ const ORDINAL_ROWS: readonly Row[] = [
         && event.surfaceOp === 'append');
       assert.ok(origin !== undefined, at('the step-5 result is on the surface'));
 
-      // Exactly the publication `publishEntry` performs: one content-only
+      // Exactly the host write an entry apply performs: one content-only
       // `tool/result` replace over the captured node, carrying the ORIGINAL
       // `turn`/`step` (1:5) while landing at step 28's log position.
       session.append('tool/result', { turn: 1, step: 5,

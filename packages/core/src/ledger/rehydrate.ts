@@ -392,11 +392,17 @@ function assertEventAgainstIntent(
     mismatch(`Archive prepared hash differs from its intent (${event.eventKey})`);
   }
   if (receipt !== undefined &&
+      // The same applied-receipt shape the live append boundary enforces
+      // (ISSUE-490): a result revision that is empty or unchanged can never be
+      // reconciled, so the archive must not plant one either.
       (receipt["sessionId"] !== event.sessionId ||
+       typeof receipt["baseRevision"] !== "string" || receipt["baseRevision"].length === 0 ||
        receipt["baseRevision"] !== intent["base_revision"] ||
        receipt["applicationSha256"] !== intent["application_sha256"] ||
        typeof receipt["appliedAtMs"] !== "number" || !Number.isSafeInteger(receipt["appliedAtMs"]) ||
-       typeof receipt["resultRevision"] !== "string")) {
+       receipt["appliedAtMs"] < 0 ||
+       typeof receipt["resultRevision"] !== "string" || receipt["resultRevision"].length === 0 ||
+       receipt["resultRevision"] === receipt["baseRevision"])) {
     mismatch(`Archive receipt differs from its prepared intent (${event.eventKey})`);
   }
 }

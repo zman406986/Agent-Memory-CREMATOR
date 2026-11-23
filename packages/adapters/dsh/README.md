@@ -19,6 +19,29 @@ npm run build
 installed into the dsh profile; a `file:///` name needs no install. Requires Node
 `>=22.13.0 <23.0.0 || >=23.4.0`; `@cremator/core` resolves from the repo's workspace.
 
+### Installing from tarballs
+
+`npm pack` in `packages/core` and in this package produces `cremator-core-0.1.0.tgz`
+and `cremator-dsh-0.1.0.tgz`. This package declares
+`"@cremator/core": "^0.1.0"`, and nothing is on the registry, so installing
+only the adapter tarball tries to fetch core from npm and fails. Install the core
+tarball first, or point npm at it with an `overrides` entry in the consuming
+project's `package.json`:
+
+```json
+{
+  "overrides": {
+    "@cremator/core": "file:./cremator-core-0.1.0.tgz"
+  }
+}
+```
+
+Then `npm install ./cremator-dsh-0.1.0.tgz` adds both packages. Keep the
+tarballs in the consuming project's directory or adjust the `file:` path.
+Verified 2026-11-23 with npm 11.17.0: the adapter alone exits 1 on the unresolved
+core dependency; the override installs two packages; installing the core tarball
+first also works.
+
 ## Use
 
 The mount entry is the subpath export; the package's default entry has no host dependency.

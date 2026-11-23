@@ -13,7 +13,7 @@ import type { RecallRecord } from "../src/ledger/manifest.js";
 import { SCHEMA_VERSION, initializeSchema } from "../src/ledger/schema.js";
 import { SqliteLedger } from "../src/ledger/sqlite-ledger.js";
 import { LedgerError } from "../src/ledger/types.js";
-import type { ArchiveRecord, LedgerEntry } from "../src/ledger/types.js";
+import type { ApplyReceipt, ArchiveRecord, LedgerEntry } from "../src/ledger/types.js";
 import { applicationFixture, bytes, recallFixture } from "./ledger-fixtures.js";
 import type { BlobStore } from "../src/ledger/blob-store.js";
 
@@ -209,6 +209,39 @@ test("stored receipts are append-only, events read in sequence, and an old CHECK
     assert.equal(oldCheck.prepare("PRAGMA user_version").get()?.user_version, 2,
       "row: the refused handle keeps the version it was found with");
   } finally { oldCheck.close(); }
+});
+
+/**
+ * The append boundary validates the same applied-receipt shape the engine
+ * reconciles against (`receiptMatches`): a receipt whose result revision is
+ * empty or unchanged can never be reconciled, so `committedState` would block
+ * every pass with no conflict row and no abandon path (ISSUE-490). Such a
+ * receipt must never land; the valid one still appends unchanged.
+ */
+test("an applied receipt the engine can never reconcile is refused by name", async () => {
+  const ledger = await SqliteLedger.open({ databasePath: ":memory:",
+    blobStore: new MemoryBlobStore(), clock });
+  try {
+    const intent = await ledger.prepare(await applicationFixture());
+    const receiptRows: readonly { readonly name: string; readonly receipt: ApplyReceipt }[] = [
+      { name: "a result revision equal to the base revision",
+        receipt: { ...intent, resultRevision: intent.baseRevision, appliedAtMs: 109 } },
+      { name: "an empty result revision",
+        receipt: { ...intent, resultRevision: "", appliedAtMs: 109 } },
+    ];
+    for (const row of receiptRows) {
+      await assert.rejects(ledger.append({ kind: "applied", sessionId: intent.sessionId,
+        eventKey: `applied:${row.name}`, atMs: 110, receipt: row.receipt }),
+      code("idempotency-conflict"), `row: ${row.name}`);
+    }
+    assert.deepEqual((await collect(ledger)).map(entry => entry.event.kind), ["prepared"],
+      "row: a refused receipt appends no event");
+    await ledger.append({ kind: "applied", sessionId: intent.sessionId,
+      eventKey: "applied:valid", atMs: 110,
+      receipt: { ...intent, resultRevision: "revision-2", appliedAtMs: 109 } });
+    assert.deepEqual((await collect(ledger)).map(entry => entry.event.kind), ["prepared", "applied"],
+      "row: a valid receipt still appends");
+  } finally { await ledger.close(); }
 });
 
 test("prepare is idempotent, persists every admitted kind, and refuses an unadmitted one before a write", async () => {

@@ -102,7 +102,10 @@ import {
   resolveContextWindowTokens, resolvePruneThresholdTokens,
 } from '@cremator/core';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, realpathSync, statSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync,
+  renameSync, statSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join, parse, resolve } from 'node:path';
 import type {
   ApplicationPort, ApplyReceipt, CapabilityFlags, Clock, DedupeClasses, ForgetRequest, Ledger,
@@ -138,7 +141,8 @@ import type {
   OpencodeApplyRefusal, OpencodeCommitKind, OpencodePortOptions, OpencodePortSnapshotOptions,
 } from './port.js';
 import {
-  readDurableAskState, readDurableReceipts, writeDurableReceipt, writeDurableAskState,
+  readDurableAskState, readDurableReceipts, removeDurableReceipt, writeDurableReceipt,
+  writeDurableAskState,
 } from './mount-state.js';
 import type { DurableAskState, DurableAskVerdict } from './mount-state.js';
 import { OPENCODE_RECORD_PREFIX, opencodeToolNodeId } from './snapshot.js';
@@ -304,7 +308,11 @@ export type OpencodeJournalKind =
   // session's window and bar were derived from. Nothing is re-derived (the
   // operator's window is authoritative); the line stamps each stale value with
   // the model it came from, so a mid-session switch is detectable.
-  | 'model-change';
+  | 'model-change'
+  // ISSUE-496: the host staged or committed an undo/revert — a non-compaction
+  // history rewrite — so the idle turn-end fact was dropped instead of clamping
+  // up to the live turn.
+  | 'reverted';
 
 export interface OpencodeJournalRecord {
   readonly kind: OpencodeJournalKind;
@@ -572,6 +580,15 @@ export interface OpencodeSessionEntry {
    * stored, and after an apply or drop settles one (ISSUE-409).
    */
   readonly persistAskState: () => void;
+  /**
+   * Drop one receipt from this session's durable state once the ledger's own
+   * `applied` row is durable (ISSUE-495; the dsh adapter's ISSUE-436
+   * collection). The receipt exists only for the crash window before that row
+   * (ISSUE-448); the ledger is the record of record (ADR-0015), so the file
+   * tracks live obligations instead of every removal ever applied. A no-op for a
+   * `':memory:'` session; a failed write is journaled, never thrown.
+   */
+  readonly collectSettledReceipt: (intentId: string | null) => void;
   /**
    * Node ids an already-sent request has carried: the ask table and the stored
    * verdicts read this set, so a result that first appears in the step being
@@ -1128,6 +1145,9 @@ export async function applyOpencodeAskVerdicts(
       entry.durableAskVerdicts.delete(removal.unitId);
     }
   }
+  // ISSUE-495: a status of `applied` means the engine's own `applied` row is
+  // durable, so the crash-window receipt the commit wrote has no reader left.
+  if (result.status === 'applied') entry.collectSettledReceipt(result.intentId);
   const refusal = entry.port.refusal?.() ?? null;
   const recallIds = applied
     ? recallIdsByForgottenNode(messages, result.intentId) : new Map<string, string>();
@@ -1401,12 +1421,156 @@ export class OpencodeDuplicateMountError extends Error {
   readonly code = OPENCODE_DUPLICATE_MOUNT_CODE;
   readonly key: string;
 
-  constructor(key: string) {
+  constructor(key: string, holder: string | null = null) {
     super(`cremator-opencode: a mount for the durable root ${JSON.stringify(key)} is already `
-      + 'active; refusing the second mount rather than open a second ledger for the same session');
+      + `active${holder === null ? '' : ` in another process (${holder})`}; refusing the second `
+      + 'mount rather than open a second ledger for the same session');
     this.name = 'OpencodeDuplicateMountError';
     this.key = key;
   }
+}
+
+/** The OS-level claim file one live mount holds on its durable root (ISSUE-497). */
+export const OPENCODE_MOUNT_LOCK_FILE = 'mount.lock';
+
+/** What a claim file records: the process that holds it and a token of its own. */
+interface MountRootHolder {
+  readonly pid: number;
+  readonly atMs: number;
+  readonly token: string;
+}
+
+/** One held claim: the file to release and the token that proves this mount wrote it. */
+export interface MountRootLock {
+  readonly path: string;
+  readonly token: string;
+}
+
+/** What claiming a root answered: this mount's claim, or the live holder found. */
+export type MountRootClaim =
+  | { readonly lock: MountRootLock }
+  | { readonly heldBy: string | null };
+
+/** Whether an error carries one filesystem code. */
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null
+    && (error as { readonly code?: unknown }).code === code;
+}
+
+/** Whether a pid names a live process; an unreadable one (EPERM) counts as live. */
+function processAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return hasErrorCode(error, 'EPERM'); }
+}
+
+/** The claim one file records, or null when it is absent, partial or unreadable. */
+function readMountRootHolder(path: string): MountRootHolder | null {
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(path, 'utf8')); }
+  catch { return null; }
+  if (!isRecord(raw)) return null;
+  const pid = raw['pid'];
+  const atMs = raw['atMs'];
+  const token = raw['token'];
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (typeof atMs !== 'number' || !Number.isFinite(atMs) || typeof token !== 'string') return null;
+  return { pid, atMs, token };
+}
+
+/**
+ * Contract the OS-level claim on one durable root (ISSUE-497; ADR-0066
+ * decision 2 kept across processes). The in-process registry above cannot see
+ * another process, so two `opencode --resume` terminals would open two ledgers on
+ * one `ledger.sqlite` and two mount-state writers over one file.
+ *
+ * The claim is one file created with the exclusive-create flag — the filesystem's
+ * own atomic test-and-set, so no read-modify-write race exists — and it is held
+ * for the mount's lifetime. There is no wait window, no retry count and no expiry
+ * (ADR-0066 decision 5): a live holder refuses this mount at once with the named
+ * duplicate-mount error. A claim whose recorded process is gone is a crashed
+ * mount's evidence, not a lease, so it is cleared and the claim retried once; a
+ * recycled pid can only make a mount refuse (the safe side, never two mounts).
+ */
+export function claimMountRoot(root: string): MountRootClaim {
+  return takeMountRootClaim(root, join(root, OPENCODE_MOUNT_LOCK_FILE));
+}
+
+/**
+ * The claim itself. A filesystem failure that is not EEXIST is the root being
+ * unusable right now, so it is named as a storage failure at the claim path
+ * instead of surfacing as a bare errno from mount construction.
+ */
+function takeMountRootClaim(root: string, path: string): MountRootClaim {
+  try { mkdirSync(root, { recursive: true }); }
+  catch (error) { throw mountClaimFailure(path, error); }
+  const token = `${String(process.pid)}-${String(Date.now())}-${Math.random().toString(16).slice(2)}`;
+  const create = (): boolean => {
+    try {
+      const fd = openSync(path, 'wx');
+      try {
+        const record: MountRootHolder = { pid: process.pid, atMs: Date.now(), token };
+        writeFileSync(fd, JSON.stringify(record));
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      return true;
+    } catch (error) {
+      if (hasErrorCode(error, 'EEXIST')) return false;
+      throw mountClaimFailure(path, error);
+    }
+  };
+  if (create()) return { lock: { path, token } };
+  const holder = readMountRootHolder(path);
+  if (holder !== null && processAlive(holder.pid)) {
+    return { heldBy: `pid ${String(holder.pid)}` };
+  }
+  breakCrashedMountRootClaim(path);
+  if (create()) return { lock: { path, token } };
+  const successor = readMountRootHolder(path);
+  return { heldBy: successor === null ? null : `pid ${String(successor.pid)}` };
+}
+
+/** This root's claim path, named on a storage failure (ISSUE-497). */
+function mountClaimFailure(path: string, error: unknown): OpencodeStorageError {
+  const reason = error instanceof Error ? error.message : String(error);
+  return new OpencodeStorageError('durable-open-failed',
+    `racoons: cannot take the mount claim at ${path}: ${reason}`, path, { cause: error });
+}
+
+/**
+ * Clear a crashed mount's claim, never a successor's (ISSUE-320's rule, no age
+ * bound). Rename first, then verify the moved record: a mount that replaced the
+ * dead claim while this one judged it keeps its claim, and only the copy this
+ * mount renamed is removed.
+ */
+function breakCrashedMountRootClaim(path: string): void {
+  const tombstone = `${path}.stale-${String(process.pid)}-${String(Date.now())}-`
+    + Math.random().toString(16).slice(2);
+  try { renameSync(path, tombstone); }
+  catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) return;
+    throw mountClaimFailure(path, error);
+  }
+  const moved = readMountRootHolder(tombstone);
+  if (moved !== null && processAlive(moved.pid)) {
+    // A successor claimed the root after this mount read the dead owner: put its
+    // claim back (a live claim at the path refuses the rename; the copy is then
+    // just dropped).
+    try { renameSync(tombstone, path); } catch { try { unlinkSync(tombstone); } catch { /* gone */ } }
+    return;
+  }
+  try { unlinkSync(tombstone); } catch { /* a later mount clears what this could not */ }
+}
+
+/**
+ * Release this mount's claim, and only its own: the token must match, so a
+ * successor's claim is never deleted (ISSUE-320). A failure to release is not a
+ * mount failure — the next process sees a dead owner and clears it.
+ */
+export function releaseMountRoot(lock: MountRootLock): void {
+  const holder = readMountRootHolder(lock.path);
+  if (holder === null || holder.token !== lock.token) return;
+  try { unlinkSync(lock.path); } catch { /* already gone */ }
 }
 
 /**
@@ -1733,6 +1897,21 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     throw new OpencodeDuplicateMountError(
       selection.kind === 'durable' ? selection.root : registryKey);
   }
+  /**
+   * ISSUE-497 / ADR-0066 decision 2 across processes: the registry above is
+   * process-local, so two processes on one durable root would still open two
+   * ledgers for the same session and two writers over one mount-state file. The
+   * root's own claim file is the OS-level test-and-set, taken here — before any
+   * session ledger can open — and held for the mount's life; a live holder is
+   * refused with the same named duplicate-mount error. No wait window, retry
+   * count or expiry is added (ADR-0066 decision 5).
+   */
+  const mountClaim = registryKey === null ? null : claimMountRoot(registryKey);
+  if (mountClaim !== null && 'heldBy' in mountClaim) {
+    throw new OpencodeDuplicateMountError(
+      selection.kind === 'durable' ? selection.root : registryKey ?? '', mountClaim.heldBy);
+  }
+  const mountLock = mountClaim !== null && 'lock' in mountClaim ? mountClaim.lock : null;
   const sessions = new Map<string, OpencodeSessionEntry>();
   /**
    * Set once `close()` starts (ISSUE-393). The per-session release awaits
@@ -1899,6 +2078,44 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   }
 
   /**
+   * Collect the durable receipts whose intents the ledger already records as
+   * `applied` (ISSUE-495; the dsh adapter's ISSUE-436 sweep). A receipt exists
+   * for the crash window before that row (ISSUE-448), so once the row is durable
+   * the copy has no reader. A failed ledger read keeps every receipt (fail-open);
+   * a failed mount-state write is named and the receipt is left for the next
+   * mount. No count, age or budget is involved.
+   */
+  async function collectSettledReceipts(
+    target: StorageTarget, receipts: readonly ApplyReceipt[], ledger: Ledger, sessionId: string,
+  ): Promise<ApplyReceipt[]> {
+    const applied = new Set<string>();
+    try {
+      for await (const row of ledger.events(sessionId)) {
+        if (row.event.kind === 'applied') applied.add(row.event.receipt.intentId);
+      }
+    } catch (error) {
+      journal('mount-state-error', { sessionId, fact: 'receipts-collect',
+        message: error instanceof Error ? error.message : String(error) });
+      return [...receipts];
+    }
+    if (applied.size === 0) return [...receipts];
+    const kept: ApplyReceipt[] = [];
+    for (const receipt of receipts) {
+      if (!applied.has(receipt.intentId)) {
+        kept.push(receipt);
+        continue;
+      }
+      const removed = removeDurableReceipt(target, receipt.intentId);
+      if (!removed.ok) {
+        journal('mount-state-error', { sessionId, fact: 'receipt',
+          intentId: receipt.intentId, message: removed.message ?? 'unknown write failure' });
+        kept.push(receipt);
+      }
+    }
+    return kept;
+  }
+
+  /**
    * ISSUE-448 / ADR-0064: seed the durable receipts before judging a prepared
    * row. A row the seeded receipts can resolve is left to recovery; a row that
    * still has no provable receipt after seeding is closed exactly once with a
@@ -2061,8 +2278,19 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         journal('mount-state-error', { sessionId, fact: 'receipts', message });
       })
       : [];
-    if (durableReceipts.length > 0) {
-      journal('receipts-resumed', { sessionId, count: durableReceipts.length });
+    /**
+     * ISSUE-495 (the dsh adapter's ISSUE-436 collection, ported): a receipt whose
+     * intent the ledger already records as `applied` is superseded crash-window
+     * state, so the mount collects it here too — a file written before this fix
+     * shrinks on its next open instead of only stopping its growth. The ledger,
+     * not the copy, is the record of record (ADR-0015). A failed ledger read
+     * keeps every receipt (fail-open); the next mount retries the sweep.
+     */
+    const receiptsInForce = durableReceipts.length === 0
+      ? durableReceipts
+      : await collectSettledReceipts(target, durableReceipts, ledger, sessionId);
+    if (receiptsInForce.length > 0) {
+      journal('receipts-resumed', { sessionId, count: receiptsInForce.length });
     }
     /**
      * ISSUE-448 / ADR-0064: seed before judging. A prepared row the seeded
@@ -2080,7 +2308,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           message: 'the durable receipts record was refused; prepared intents are not judged '
             + 'against it on this open' });
       } else {
-        await settlePreparedIntents({ ledger, receipts: durableReceipts, sessionId });
+        await settlePreparedIntents({ ledger, receipts: receiptsInForce, sessionId });
       }
     }
     // The declared flags, not a caller's wish: the mount passes the pair it
@@ -2098,7 +2326,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     let mountedEntry: OpencodeSessionEntry | null = null;
     const port = (options.createPort ?? createOpencodePort)({
       sessionId, clock, capabilities, appliedPlans: seededAppliedPlans,
-      ...(durableReceipts.length === 0 ? {} : { receipts: durableReceipts }),
+      ...(receiptsInForce.length === 0 ? {} : { receipts: receiptsInForce }),
       persistReceipt: (receipt) => {
         if (target.kind !== 'durable') return;
         const written = writeDurableReceipt(target, receipt);
@@ -2233,6 +2461,14 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         if (!written.ok) {
           journal('mount-state-error', { sessionId, fact: 'ask',
             message: written.message ?? 'unknown write failure' });
+        }
+      },
+      collectSettledReceipt: (intentId) => {
+        if (target.kind !== 'durable' || intentId === null) return;
+        const removed = removeDurableReceipt(target, intentId);
+        if (!removed.ok) {
+          journal('mount-state-error', { sessionId, fact: 'receipt', intentId,
+            message: removed.message ?? 'unknown write failure' });
         }
       },
       seenNodeIds: restoredSeen, pendingSeenNodeIds: new Set<NodeId>(),
@@ -2629,6 +2865,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           code: refusal.code, reason: refusal.reason, detail: refusal.detail,
         } }),
       });
+      // ISSUE-495: the at-rest pass's own `applied` row is durable from here.
+      if (result.status === 'applied') entry.collectSettledReceipt(result.intentId);
       /**
        * The manual forgets the tool resolved apply here, after the at-rest
        * commit and before the prune pass. The engine owns the event, the guard
@@ -2973,6 +3211,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           ranges: pending.request.ranges.length, status: result.status,
           intentId: result.intentId, committed: did,
           issues: result.validation?.ok === false ? result.validation.issues : [] });
+        // ISSUE-495: the forget's own `applied` row is durable from here.
+        if (result.status === 'applied') entry.collectSettledReceipt(result.intentId);
         if (did) entry.port.observe(messages);
       } catch (error) {
         journal('forget-error', { sessionId: entry.sessionId, eventId: pending.eventId,
@@ -3914,6 +4154,29 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       await idlePass(sessionId);
       return;
     }
+    /**
+     * ISSUE-496: the host's undo rewrites its store without a compaction event
+     * (2.2.5 registers `session.revert.staged`, `.cleared` and `.committed`
+     * beside `session.compaction.*`). The redone turn reuses the undone turn's
+     * ordinal, so the pre-undo idle's turn-end fact would clamp up to the LIVE
+     * turn and let the closed-episode lane evict that turn's miss bodies. A
+     * staged or committed revert is a non-compaction history rewrite: drop the
+     * fact exactly as `session.compaction.ended` does, and drop the port's
+     * retained copy too (ISSUE-362), or a no-options observation still clamps
+     * the stale fact up. A cleared revert rewrote nothing, so it keeps the fact.
+     */
+    if (type === 'session.revert.staged' || type === 'session.revert.committed') {
+      const entry = sessions.get(sessionId);
+      if (entry !== undefined) {
+        entry.completedThroughTurnOrdinal = null;
+        entry.port.clearCompletedTurnFact?.();
+      }
+      journal('reverted', { sessionId, phase: type.slice('session.revert.'.length),
+        ...(entry === undefined ? {} : { generation: entry.compactionGeneration }),
+        reason: 'the host rewrote its history without a compaction; the idle turn fact may '
+          + 'name a turn the rebuilt array reuses' });
+      return;
+    }
     if (type === 'session.compaction.started' || type === 'session.compaction.delta'
       || type === 'session.compaction.ended' || type === 'session.compaction.failed') {
       const phase = type.slice('session.compaction.'.length);
@@ -4078,6 +4341,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     ...selection.kind === 'durable' ? { storageRoot: selection.root }
       : { storage: ':memory:' },
     ...(options.journalFile === undefined ? {} : { journalFile: options.journalFile }),
+    /** The root's OS-level claim this mount holds (ISSUE-497). */
+    ...(mountLock === null ? {} : { lock: mountLock.path }),
     /** The full additive inventory this mount registers, not a subset. */
     tools: [tool.name, ...(forgetTool === null ? [] : [forgetTool.name])].join(','),
     forgetTool: forgetTool !== null,
@@ -4161,6 +4426,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (registryKey !== null && activeMounts.get(registryKey) === mount) {
         activeMounts.delete(registryKey);
       }
+      // ISSUE-497: the root's OS-level claim goes with it, and only this mount's
+      // own claim is removed (its token must match; a successor's is never deleted).
+      if (mountLock !== null) releaseMountRoot(mountLock);
       // ISSUE-407: from here on a post-dispose call writes no journal line
       // (the ISSUE-420 contract); the in-progress refusal lines stop.
       disposeComplete = true;
@@ -4299,6 +4567,10 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           'session.compaction.delta',
           'session.compaction.ended',
           'session.compaction.failed',
+          // ISSUE-496: the undo/revert notice is a non-compaction history
+          // rewrite, so the mount must see it to drop the stale turn fact.
+          'session.revert.staged',
+          'session.revert.committed',
         ];
         const source = context.event.subscribe({ types })[Symbol.asyncIterator]();
         iterator = source;

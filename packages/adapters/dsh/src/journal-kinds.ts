@@ -42,6 +42,11 @@ export const CREMATOR_JOURNAL_KINDS = [
   // many it recovered. A pass whose first answer was clean writes no such line.
   'prune-correction',
   'prune-verdict', 'prune-recorded', 'prune-threshold', 'prune-error',
+  // `prune-round-error`: a durable round/latch/queue write failed (the
+  // in-memory fact still serves this process) or was refused because a
+  // transient read failure would have republished a merged empty document over
+  // intact facts (ISSUE-499; `refused: true`, `fact`, `reason`). Reads name a
+  // refused document or record the same way before failing open.
   'prune-round-error', 'prune-round-resumed',
   // the depth latch's state came back from the round file on remount
   // (ISSUE-336): one line naming the restored post-pass baseline
@@ -137,33 +142,10 @@ export const CREMATOR_JOURNAL_KINDS = [
   // an absent service adds `reason: 'no-tools-service'`. One line per mount,
   // so "no tools offered" is never byte-identical to "both offered".
   'tool-registration',
-  // an entry replacement the port committed could not be published to the host
-  // surface (ISSUE-441; ADR-0065). `callId` and `eventId` name the node, and
-  // `pending` counts the applications still queued. A transient (host append)
-  // failure is NOT dropped: the next boundary republishes it, so the ledger's
-  // `applied` claim and the surface cannot silently diverge.
-  'entry-publish-failed',
-  // an entry replacement whose node the host surface no longer holds
-  // (ISSUE-449): `callId`/`eventId` name it and `reason` is `no-live-result`
-  // or `no-host-event`. A missing node can never be republished, so the
-  // request is taken out of the queue head after this one line instead of
-  // blocking every later application behind it.
-  'entry-publish-dropped',
-  // an entry publish was still queued when its session was released (ISSUE-450):
-  // `callId`/`eventId` name the head, `pending` counts the queue, and `reason`
-  // is `session/end` or `close`. `durable: true` means the queue is on disk and
-  // the next entry for this session id replays it; `false` means an in-memory
-  // session lost the replacement, named here instead of vanishing silently.
-  'entry-publish-abandoned',
-  // the durable pending entry-publish intent could not be written (ISSUE-450):
-  // `pending` counts the records the write carried and `message` names the
-  // storage error. Fail-open: the in-memory queue still serves this process.
-  'entry-publish-persist-error',
   // a pending-append intent this session's round file carries is malformed
   // (ISSUE-430): on a fresh process the corrupt record is dropped fail-open,
   // and this line names the position and the defect instead of reading as an
-  // empty queue. `fact` is `entry-publishes` when the malformed fact is the
-  // entry-publish intent ISSUE-450 added; absent means the append intent.
+  // empty queue.
   'pending-append-corrupt',
   // the install boundary (ISSUE-414): one line per mount of a durable session,
   // naming the mount generation and whether this mount recorded the first one
@@ -173,7 +155,11 @@ export const CREMATOR_JOURNAL_KINDS = [
   'install-boundary',
   // a durable mount-state write (install identity, pending forgets, receipts)
   // failed: the in-memory state still serves this process, only its restart
-  // durability is lost. Fail-open, like every other mount seam.
+  // durability is lost. Fail-open, like every other mount seam. ISSUE-499: a
+  // read this build could not trust is named the same way — `refused: true`,
+  // the `fact` and its `reason`; a writer then refuses to republish a merged
+  // empty document over the facts it could not read. A malformed record inside
+  // a readable document is named here too, before the read fails open.
   'mount-state-error',
   // the durable install identity could not be written (ISSUE-439). The mount
   // never journals a boundary it did not record: `state` names the boundary the
@@ -191,15 +177,15 @@ export const CREMATOR_JOURNAL_KINDS = [
   'install-fallback',
   // a fork mount dropped the parent's owed durable work from the child's copy
   // (ISSUE-437): `parentSessionId` names the session the copied state belongs
-  // to, and `forgets`/`appends`/`entryPublishes` count the facts cleared, with
+  // to, and `forgets`/`appends` count the facts cleared, with
   // `round`/`latch`/`entryAskFired` naming the parent's header facts when one
-  // was dropped (ISSUE-476). Skipping a durable fact is not removing it, and a
-  // later child mount would replay it as its own.
+  // was dropped. Skipping a durable fact is not removing it, and a later child
+  // mount would replay it as its own.
   'fork-state-dropped',
   // a fork's clear of an inherited fact failed (ISSUE-456): `file` names the
   // sibling file (`mount-state.json` for a forget, `prune-round.json` for an
-  // append or entry-publish queue), `fact` names the inherited fact and `count`
-  // how many copies remain. The drop line never claims a fact whose write
+  // append), `fact` names the inherited fact and `count` how many copies
+  // remain. The drop line never claims a fact whose write
   // returned false, and the fork keeps the parent's install identity so the
   // next mount re-forks and retries.
   'fork-clear-failed',
@@ -234,8 +220,10 @@ export const CREMATOR_JOURNAL_KINDS = [
   'receipts-resumed',
   // ISSUE-423: a host compaction landed while an ask/apply window was open, so
   // the depth latch was NOT re-armed mid-flight. `phase` and `generation` name
-  // the compaction; `window` is `entry` or `prune`. The window's own end re-arms
-  // the latch once no apply is running (ADR-0050's native-compaction backstop).
+  // the compaction; `window` names the open lanes — `entry`, `prune`, or
+  // `entry+prune` when a direct prune overlaps an in-flight entry ask
+  // (ISSUE-501). The last window's end re-arms the latch once no apply is
+  // running (ADR-0050's native-compaction backstop).
   'native-compaction-deferred',
   // ISSUE-432: the live host route changed under this session id, so the
   // per-entry floor was re-derived and stamped with its provider/model. `from`

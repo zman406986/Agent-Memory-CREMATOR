@@ -28,10 +28,17 @@ export function appendEvent(db: DatabaseSync, event: LedgerEvent): LedgerEntry {
         text(intent, "application_sha256") !== event.applicationSha256) conflict("Prepared hash differs");
     if (event.kind === "applied") {
       const receipt = event.receipt;
+      // The full shape `receiptMatches` reconciles against (engine/journal.ts).
+      // A receipt whose result revision is empty or unchanged can never be
+      // reconciled, so `committedState` would block every later pass on it with
+      // no conflict row and no abandon path; it must never land (ISSUE-490).
       if (receipt.sessionId !== event.sessionId ||
+          typeof receipt.baseRevision !== "string" || receipt.baseRevision.length === 0 ||
           receipt.baseRevision !== text(intent, "base_revision") ||
           receipt.applicationSha256 !== text(intent, "application_sha256") ||
-          !Number.isSafeInteger(receipt.appliedAtMs) || typeof receipt.resultRevision !== "string") {
+          !Number.isSafeInteger(receipt.appliedAtMs) || receipt.appliedAtMs < 0 ||
+          typeof receipt.resultRevision !== "string" || receipt.resultRevision.length === 0 ||
+          receipt.resultRevision === receipt.baseRevision) {
         conflict("Receipt differs from prepared intent");
       }
     }

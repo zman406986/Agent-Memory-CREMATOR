@@ -35,6 +35,12 @@
  * the ordinal does not silently restart. Worst case is a repeated round ordinal,
  * never a refused prune.
  *
+ * A TRANSIENT read failure is not corruption (ISSUE-499): the file may still
+ * hold an intact round, latch and owed queues, so a writer refuses to republish
+ * a document merged from an empty read (which would erase them) and names the
+ * refusal. Reads name the failure too and keep their fail-open answer. A
+ * genuinely corrupt document keeps its documented start-over write.
+ *
  * `:memory:` storage (tests) persists nothing: the in-memory entry counter is
  * the whole truth there, exactly as before this module existed.
  */
@@ -63,34 +69,88 @@ function sessionDirOf(target: ResolvedRacoonsStorage): string | null {
  * The round this session last completed; 0 when nothing was ever written.
  * A durable target with no file, a corrupt file, or a negative/non-integer
  * value all read as 0: the safe failure is "start over", never "trust garbage".
+ * A present file or record this build cannot read is named (ISSUE-499) instead
+ * of reading as a silent 0.
  */
-export function readPruneRound(target: ResolvedRacoonsStorage): number {
+export function readPruneRound(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): number {
   const dir = sessionDirOf(target);
   if (dir === null) return 0;
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(join(dir, PRUNE_ROUND_FILE), 'utf8'));
-    const round = typeof parsed === 'object' && parsed !== null
-      ? (parsed as { readonly round?: unknown }).round : undefined;
-    return typeof round === 'number' && Number.isSafeInteger(round) && round >= 0 ? round : 0;
-  } catch {
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    nameReadRefusal(journal, sessionId, 'round', read.reason);
     return 0;
   }
+  const round = read.doc['round'];
+  if (round === undefined) return 0;
+  if (typeof round === 'number' && Number.isSafeInteger(round) && round >= 0) return round;
+  nameReadRefusal(journal, sessionId, 'round',
+    'the round record is structurally invalid; reading it as absent');
+  return 0;
+}
+
+/**
+ * A read's result: the current document and why a present one was refused.
+ * `transient` is true only for a read that failed while the file may still hold
+ * intact facts (ISSUE-499); a corrupt document is `false` because its facts are
+ * unreadable anyway and the documented "start over" write still applies.
+ */
+interface RoundDocRead {
+  readonly doc: Record<string, unknown>;
+  readonly transient: boolean;
+  readonly reason?: string;
 }
 
 /**
  * The file's current document, or `{}` when it is absent, unreadable or not a
  * JSON object. Every writer reads it first so the facts it does not own ride
  * along unchanged (ISSUE-336's trigger, ISSUE-374's appends); the safe failure
- * is "start over", never "trust garbage".
+ * is "start over", never "trust garbage". An absent file is fresh; anything
+ * else names its reason so a refusal can say what it could not read (ISSUE-499).
  */
-function readDoc(dir: string): Record<string, unknown> {
+function readDoc(dir: string): RoundDocRead {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(join(dir, PRUNE_ROUND_FILE), 'utf8'));
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown> : {};
-  } catch {
-    return {};
+    raw = fs.readFileSync(join(dir, PRUNE_ROUND_FILE), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { doc: {}, transient: false };
+    return { doc: {}, transient: true, reason: 'the prune-round file could not be read: '
+      + (error instanceof Error ? error.message : String(error)) };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { doc: {}, transient: false, reason: 'the prune-round file is not valid JSON' };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { doc: {}, transient: false, reason: 'the prune-round file is not a JSON object' };
+  }
+  return { doc: parsed as Record<string, unknown>, transient: false };
+}
+
+/**
+ * Name a refused document or record read (ISSUE-499). The read still answers its
+ * fail-open default; the line is what makes the loss visible with a cause.
+ */
+function nameReadRefusal(journal: MountJournal | undefined, sessionId: string | undefined,
+  fact: string, reason: string): void {
+  journal?.('prune-round-error', { sessionId, fact, refused: true, reason });
+}
+
+/**
+ * Refuse to republish a merged document over a transient read failure
+ * (ISSUE-499). The facts this writer does not own are still on disk for the next
+ * attempt; merging them into an empty read and renaming that over the file would
+ * erase the round, the latch and the owed queues. A genuinely corrupt document
+ * keeps its documented "start over" write.
+ */
+function refusePublish(dir: string, reason: string, journal: MountJournal, sessionId: string,
+  errorKind: 'prune-round-error' | 'append-persist-error',
+  fields: Record<string, unknown>): false {
+  journal(errorKind, { sessionId, ...fields, refused: true,
+    reason: `refusing to overwrite ${join(dir, PRUNE_ROUND_FILE)}: ${reason}` });
+  return false;
 }
 
 /**
@@ -104,7 +164,7 @@ function readDoc(dir: string): Record<string, unknown> {
  */
 function publishDoc(dir: string, doc: Record<string, unknown>, journal: MountJournal,
   sessionId: string,
-  errorKind: 'prune-round-error' | 'append-persist-error' | 'entry-publish-persist-error',
+  errorKind: 'prune-round-error' | 'append-persist-error',
   fields: Record<string, unknown>): boolean {
   const final = join(dir, PRUNE_ROUND_FILE);
   const temp = `${final}.${String(process.pid)}.${String(tempSeq++)}.tmp`;
@@ -136,16 +196,20 @@ export function writePruneRound(target: ResolvedRacoonsStorage, round: number,
   journal: MountJournal, sessionId: string, trigger?: PruneWindowTriggerState): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const prior = readDoc(dir);
+  const read = readDoc(dir);
+  const fields = { round };
+  if (read.transient) {
+    return refusePublish(dir, read.reason ?? 'unreadable', journal, sessionId,
+      'prune-round-error', fields);
+  }
+  const prior = read.doc;
   const appends = prior['appends'];
-  const entryPublishes = prior['entryPublishes'];
   return publishDoc(dir, { round,
     ...(trigger === undefined ? {} : { trigger }),
     ...(typeof prior['entryAskFired'] === 'boolean'
       ? { entryAskFired: prior['entryAskFired'] } : {}),
-    ...(Array.isArray(appends) ? { appends } : {}),
-    ...(Array.isArray(entryPublishes) ? { entryPublishes } : {}) },
-  journal, sessionId, 'prune-round-error', { round });
+    ...(Array.isArray(appends) ? { appends } : {}) },
+  journal, sessionId, 'prune-round-error', fields);
 }
 
 /**
@@ -156,14 +220,21 @@ export function writePruneRound(target: ResolvedRacoonsStorage, round: number,
  * A fork starts false (see `plugin.ts`): the parent's ask history is not the
  * child's, exactly as the round and latch are not inherited.
  */
-export function readEntryAskFired(target: ResolvedRacoonsStorage): boolean {
+export function readEntryAskFired(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return false;
-  try {
-    return readDoc(dir)['entryAskFired'] === true;
-  } catch {
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    nameReadRefusal(journal, sessionId, 'entryAskFired', read.reason);
     return false;
   }
+  const fired = read.doc['entryAskFired'];
+  if (fired === undefined) return false;
+  if (typeof fired === 'boolean') return fired;
+  nameReadRefusal(journal, sessionId, 'entryAskFired',
+    'the entryAskFired record is structurally invalid; reading it as absent');
+  return false;
 }
 
 /**
@@ -177,16 +248,20 @@ export function writeEntryAskFired(target: ResolvedRacoonsStorage, fired: boolea
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const prior = readDoc(dir);
+  const read = readDoc(dir);
+  const fields = { entryAskFired: fired };
+  if (read.transient) {
+    return refusePublish(dir, read.reason ?? 'unreadable', journal, sessionId,
+      'prune-round-error', fields);
+  }
+  const prior = read.doc;
   return publishDoc(dir, {
     ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
     ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
       ? { trigger: prior['trigger'] } : {}),
     ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
-    ...(Array.isArray(prior['entryPublishes'])
-      ? { entryPublishes: prior['entryPublishes'] } : {}),
     entryAskFired: fired,
-  }, journal, sessionId, 'prune-round-error', { entryAskFired: fired });
+  }, journal, sessionId, 'prune-round-error', fields);
 }
 
 /**
@@ -195,26 +270,35 @@ export function writeEntryAskFired(target: ResolvedRacoonsStorage, fired: boolea
  * malformed `trigger` value all read as null. The safe failure is "start with
  * a fresh latch", never "trust garbage" — the same rule the round read follows.
  */
-export function readPruneTriggerState(target: ResolvedRacoonsStorage): PruneWindowTriggerState | null {
+export function readPruneTriggerState(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): PruneWindowTriggerState | null {
   const dir = sessionDirOf(target);
   if (dir === null) return null;
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(join(dir, PRUNE_ROUND_FILE), 'utf8'));
-    const trigger = typeof parsed === 'object' && parsed !== null
-      ? (parsed as { readonly trigger?: unknown }).trigger : undefined;
-    if (typeof trigger !== 'object' || trigger === null) return null;
-    const state = trigger as { readonly lastFireUsage?: unknown;
-      readonly belowSinceFire?: unknown; readonly baselinePending?: unknown };
-    const usage = state.lastFireUsage;
-    if (usage !== null
-      && (typeof usage !== 'number' || !Number.isSafeInteger(usage) || usage < 0)) return null;
-    if (typeof state.belowSinceFire !== 'boolean'
-      || typeof state.baselinePending !== 'boolean') return null;
-    return { lastFireUsage: usage, belowSinceFire: state.belowSinceFire,
-      baselinePending: state.baselinePending };
-  } catch {
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    nameReadRefusal(journal, sessionId, 'trigger', read.reason);
     return null;
   }
+  const trigger = read.doc['trigger'];
+  if (trigger === undefined) return null;
+  if (typeof trigger !== 'object' || trigger === null) {
+    nameReadRefusal(journal, sessionId, 'trigger',
+      'the trigger record is structurally invalid; reading it as absent');
+    return null;
+  }
+  const state = trigger as { readonly lastFireUsage?: unknown;
+    readonly belowSinceFire?: unknown; readonly baselinePending?: unknown };
+  const usage = state.lastFireUsage;
+  const validUsage = usage === null
+    || (typeof usage === 'number' && Number.isSafeInteger(usage) && usage >= 0);
+  if (!validUsage || typeof state.belowSinceFire !== 'boolean'
+    || typeof state.baselinePending !== 'boolean') {
+    nameReadRefusal(journal, sessionId, 'trigger',
+      'the trigger record is structurally invalid; reading it as absent');
+    return null;
+  }
+  return { lastFireUsage: usage, belowSinceFire: state.belowSinceFire,
+    baselinePending: state.baselinePending };
 }
 
 /**
@@ -247,7 +331,12 @@ export function readPendingAppends(target: ResolvedRacoonsStorage,
   const dir = sessionDirOf(target);
   if (dir === null) return [];
   try {
-    const appends = readDoc(dir)['appends'];
+    const read = readDoc(dir);
+    if (read.reason !== undefined) {
+      nameReadRefusal(journal, sessionId, 'appends', read.reason);
+      return [];
+    }
+    const appends = read.doc['appends'];
     if (!Array.isArray(appends)) return [];
     const records: DurableAppendRecord[] = [];
     for (const [index, value] of appends.entries()) {
@@ -284,92 +373,19 @@ export function writePendingAppends(target: ResolvedRacoonsStorage,
   records: readonly DurableAppendRecord[], journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const prior = readDoc(dir);
-  return publishDoc(dir, {
-    ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
-    ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
-      ? { trigger: prior['trigger'] } : {}),
-    ...(typeof prior['entryAskFired'] === 'boolean'
-      ? { entryAskFired: prior['entryAskFired'] } : {}),
-    ...(Array.isArray(prior['entryPublishes'])
-      ? { entryPublishes: prior['entryPublishes'] } : {}),
-    ...(records.length > 0 ? { appends: records } : {}),
-  }, journal, sessionId, 'append-persist-error', { pending: records.length });
-}
-
-/**
- * One entry replacement a released life still owes the host surface
- * (ISSUE-450). `callId` is the node identity `publishEntry` resolves at replay
- * time, `eventId` is the transcript id the journal names, and `bytesBase64`
- * carries the replacement body losslessly through the JSON file.
- */
-export interface DurableEntryPublish {
-  readonly callId: string;
-  readonly eventId: string;
-  readonly bytesBase64: string;
-}
-
-/**
- * The pending entry-publish intent this session's file carries (ISSUE-450), in
- * commit order, or `[]` when none is readable. The same fail-open rule as the
- * append intent: a malformed record is named through `pending-append-corrupt`
- * with `fact: 'entry-publishes'` and the whole fact reads empty rather than a
- * half-decoded body reaching the host.
- */
-export function readPendingEntryPublishes(target: ResolvedRacoonsStorage,
-  journal?: MountJournal, sessionId?: string): DurableEntryPublish[] {
-  const dir = sessionDirOf(target);
-  if (dir === null) return [];
-  try {
-    const publishes = readDoc(dir)['entryPublishes'];
-    if (!Array.isArray(publishes)) return [];
-    const records: DurableEntryPublish[] = [];
-    for (const [index, value] of publishes.entries()) {
-      const malformed = (detail: string): DurableEntryPublish[] => {
-        journal?.('pending-append-corrupt', { sessionId, position: index,
-          detail, fact: 'entry-publishes' });
-        return [];
-      };
-      if (typeof value !== 'object' || value === null) return malformed('record is not an object');
-      const record = value as { readonly callId?: unknown; readonly eventId?: unknown;
-        readonly bytesBase64?: unknown };
-      if (typeof record.callId !== 'string' || typeof record.eventId !== 'string'
-        || typeof record.bytesBase64 !== 'string') {
-        return malformed('record is missing a string callId, eventId or bytesBase64');
-      }
-      const bytes = Buffer.from(record.bytesBase64, 'base64');
-      if (bytes.toString('base64') !== record.bytesBase64) {
-        return malformed('bytesBase64 does not round-trip');
-      }
-      records.push({ callId: record.callId, eventId: record.eventId,
-        bytesBase64: record.bytesBase64 });
-    }
-    return records;
-  } catch {
-    return [];
+  const read = readDoc(dir);
+  const fields = { pending: records.length };
+  if (read.transient) {
+    return refusePublish(dir, read.reason ?? 'unreadable', journal, sessionId,
+      'append-persist-error', fields);
   }
-}
-
-/**
- * Write the pending entry-publish intent (ISSUE-450), preserving the round,
- * latch, first-ask flag and append intent the file already carries. An empty
- * queue removes the fact, so a fully published session leaves no stale replay
- * payload. Published atomically through the same temp+rename; a failed write
- * journals `entry-publish-persist-error` and returns false — the in-memory
- * queue still serves this process, only the restart durability is lost.
- */
-export function writePendingEntryPublishes(target: ResolvedRacoonsStorage,
-  records: readonly DurableEntryPublish[], journal: MountJournal, sessionId: string): boolean {
-  const dir = sessionDirOf(target);
-  if (dir === null) return true;
-  const prior = readDoc(dir);
+  const prior = read.doc;
   return publishDoc(dir, {
     ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
     ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
       ? { trigger: prior['trigger'] } : {}),
     ...(typeof prior['entryAskFired'] === 'boolean'
       ? { entryAskFired: prior['entryAskFired'] } : {}),
-    ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
-    ...(records.length > 0 ? { entryPublishes: records } : {}),
-  }, journal, sessionId, 'entry-publish-persist-error', { pending: records.length });
+    ...(records.length > 0 ? { appends: records } : {}),
+  }, journal, sessionId, 'append-persist-error', fields);
 }
