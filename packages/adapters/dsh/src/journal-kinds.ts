@@ -150,8 +150,11 @@ export const CREMATOR_JOURNAL_KINDS = [
   // the install boundary (ISSUE-414): one line per mount of a durable session,
   // naming the mount generation and whether this mount recorded the first one
   // (`fresh: true`) or resumed state this session already owned. A fresh mount
-  // over a session with pre-install history never replays or asks about that
-  // history; the count of the node ids it excluded rides beside it.
+  // over a session with pre-install history records that history as the
+  // session's inherited set; the set is fork/clone identity evidence, never an
+  // eligibility gate, so a later pass tables and removes those results exactly
+  // like one the mount observed land. The count of recorded node ids rides
+  // beside the line.
   'install-boundary',
   // a durable mount-state write (install identity, pending forgets, receipts)
   // failed: the in-memory state still serves this process, only its restart
@@ -168,12 +171,12 @@ export const CREMATOR_JOURNAL_KINDS = [
   'install-persist-error',
   // a mount with no readable install record found its own rows in the durable
   // ledger (ISSUE-460) and classified itself `restart` instead of `inherited`:
-  // `reason` is `ledger-rows`, `source` names where the pre-install set came
+  // `reason` is `ledger-rows`, `source` names where the inherited set came
   // from (`preinstall-record` when the mount's own durable proof answers,
-  // `surface-unsafe` when no proof exists and every surface result must stay
-  // excluded), and `preInstall` counts that set (ISSUE-477). Rows under this
-  // session id are its own past; a fork's copied rows carry the parent's id and
-  // do not count.
+  // `surface-unsafe` when no proof exists and the surface's results are
+  // recorded by name), and `preInstall` counts that set (ISSUE-477). Rows under
+  // this session id are its own past; a fork's copied rows carry the parent's id
+  // and do not count.
   'install-fallback',
   // a fork mount dropped the parent's owed durable work from the child's copy
   // (ISSUE-437): `parentSessionId` names the session the copied state belongs

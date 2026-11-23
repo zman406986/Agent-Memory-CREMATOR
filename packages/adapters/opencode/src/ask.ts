@@ -196,12 +196,6 @@ export interface OpencodeAskInput {
    */
   readonly appliedPlans?: OpencodeAppliedPlanIndex;
   /**
-   * The install boundary (ISSUE-419): node ids that were present before this
-   * mount started. They are neither tabled nor removed by the pass, even when a
-   * banked row or a seen mark would otherwise reach them.
-   */
-  readonly excludeNodeIds?: ReadonlySet<NodeId>;
-  /**
    * Whether this fire is the session's FIRST table ask (ISSUE-194; ADR-0050
    * decision 5). `true` states the 70 percent keep target, `false` the 40
    * percent one for every later ask. Defaults to `true` for a pure table build;
@@ -312,7 +306,6 @@ export function buildOpencodeAskBatch(input: OpencodeAskInput): OpencodeAskBatch
     messages: input.messages,
     round,
     ...(input.classes === undefined ? {} : { classes: input.classes }),
-    ...(input.excludeNodeIds === undefined ? {} : { excludeNodeIds: input.excludeNodeIds }),
   });
   if (plan === null) return null;
   const nodes: ToolResultNode[] = [];
@@ -346,13 +339,6 @@ export function buildOpencodeAskBatch(input: OpencodeAskInput): OpencodeAskBatch
   const rows: PruneAskRow[] = [];
   const bankedRows: PruneAskRow[] = [];
   for (const row of plan.askRows) {
-    // ISSUE-419: a node present before this mount is never a row, whatever a
-    // banked removal or a seen mark says. The pass already excluded it; this
-    // keeps a caller that supplied its own plan from re-introducing it.
-    if (input.excludeNodeIds?.has(row.unit.nodeId) === true) {
-      dropped.unseen += 1;
-      continue;
-    }
     if (appliedPlans !== undefined
       && opencodeBankedRemovalOf(row.unit.nodeId, appliedPlans, input.messages,
         input.sessionId, nodeIds)) {
@@ -401,22 +387,18 @@ export function buildOpencodePassPlan(input: {
   readonly messages: readonly OpencodeMessage[];
   readonly round: number;
   readonly classes?: DedupeClasses;
-  /** The install boundary (ISSUE-419): nodes excluded from removal and the table. */
-  readonly excludeNodeIds?: ReadonlySet<NodeId>;
 }): PrunePassPlan | null {
   if (!Number.isSafeInteger(input.round) || input.round < 1) {
     throw new RangeError('cremator: the pass needs a positive round ordinal');
   }
-  const excluded = input.excludeNodeIds;
   const nodes: ToolResultNode[] = [];
   for (const node of input.snapshot.nodes) {
     if (node.kind !== 'tool-result') continue;
-    if (excluded?.has(node.id) === true) continue;
     nodes.push(node);
   }
   const units = new UnitTracker({
     sessionId: input.sessionId, barBytes: OPENCODE_ASK_FLOOR_BYTES,
-  }).units(input.snapshot).filter(unit => excluded?.has(unit.nodeId) !== true);
+  }).units(input.snapshot);
   if (units.length === 0) return null;
   const episodes: readonly Episode[] = new EpisodeTracker({
     noNewPathSteps: DEFAULT_CONFIG.thresholds.episodeNoNewPathSteps,

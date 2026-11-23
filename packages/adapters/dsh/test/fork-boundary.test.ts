@@ -8,9 +8,10 @@
  * the parent's copy carried to a child id. These tests build exactly that shape
  * (a real per-session directory copied to a second id) and pin:
  *
- *   1. the child is recognised as a fork by name, replays nothing, asks nothing
- *      and tables nothing it inherited, while its OWN new result is delivered
- *      and asked as usual; and
+ *   1. the child is recognised as a fork by name and replays nothing it
+ *      inherited, while its OWN new result is delivered and asked as usual.
+ *      The inherited results are ordinary history for the bulk lane: a later
+ *      `/cremate` plans and asks over them (no pre-install eligibility gate);
  *   2. the child's first step names the missing capture instead of refusing
  *      `no-seed` — the parent's request is not this session's seed.
  */
@@ -224,7 +225,7 @@ async function forkedFixture(beforeCopy?: (root: string) => void): Promise<{
   return { dir, root, parent, child: inheritedSession('session-child', parent), body };
 }
 
-test('ISSUE-422: a forked child excludes its parent\'s settled surface and replays nothing', async () => {
+test('ISSUE-422: a forked child replays nothing and tables its inherited surface', async () => {
   const fixture = await forkedFixture();
   const journal: JournalLine[] = [];
   const second = mountOn(fixture.root, journal);
@@ -255,19 +256,24 @@ test('ISSUE-422: a forked child excludes its parent\'s settled surface and repla
       'session-child',
       'the child records its OWN install identity over the copy');
 
-    // Settle the inherited surface: no replay, no ask, no table.
+    // The fork still recovers nothing from the parent (the child's first mount
+    // never replays inherited work), but the parent's results are no longer
+    // excluded from the bulk lane: `/cremate` plans and asks over them.
     await second.runStep(child, { turn: 2, step: 1 });
     assert.equal(kinds(journal, 'entry').length, 0, 'no inherited landing was re-delivered');
     assert.equal(kinds(journal, 'entry-resume-recovered').length, 0,
       'a fork recovers nothing from the parent');
-    assert.equal(kinds(journal, 'entry-ask').length, 0, 'no ask fired over inherited history');
+    assert.equal(kinds(journal, 'entry-ask').length, 0, 'no entry ask fired over inherited history');
     requestPrune(child, 2);
     await second.runStep(child, { turn: 2, step: 2 });
-    assert.equal(kinds(journal, 'prune-plan')[0]?.['units'], 0,
-      'the bulk lane plans no unit for inherited content');
-    assert.equal(kinds(journal, 'prune-verdict').length, 0, 'nothing inherited was tabled');
+    const inheritedPlan = kinds(journal, 'prune-plan')[0];
+    assert.equal(inheritedPlan?.['units'], 1,
+      'the bulk lane plans the inherited content like any other');
+    assert.equal(inheritedPlan?.['askRows'], 1, 'and puts it on the table');
+    assert.equal(kinds(journal, 'prune-table').length > 0, true,
+      'the prune ask left the seam');
     assert.equal(surfaceResultText(child, 'c1'), fixture.body,
-      'the inherited result keeps every byte');
+      'the inherited result keeps every byte because this answer kept it');
 
     // The child's OWN next result is ordinary: delivered and asked once.
     step(child, 3, 'c2', oversizedBody('CHILD'));
@@ -361,8 +367,11 @@ test('ISSUE-437: a fork drops the parent\'s owed forgets and appends', async () 
     await third.runStep(childAgain, { turn: 2, step: 1 });
     assert.equal(kinds(childJournal, 'forget-recovered').length, 0,
       'no inherited forget was re-queued');
-    assert.equal(kinds(childJournal, 'entry-resume-recovered').length, 0,
-      'no inherited append was replayed');
+    // The restart recovers the surface (the inherited result is ordinary
+    // history now), but the parent's append is never replayed.
+    assert.equal(kinds(childJournal, 'entry-resume-recovered')
+      .filter(line => line['appends'] !== undefined && line['appends'] !== 0).length, 0,
+    'no inherited append was replayed');
     assert.equal(kinds(childJournal, 'forget').length, 0, 'no forget ran in the child');
 
     // A parent restart on its own directory still replays both facts.
@@ -759,7 +768,7 @@ test('ISSUE-478: a withheld fork identity keeps the child\'s own result eligible
     const thirdJournal: JournalLine[] = [];
     const third = mountOn(fixture.root, thirdJournal);
     try {
-      const entry = await third.sessionFor(fixture.child.id, fixture.child);
+      await third.sessionFor(fixture.child.id, fixture.child);
       assert.equal(kinds(thirdJournal, 'fork-clear-pending').length, 1,
         'the remount names the pending-clear marker');
       const boundaryIndex = thirdJournal.findIndex(line => line.kind === 'install-boundary');
@@ -770,18 +779,23 @@ test('ISSUE-478: a withheld fork identity keeps the child\'s own result eligible
       assert.equal(droppedIndex < boundaryIndex, true,
         'the clear completes before the identity lands');
       assert.equal(kinds(thirdJournal, 'install-boundary').at(-1)?.['preInstall'], 1,
-        'only the inherited result is pre-install on the remount');
-      assert.equal(entry.preInstallNodeIds.has('dsh:session-child:result:c2'), false,
-        'the child\'s own result is not inherited history');
+        'only the inherited result is recorded on the remount');
+      const childState = JSON.parse(readFileSync(join(dirname(resolveSessionStorage(
+        fixture.root, 'session-child').databasePath), 'mount-state.json'), 'utf8')) as
+        { readonly install?: { readonly preInstallNodeIds?: readonly string[] } };
+      assert.deepEqual(childState.install?.preInstallNodeIds,
+        ['dsh:session-child:result:c1'],
+        'the child\'s own result is not inherited history (identity, not eligibility)');
 
-      // Recovery re-queues the child's own surface result, not the parent's.
+      // Recovery re-queues every surface result, including the inherited one:
+      // the set no longer gates delivery.
       await third.runStep(fixture.child, { turn: 2, step: 2 });
       assert.equal(kinds(thirdJournal, 'entry').some(line =>
         line['eventId'] === 'dsh:session-child:result:c2'), true,
       'the remount delivers the child\'s own result');
       assert.equal(kinds(thirdJournal, 'entry').some(line =>
-        line['eventId'] === 'dsh:session-child:result:c1'), false,
-      'the inherited result is never re-delivered');
+        line['eventId'] === 'dsh:session-child:result:c1'), true,
+      'the inherited result is recovered like any other');
     } finally {
       await third.close();
       cleanup(fixture.dir);

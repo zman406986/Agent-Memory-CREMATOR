@@ -911,6 +911,33 @@ test('a read result states its outcome and coverage from host data', () => {
   assert.equal(word.coverage, 'full', 'the successful whole read stays full');
 });
 
+test('every 2.4.0 read-truncation notice form withholds the full-coverage claim', () => {
+  /*
+   * ISSUE-536: 2.4.0 builds the notice from one template with four forms. The
+   * adapter matched only the plain saved form, so a cut last line, a failed
+   * save, or a zero-line cut was recorded as a whole-file read and the core
+   * could remove an earlier whole read as superseded. Every form must claim no
+   * coverage; an ordinary untruncated read still claims full.
+   */
+  const cases: readonly (readonly [string, string])[] = [
+    ['plain', '[showing lines 1-2000 of 5000; full output saved to /tmp/full.txt]'],
+    ['last line cut',
+      '[showing lines 1-2000 (last line cut) of 5000; full output saved to /tmp/full.txt]'],
+    ['save failed', '[showing lines 1-2000 of 5000; full output could not be saved: EACCES]'],
+    ['zero lines', '[showing 0 lines of 5000; full output saved to /tmp/full.txt]'],
+  ];
+  for (const [label, notice] of cases) {
+    const read = readPathEvidence(oneRead('call_notice', { filePath: 'BIG.md' },
+      textResult(`head\n${notice}\n`)), 'call_notice');
+    assert.equal(read.outcome, 'hit', `${label}: a truncated read is still a hit`);
+    assert.equal(Object.hasOwn(read, 'coverage'), false,
+      `${label}: the truncation notice means no full-coverage claim`);
+  }
+  const whole = readPathEvidence(oneRead('call_whole_536', { filePath: 'OK.md' },
+    textResult('the whole file')), 'call_whole_536');
+  assert.equal(whole.coverage, 'full', 'an untruncated read still claims full coverage');
+});
+
 test('a failed tool result carries the failure flag on its evidence', () => {
   /*
    * ISSUE-328 parity with dsh: the host's structured error tag travels on

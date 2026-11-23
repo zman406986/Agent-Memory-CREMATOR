@@ -73,11 +73,21 @@ the mount appends one JSON record per line to; it is the JSON-config form of the
 optional, and a write failure never changes an outcome. `excludeTools` is the test-only tool
 exclusion described below.
 
+OpenCode 2.4.0 calls `setup` once per location in one server process. Every location shares the
+one process-wide mount for the configured durable root, so each session has one ledger and one
+ask lane; each location still registers its own `/cremate` command and tools, so a chat works
+whichever folder the server was started in. A location whose options differ from the first one's
+joins the mount and says so on its `mount-shared` journal line; the first mount's options win.
+
 ### The `/cremate` command
 
 On a host that exposes `context.command.transform`, `setup` registers the manual `cremate` command;
-the host lists it as `/cremate`. It runs the same table pass on demand, not gated by the depth
-latch. A host without that seam mounts without the command; the automatic pass still runs.
+the host lists it as `/cremate` in that location. It runs the same table pass on demand, not gated
+by the depth latch. A host without that seam mounts without the command; the automatic pass still
+runs. The menu parts also call the `cremator-opencode` RPC, which every location registers and
+which runs the same pass. A session needs one request since this process loaded for the mount to
+hold its array; `/cremate` before that first request reports `no-session`, because the plugin seam
+exposes stored messages but not the assembled request the pass plans against.
 
 ## What the mount does
 

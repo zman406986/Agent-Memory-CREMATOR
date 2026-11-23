@@ -3,8 +3,8 @@
  * over a durable storage root and a fake host session, one claim each:
  *
  *   1. a mount installed into a session that already holds history records the
- *      install, replays nothing, asks nothing and never tables or removes the
- *      pre-install result;
+ *      install and the inherited set, and a later `/cremate` pass tables and
+ *      removes the pre-install result exactly like a result it observed land;
  *   2. a later mount over the SAME durable state is a restart: it recovers the
  *      landings the previous process left on the surface, exactly as before.
  *
@@ -28,7 +28,8 @@ import { PREINSTALL_RECORD_FILE } from '../src/preinstall-record.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
 
 const ROUTE = { provider: 'p', model: 'm' };
-const FORGET = '{"1":{"forgetall":"oversized read"}}';
+// The shipped prune grammar's `forgetall`: a boolean action plus its summary.
+const FORGET = '{"1":{"forgetall":true,"summary":"oversized read"}}';
 
 interface FakeSession extends DshMountSession {
   readonly log: DshMountEvent[];
@@ -191,6 +192,18 @@ function requestPrune(session: FakeSession): void {
 const kinds = (journal: readonly JournalLine[], kind: string): JournalLine[] =>
   journal.filter(line => line.kind === kind);
 
+/** The model-visible text of every node on the session's live surface. */
+function liveSurfaceTexts(session: FakeSession): string[] {
+  const texts: string[] = [];
+  for (const seq of session.surface?.nodes ?? []) {
+    const event = session.eventAt?.(seq);
+    if (event === undefined) continue;
+    const data = event.data as { message?: { content?: readonly { text?: string }[] } };
+    texts.push(data.message?.content?.map(block => block.text ?? '').join('') ?? '');
+  }
+  return texts;
+}
+
 function cleanup(dir: string): void {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try { rmSync(dir, { recursive: true, force: true }); return; }
@@ -198,7 +211,7 @@ function cleanup(dir: string): void {
   }
 }
 
-test('a fresh install into a session with history replays, asks and removes nothing', async () => {
+test('a fresh install into a session with history tables and removes the old result', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'racoons-install-'));
   const root = join(dir, 'racoons');
   const journal: JournalLine[] = [];
@@ -220,30 +233,40 @@ test('a fresh install into a session with history replays, asks and removes noth
     requestPrune(session);
     await preStep(mount.listeners, session);
 
-    // The install boundary is recorded and names the pre-install result.
+    // The install boundary is recorded and still names the inherited set. The
+    // set is durable identity evidence, not an eligibility gate.
     const boundary = kinds(journal, 'install-boundary');
     assert.equal(boundary.length, 1, 'one install-boundary line');
     assert.equal(boundary[0]?.['fresh'], true, 'a mount with no durable state is a fresh install');
-    assert.equal(boundary[0]?.['preInstall'], 1, 'the result already on the surface is pre-install');
+    assert.equal(boundary[0]?.['preInstall'], 1, 'the result already on the surface is recorded');
     const statePath = join(dirname(resolveSessionStorage(root, 'session-install').databasePath),
       'mount-state.json');
     const state = JSON.parse(readFileSync(statePath, 'utf8')) as
       { readonly install?: { readonly preInstallNodeIds?: readonly string[] } };
     assert.deepEqual(state.install?.preInstallNodeIds, [preInstallId],
-      'the durable install identity names the excluded node');
+      'the durable install identity names the inherited node');
 
-    // No replay, no entry ask, no removal, and the pass plans zero units.
-    assert.equal(kinds(journal, 'entry').length, 0, 'no pre-install landing was re-delivered');
-    assert.equal(kinds(journal, 'entry-ask').length, 0, 'no ask fired over pre-install history');
+    // No entry replay at mount (a fresh install runs no recovery), but the
+    // `/cremate` pass treats the inherited result exactly like a new one: it is
+    // planned, asked over, and removed.
+    assert.equal(kinds(journal, 'entry').length, 0, 'a fresh install delivers nothing at mount');
     assert.equal(kinds(journal, 'entry-resume-recovered').length, 0, 'a fresh install recovers nothing');
-    assert.equal(kinds(journal, 'prune-plan')[0]?.['units'], 0,
-      'the bulk lane plans no unit for pre-install content');
-    assert.equal(kinds(journal, 'prune-verdict').length, 0, 'nothing was tabled for removal');
-    assert.equal(kinds(journal, 'prune-apply').filter(line => line['status'] === 'applied').length, 0);
-    const surfaceText = (session.eventAt?.(surfaceSeq ?? -1)?.data as
-      { message?: { content?: readonly { text?: string }[] } } | undefined)
-      ?.message?.content?.map(block => block.text ?? '').join('') ?? '';
-    assert.equal(surfaceText, body, 'the pre-install result keeps every byte');
+    const plan = kinds(journal, 'prune-plan')[0];
+    assert.equal(plan?.['units'], 1, 'the bulk lane plans the inherited result');
+    assert.equal(plan?.['askRows'], 1, 'and puts it on the ask table');
+    assert.equal(kinds(journal, 'prune-table').length > 0, true, 'the ask left the seam');
+    const verdict = kinds(journal, 'prune-verdict');
+    assert.equal(verdict.length, 1, 'the inherited unit was tabled for removal');
+    assert.equal(verdict[0]?.['action'], 'forgetall', 'the judged action is named');
+    const applied = kinds(journal, 'prune-apply').filter(line => line['status'] === 'applied');
+    assert.equal(applied.length, 1, 'the removal landed through the apply leg');
+    assert.equal(applied[0]?.['removals'], 1);
+    // The host surface no longer holds the pre-install body; a record that can
+    // restore it took its place.
+    const liveTexts = liveSurfaceTexts(session);
+    assert.equal(liveTexts.includes(body), false, 'the pre-install body left the model surface');
+    assert.equal(liveTexts.some(text => text.startsWith('[not retained]')), true,
+      'a recall record replaced the forgotten result');
   } finally {
     await mount.close();
     cleanup(dir);
@@ -336,11 +359,13 @@ test('a restart on the same durable state still recovers its own landings', asyn
 /**
  * ISSUE-439 / ISSUE-458: the install identity is the input to every later
  * classification, so a failed write must not be read as "no durable state".
- * On a FIRST mount the computed pre-install set is a proved fact — this mount
+ * On a FIRST mount the computed inherited set is a proved fact — this mount
  * never observed those results land — so the failure path must not demote it.
- * A directory at the file's own path is the portable write injection.
+ * The set is identity, never an eligibility gate: the result is ordinary
+ * history a later pass may table and remove. A directory at the file's own path
+ * is the portable write injection.
  */
-test('ISSUE-458: a failed install write on a first mount keeps inherited history excluded',
+test('ISSUE-458: a failed install write on a first mount keeps the inherited set',
   async () => {
     const dir = mkdtempSync(join(tmpdir(), 'racoons-install-write-'));
     const root = join(dir, 'racoons');
@@ -373,10 +398,14 @@ test('ISSUE-458: a failed install write on a first mount keeps inherited history
         'the line names the boundary the write was for');
       assert.equal(kinds(journal1, 'install-boundary').length, 0,
         'no boundary is claimed that the file does not hold');
-      assert.equal(kinds(journal1, 'entry').length, 0, 'the inherited result is never delivered');
-      assert.equal(kinds(journal1, 'entry-ask').length, 0, 'and never asked over');
+      // The failed write makes this mount owe recovery, and nothing excludes the
+      // inherited result any more: recovery re-queues it as ordinary history.
+      assert.equal(kinds(journal1, 'entry')[0]?.['eventId'], preInstallId,
+        'the inherited result is delivered like any other');
+      assert.equal(kinds(journal1, 'entry-ask').length, 0,
+        'the entry ask trigger is off in this fixture');
       assert.equal(kinds(journal1, 'prune-apply').filter(line => line['status'] === 'applied').length,
-        0, 'and never removed');
+        0, 'no pass ran, so nothing was removed');
       const surfaceText = (session.eventAt?.(surfaceSeq ?? -1)?.data as
         { message?: { content?: readonly { text?: string }[] } } | undefined)
         ?.message?.content?.map(block => block.text ?? '').join('') ?? '';
@@ -390,14 +419,15 @@ test('ISSUE-458: a failed install write on a first mount keeps inherited history
       assert.equal(boundary.length, 1, 'the retry journals the boundary it wrote');
       assert.equal(boundary[0]?.['state'], 'inherited',
         'the retried boundary names what was attempted, never restart');
-      assert.equal(boundary[0]?.['preInstall'], 1, 'the computed pre-install id is kept');
+      assert.equal(boundary[0]?.['preInstall'], 1, 'the computed inherited id is kept');
       const state = JSON.parse(readFileSync(statePath, 'utf8')) as
         { readonly install?: { readonly preInstallNodeIds?: readonly string[] } };
       assert.deepEqual(state.install?.preInstallNodeIds, [preInstallId],
-        'the retried file still lists it as pre-install');
+        'the retried file still records it as inherited');
       await first.close();
 
-      // A later mount is a restart and still excludes the inherited result.
+      // A later mount is a restart over the same durable state. The inherited
+      // result is recovered as ordinary history, exactly like a new landing.
       await second.apply();
       attach(second, session);
       await preStep(second.listeners, session);
@@ -405,8 +435,8 @@ test('ISSUE-458: a failed install write on a first mount keeps inherited history
       assert.equal(remount[0]?.['state'], 'restart', 'the next mount is a restart');
       assert.equal(remount[0]?.['preInstall'], 1,
         'the inherited id survives to the next mount');
-      assert.equal(kinds(journal2, 'entry').length, 0,
-        'the result stays excluded on a restart');
+      assert.equal(kinds(journal2, 'entry')[0]?.['eventId'], preInstallId,
+        'the restart recovers the result instead of skipping it');
     } finally {
       await first.close();
       await second.close();
@@ -617,12 +647,13 @@ test('ISSUE-460: ledger rows rescue the classification after a lost install writ
   });
 
 /**
- * ISSUE-477: the ISSUE-460 ledger fallback must not promote results the session
- * never observed. The first mount computes the inherited set before its install
- * write fails; that set is durable in its own file, so a death that leaves a
- * ledger row behind still excludes the inherited result on the remount.
+ * ISSUE-477: the ISSUE-460 ledger fallback must still record the inherited set.
+ * The first mount computes it before its install write fails; that set is
+ * durable in its own file, so a death that leaves a ledger row behind still
+ * names the inherited result on the remount. It is identity evidence, not a
+ * skip: the result is recovered and delivered like any other.
  */
-test('ISSUE-477: the ledger fallback keeps the inherited result excluded', async () => {
+test('ISSUE-477: the ledger fallback keeps the inherited set as identity', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'racoons-ledger-inherited-'));
   const root = join(dir, 'racoons');
   const sessionId = 'session-ledger-inherited';
@@ -633,8 +664,8 @@ test('ISSUE-477: the ledger fallback keeps the inherited result excluded', async
   mkdirSync(statePath, { recursive: true });
   const journal1: JournalLine[] = [];
   const journal2: JournalLine[] = [];
-  const first = fakeMount(root, journal1, { entryAsk: true });
-  const second = fakeMount(root, journal2, { entryAsk: true });
+  const first = fakeMount(root, journal1);
+  const second = fakeMount(root, journal2);
   try {
     await first.apply();
     const session = fakeSession(sessionId);
@@ -651,7 +682,9 @@ test('ISSUE-477: the ledger fallback keeps the inherited result excluded', async
       readonly sessionId?: string; readonly ids?: readonly string[] };
     assert.equal(proof.sessionId, sessionId, 'the proof names this session');
     assert.deepEqual(proof.ids, [preInstallId],
-      'the computed pre-install set is durable before the first pass');
+      'the computed inherited set is durable before the first pass');
+    assert.equal(kinds(journal1, 'entry')[0]?.['eventId'], preInstallId,
+      'the first mount recovers the inherited result like any other');
     await first.close();
 
     // Plant the validation row this session's own earlier pass wrote: the only
@@ -678,15 +711,15 @@ test('ISSUE-477: the ledger fallback keeps the inherited result excluded', async
     assert.equal(fallback.length, 1, 'the fallback is named for the operator');
     assert.equal(fallback[0]?.['reason'], 'ledger-rows', 'the ledger rescued classification');
     assert.equal(fallback[0]?.['source'], 'preinstall-record',
-      'the journal names the durable proof as the exclusion reason');
-    assert.equal(fallback[0]?.['preInstall'], 1, 'the inherited result is still excluded');
-    assert.equal(kinds(journal2, 'entry').length, 0,
-      'the pre-existing result is never re-delivered');
+      'the journal names the durable proof as the source of the set');
+    assert.equal(fallback[0]?.['preInstall'], 1, 'the inherited set is still recorded');
+    assert.equal(kinds(journal2, 'entry')[0]?.['eventId'], preInstallId,
+      'the pre-existing result is recovered, not skipped');
     assert.equal(kinds(journal2, 'entry-ask').length, 0,
-      'and never asked over');
+      'the entry ask trigger is off in this fixture');
     assert.equal(kinds(journal2, 'prune-apply')
       .filter(line => line['status'] === 'applied').length, 0,
-    'and never removed');
+    'no pass ran, so nothing was removed');
   } finally {
     await first.close();
     await second.close();

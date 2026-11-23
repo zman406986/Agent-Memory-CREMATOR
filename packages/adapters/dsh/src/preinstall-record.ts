@@ -3,17 +3,22 @@
  *
  * `mount-state.json` carries the install identity, but its own write can fail
  * (a read-only file, or a directory at the path), and the install identity is
- * the thing that was withheld. The pre-install set is still a fact this mount
+ * the thing that was withheld. The inherited set is still a fact this mount
  * computed before its first pass: which surface results predate this session's
  * durable state, and which the fork's first mount already inherited. Keeping
  * that proof in its own sibling file makes it independent of the install
  * identity, so
  *
- *   - a mount whose install write never landed still reads back the set it
- *     computed instead of promoting inherited history to eligible (ISSUE-477);
+ *   - a mount whose install write never landed still reads back the inherited
+ *     set it computed, so the retried identity records the same fork/clone
+ *     facts (ISSUE-477);
  *   - a fork records the pending clear beside the set it inherited, so a death
- *     before the retry re-clears the parent's facts without recomputing
- *     pre-install from a surface the child has since grown (ISSUE-478).
+ *     before the retry re-clears the parent's facts without recomputing the
+ *     inherited set from a surface the child has since grown (ISSUE-478).
+ *
+ * The set is identity evidence, never an eligibility gate: nothing reads it to
+ * skip a result. It exists so a re-fork can name what the child inherited, not
+ * so a prune pass can exclude it.
  *
  * `pendingClear` is the durable marker that a fork still owes the parent's
  * clear. It lives here, not in the withheld install identity, because that
@@ -36,11 +41,11 @@ export const PREINSTALL_RECORD_FILE = 'preinstall.json';
 /** A per-process token so two writes never stage the same temp name. */
 let tempSeq = 0;
 
-/** One mount's pre-install proof. */
+/** One mount's inherited-set proof. */
 export interface DurablePreinstallRecord {
   /** The session this proof belongs to; a copy's parent record never answers for a child. */
   readonly sessionId: string;
-  /** The tool-result node ids this session never observed land. */
+  /** The tool-result node ids this session never observed land (identity, not a skip). */
   readonly ids: readonly string[];
   /** Whether a fork still owes the parent's fact clear before its identity lands. */
   readonly pendingClear: boolean;

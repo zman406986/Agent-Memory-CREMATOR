@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CharHeuristicTokenMeter, Meter } from '@cremator/core';
-import { costOf, stepEndedRow, tokenUsageOf, usageObservation } from '../src/meter.js';
+import { costOf, generateUsageRow, stepEndedRow, tokenUsageOf, usageObservation } from '../src/meter.js';
 import { runRows } from './rows.js';
 import type { Row } from './rows.js';
 
@@ -133,6 +133,47 @@ const ROWS: readonly Row[] = [
     assert.equal(malformed?.kind === 'usage' ? malformed.costUsd : 1, null,
       at('the malformed cost is null, never a number'));
     assert.equal(costOf(-1), null, at('a negative cost is not printable'));
+  } },
+  { name: 'the-generate-answer-is-the-ask-reading', run(at) {
+    const declared = generateUsageRow({
+      text: '{}',
+      tokens: { input: 1_000, output: 40, reasoning: 5, cache: { read: 700, write: 30 } },
+      cost: 0.0125,
+    }, 'ask:1');
+    assert.equal(declared?.kind, 'usage', at('the declared answer yields a usage row'));
+    if (declared?.kind !== 'usage') throw new Error(at('missing row'));
+    assert.deepEqual(declared.usage,
+      { inputTokens: 1_730, outputTokens: 40, cachedInputTokens: 730 },
+      at('the four token counts map through the step row arithmetic'));
+    assert.equal(declared.reasoningTokens, 5, at('reasoning is carried, never added to output'));
+    assert.equal(declared.cacheReadTokens, 700, at('the read bucket is carried'));
+    assert.equal(declared.cacheWriteTokens, 30, at('the write bucket is carried'));
+    assert.equal(declared.costUsd, 0.0125, at('the declared cost is carried'));
+    assert.equal(declared.messageId, 'ask:1', at('the id is the mount ask identity'));
+    // Precedence: the declared shape wins when both are usable.
+    const both = generateUsageRow({
+      text: '{}',
+      tokens: { input: 10, output: 2, reasoning: 1, cache: { read: 3, write: 4 } },
+      usage: { input: 99, output: 99, reasoning: 9, cache: { read: 9, write: 9 } },
+      cost: 0.5,
+    }, 'ask:2');
+    assert.deepEqual(both?.kind === 'usage' ? both.usage : null,
+      { inputTokens: 17, outputTokens: 2, cachedInputTokens: 7 },
+      at('the declared tokens beat the open usage field'));
+    assert.equal(both?.kind === 'usage' ? both.costUsd : 1, 0.5,
+      at('the declared cost is carried with the declared tokens'));
+    // The open shape is the fallback when the declared one is absent.
+    const open = generateUsageRow({ text: '{}',
+      usage: { input: 5, output: 3, reasoning: 0, cache: { read: 1, write: 1 } } }, 'ask:3');
+    assert.deepEqual(open?.kind === 'usage' ? open.usage : null,
+      { inputTokens: 7, outputTokens: 3, cachedInputTokens: 2 },
+      at('the open usage field still reads'));
+    assert.equal(open?.kind === 'usage' ? open.costUsd : 1, null,
+      at('no cost is stated, so cost is null, never zero'));
+    // Nothing stated is null, never a zero reading.
+    assert.equal(generateUsageRow({ text: '{}' }, 'ask:4'), null,
+      at('an answer with no reading is null'));
+    assert.equal(generateUsageRow(null, 'ask:5'), null, at('a non-object answer is null'));
   } },
 ];
 

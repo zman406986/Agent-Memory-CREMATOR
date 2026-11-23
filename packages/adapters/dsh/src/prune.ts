@@ -95,15 +95,6 @@ export interface RecordOnlyPruneOptions {
    */
   readonly settledNodeIds?: ReadonlySet<string>;
   /**
-   * Result node ids this mount must never table or remove (ISSUE-414): the tool
-   * results already on the host surface when this session's durable state was
-   * first recorded. They arrived before the mount existed, so it never observed
-   * them land; they are filtered out of the snapshot the pass plans against,
-   * which is the one way a unit can reach the table or a removal. Omitted or
-   * empty means nothing is excluded.
-   */
-  readonly excludedNodeIds?: ReadonlySet<string>;
-  /**
    * The bulk ask's answer grammar (ISSUE-221), passed straight from the mount's
    * resolved config. The mount's shipped default is `nokeepall` (ADR-0056); a
    * direct caller that omits it gets `3option`, the original contract byte for
@@ -193,14 +184,12 @@ export async function runRecordOnlyPrune(
   options: RecordOnlyPruneOptions,
 ): Promise<RecordOnlyPruneOutcome> {
   const { sessionId, journal } = options;
-  const excluded = options.excludedNodeIds;
-  // ISSUE-414: a pre-install result was never observed by this mount, so it is
-  // absent from the snapshot the pass plans against — and therefore from the
-  // units, the episodes and the table. Nothing downstream can name it.
-  const snapshot = excluded === undefined || excluded.size === 0
-    ? options.snapshot
-    : { ...options.snapshot,
-        nodes: options.snapshot.nodes.filter(node => !excluded.has(node.id)) };
+  // Every result the snapshot holds is eligible, including results that were
+  // already on the host surface when this session's durable state was created.
+  // There is no pre-install exclusion: the pass plans over exactly the surface
+  // it was handed, so a later `/cremate` or automatic pass can table and remove
+  // history this mount did not observe land.
+  const snapshot = options.snapshot;
   const units = new UnitTracker({ sessionId, barBytes: options.barBytes }).units(snapshot);
   const nodes = nodesOf(snapshot);
   const episodes: readonly Episode[] = new EpisodeTracker({

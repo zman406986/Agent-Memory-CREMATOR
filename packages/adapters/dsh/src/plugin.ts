@@ -742,15 +742,6 @@ export interface RacoonsSessionEntry {
    */
   resumeRecovery: boolean;
   /**
-   * The tool-result node ids this session already held when the mount's durable
-   * state was first recorded (ISSUE-414). They predate this mount, so it never
-   * observed them land: recovery does not re-queue them and the bulk lane does
-   * not table or remove them. Empty for an in-memory session (no durable state
-   * to distinguish a restart from a fresh install) and for a first mount over an
-   * empty surface.
-   */
-  readonly preInstallNodeIds: ReadonlySet<string>;
-  /**
    * The install generation this mount recorded or resumed (ISSUE-414): 1 on a
    * fresh install, one more on each later mount of the same durable state, and
    * null when the session has no durable target. It is a label for the journal,
@@ -2179,7 +2170,7 @@ export function createRacoonsMount(options: {
     const forkFrom = priorInstall !== null && priorInstall.sessionId !== undefined
       && priorInstall.sessionId !== sessionId ? priorInstall.sessionId : null;
     const forked = forkFrom !== null;
-    // ISSUE-477 / ISSUE-478: the pre-install proof and pending-clear marker in
+    // ISSUE-477 / ISSUE-478: the inherited-set proof and pending-clear marker in
     // their own file, so they survive the install identity's own failed write.
     // A record that names another session is the copied parent's and never
     // answers for this child.
@@ -2298,9 +2289,12 @@ export function createRacoonsMount(options: {
     // means this session's state is ours — a restart, and recovery runs exactly
     // as before. No durable state at all means this mount is being installed
     // into a session that may already hold history: it records the tool-result
-    // node ids already on that surface, recovers nothing, and never tables,
-    // removes or asks about them. An in-memory session has no durable state to
-    // read, so it keeps the pre-414 behaviour (recover).
+    // node ids already on that surface as the install's inherited set. That set
+    // is durable identity evidence for a later fork/clone mount (ISSUE-422,
+    // ISSUE-477, ISSUE-478); it is NOT an eligibility gate. A result it names is
+    // tableable and removable by a later pass exactly like a result this mount
+    // observes land. An in-memory session has no durable state to read, so it
+    // keeps the pre-414 behaviour (recover).
     let installGeneration: number | null = null;
     let preInstallNodeIds: ReadonlySet<string> = new Set<string>();
     let installBoundary: RacoonsSessionEntry['installBoundary'] = 'none';
@@ -2465,11 +2459,13 @@ export function createRacoonsMount(options: {
       if (forked) {
         // ISSUE-422: the state names the parent. Every result on the inherited
         // surface was settled by the parent, so all of it is this child's
-        // pre-install history; the child records its own generation-1 identity
-        // over the copy so a later mount of the child is a plain restart.
+        // inherited set; the child records its own generation-1 identity over
+        // the copy so a later mount of the child is a plain restart. The set is
+        // identity evidence (which results the child inherited), never a skip:
+        // a later prune pass may table and remove them like any other result.
         // ISSUE-478: a re-fork of a child that already ran here keeps the
-        // pre-install set its own first fork recorded. Recomputing it from the
-        // surface would promote the child's own results to inherited history.
+        // inherited set its own first fork recorded. Recomputing it from the
+        // surface would misreport the child's own results as inherited history.
         const restoredIds = ownPreinstall !== null ? [...ownPreinstall.ids] : surfaceToolIds;
         forkReborn = ownPreinstall !== null;
         if (ownPreinstall !== null && ownPreinstall.pendingClear) {
@@ -2491,14 +2487,15 @@ export function createRacoonsMount(options: {
         // a death before the boundary lands leaves no install identity. A ledger
         // row under THIS session id is proof the session already ran here (a
         // fork's copied rows carry the parent's id, so they never count). Trust
-        // the ledger over the missing file: classify a restart, promote nothing
-        // to pre-install, and name the fallback.
+        // the ledger over the missing file: classify a restart, record the
+        // inherited set, and name the fallback.
         if (await ledgerHasRows(ledger, sessionId)) {
-          // ISSUE-477: the pre-install set the first mount computed is durable
+          // ISSUE-477: the inherited set the first mount computed is durable
           // proof independent of the install identity, so a death before that
-          // identity lands does not promote inherited history to eligible.
-          // Without that proof the surface cannot be shown to be this session's
-          // own, so every surface result stays excluded by name.
+          // identity lands still records the same set. Without that proof the
+          // surface results cannot be shown to predate this session, so they are
+          // recorded as the inherited set by name. Either way the set is
+          // identity evidence, not an eligibility gate.
           const ids = ownPreinstall !== null ? [...ownPreinstall.ids] : surfaceToolIds;
           installGeneration = 1;
           preInstallNodeIds = new Set(ids);
@@ -2517,10 +2514,12 @@ export function createRacoonsMount(options: {
           // ISSUE-414: "pre-install" is what this mount never OBSERVED land. The
           // session/event observer has captured every result appended since the
           // plugin was applied, so a surface result absent from the capture
-          // buffer predates the plugin and must never be replayed, asked over or
-          // removed. (A host that appends between apply and the first session
+          // buffer predates the plugin and is recorded as the inherited set.
+          // (A host that appends between apply and the first session
           // registration cannot be told apart; it is the same shape a fresh
-          // install into existing history produces, so it is excluded too.)
+          // install into existing history produces, so it is recorded too.) The
+          // set is identity evidence only: those results stay tableable and
+          // removable exactly like one this mount observed land.
           const observed = new Set((buffers.get(sessionId) ?? []).map(capture => capture.eventId));
           const ids = host === undefined ? [] : surfaceTranscript(host, { sessionId }).items
             .filter(item => item.role === 'tool' && !observed.has(item.id))
@@ -2532,8 +2531,9 @@ export function createRacoonsMount(options: {
           installBoundary = ids.length > 0 ? 'inherited' : 'fresh';
           identity = { generation: 1, installedAtMs: clock.nowMs(),
             preInstallNodeIds: ids, sessionId };
-          // ISSUE-477: record the exclusion before the first pass, in its own
-          // file, so a lost install write cannot erase it.
+          // ISSUE-477: record the inherited set before the first pass, in its own
+          // file, so a lost install write cannot erase it. The set is never read
+          // as an eligibility gate; it survives as the fork/clone identity.
           writePreinstallRecord(durable, { sessionId, ids, pendingClear: false },
             journal, sessionId);
         }
@@ -2586,10 +2586,11 @@ export function createRacoonsMount(options: {
         // landed. The mount does not journal a boundary the file does not hold;
         // it fails closed and retries the identity at each boundary until it
         // lands. ISSUE-458: only a genuine restart (a prior install exists)
-        // falls back to "this session's own state with no result promoted to
-        // pre-install". A first mount classified `inherited` or `fresh` keeps
-        // the set it just computed — those ids were proved never observed, so
-        // demoting them would make history eligible.
+        // falls back to "this session's own state with the prior inherited set".
+        // A first mount classified `inherited` or `fresh` keeps the set it just
+        // computed — those ids were proved never observed, so the retried
+        // identity records them as the inherited set. The set gates no
+        // eligibility either way.
         installWriteFailed = true;
         if (!forked && priorInstall !== null) {
           installGeneration = priorInstall.generation + 1;
@@ -2647,7 +2648,7 @@ export function createRacoonsMount(options: {
           // proof and never replays the parent's inherited work.
           ? forkReborn
           : (priorInstall !== null || installWriteFailed || recoveredFromLedger)),
-      preInstallNodeIds, installGeneration,
+      installGeneration,
       installBoundary, retryInstallIdentity,
       compactionGeneration: 0, entryWindows: 0, pruneWindows: 0,
       compactionRearmDeferred: false,
@@ -4096,10 +4097,6 @@ export function createRacoonsMount(options: {
           // table must not re-list them. The pass reads the invalidation itself,
           // so a unit a write made stale is still listable.
           settledNodeIds: entry.entryKept,
-          // ISSUE-414: results already on the surface before this session's
-          // durable state existed were never observed landing, so the pass can
-          // neither table nor remove them.
-          excludedNodeIds: entry.preInstallNodeIds,
           // ISSUE-221: the bulk ask's grammar, resolved from the row; absent is
           // `3option`, the shipped contract byte for byte.
           grammar: config.pruneAskGrammar,
@@ -4347,11 +4344,12 @@ export function createRacoonsMount(options: {
    * a death before the flush left owed to the host. A fresh session finds
    * nothing to recover and writes no line.
    *
-   * Two bounds shape it. ISSUE-414: a result whose node id is in the mount's
-   * durable pre-install set was never observed landing, so it is never re-queued
-   * and never asked over. ISSUE-428: the latch clears only when every leg
+   * One bound shapes the clear. ISSUE-428: the latch clears only when every leg
    * succeeds; a throw (`collapse`, `surface-read`, `marks`, `appends`, `sync`)
    * leaves a named `entry-recovery-retry` line and the next boundary retries.
+   * Every surface result is re-queued, including results that predate this
+   * session's install identity (ISSUE-414's eligibility guard is gone): the
+   * surface the recovery reads is the whole history this session owns.
    */
   async function recoverResumedEntry(entry: RacoonsSessionEntry,
     session: DshMountSession): Promise<void> {
@@ -4429,9 +4427,6 @@ export function createRacoonsMount(options: {
     const queued = new Set(buffer.map(capture => capture.eventId));
     for (const [index, item] of synced.items.entries()) {
       if (item.role !== 'tool') continue;
-      // ISSUE-414: a result that predates this session's durable state was
-      // never observed landing, so it is never re-queued (and never asked over).
-      if (entry.preInstallNodeIds.has(item.id)) continue;
       // A failed result is never queued, exactly as `observe` skips it.
       if (isRecord(item.hostData) && item.hostData['isError'] === true) continue;
       if ((item.embeddedRecords?.length ?? 0) > 0) entry.entryJudged.add(item.id);

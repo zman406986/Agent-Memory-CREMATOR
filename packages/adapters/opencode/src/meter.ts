@@ -1,8 +1,9 @@
 /**
- * Step usage → the core's reconciliation row (ISSUE-192; 2.4.0 seam map).
+ * Step and ask usage → the core's reconciliation row (ISSUE-192; 2.4.0 seam
+ * map; ISSUE-538).
  *
- * The host has exactly one per-request place where an authoritative count exists:
- * the `session.step.ended` event. Its `data` carries `{sessionID,
+ * The main lane has exactly one per-request place where an authoritative count
+ * exists: the `session.step.ended` event. Its `data` carries `{sessionID,
  * assistantMessageID, finish, cost, tokens}` and `tokens` is
  * `{input, output, reasoning, cache: {read, write}}` (`@opencode/schema@2.4.0`
  * `dist/event-manifest.d.ts`, `session.step.ended`; `TokenUsage.Info` has the
@@ -10,10 +11,30 @@
  * nothing else; when the mount hands the value to `engine.observe` is the
  * mount's decision (`src/plugin.ts`).
  *
+ * **The ask lane's reading is the `session.generate` answer.** 2.4.0 declares
+ * the call's success body as `{data: {text, tokens, cost}}`
+ * (`@opencode/protocol@2.4.0` `dist/groups/session.d.ts`,
+ * `session.generate`); the plugin unwraps `data`, so the mount's own call
+ * resolves to `{text, tokens, cost}`. Those are the exact cost and the same
+ * four token counts a step row states, attributed by construction: the value
+ * is the answer to the one ask this mount sent, so no request id is needed.
+ *
+ * **`session.usage.recorded` is deliberately not subscribed to.** 2.4.0
+ * declares it with `source: "title" | "compaction" | "generate"` and data
+ * `{sessionID, source, cost, tokens}`, but it is replay-only:
+ * `session-event.js` publishes `UsageRecorded` in `DurableDefinitions`, not
+ * `Definitions`, with the comment "Internal and replay-only events are
+ * excluded from the public manifest". The plugin event hook is the public
+ * stream (`@opencode/plugin`'s `EventDomain` is typed by
+ * `EventSubscribeInput["types"]` / `EventSubscribeOutput`, neither of which
+ * lists it); only `GET /api/experimental/session/:id/log` returns it, and the
+ * plugin context exposes no session log. Requesting it on `event.subscribe`
+ * would decode-fail the whole subscription, so the mount never asks for it.
+ *
  * **`session.usage.updated` is deliberately not used.** It carries session
  * totals and no message id, so it cannot name the one request a reconciliation
  * row describes; using it would double count every step. The per-step event is
- * the only row source.
+ * the only main row source; for the ask, the generate answer is.
  *
  * **The count arithmetic is the host's own contract, restated in the core's
  * terms.** `Session.getUsage()` subtracts the cached tokens from the prompt
@@ -27,9 +48,10 @@
  *
  * **Absent is not zero.** A row with no `tokens` object is `missing`; a row whose
  * counts are malformed is `invalid`. A row with `cache: {read: 0, write: 0}` is a
- * cold cache (`0`), which is a fact the host stated. Only a `session.step.ended`
- * event yields a row; nothing is reconstructed from the message array, which no
- * longer carries `step-finish` parts.
+ * cold cache (`0`), which is a fact the host stated. A main row comes only from a
+ * `session.step.ended` event and an ask row only from a `session.generate`
+ * answer; nothing is reconstructed from the message array, which no longer
+ * carries `step-finish` parts.
  *
  * `cost` is telemetry input only. It is carried for the journal and never
  * reaches `ApiUsage`, so no value of it can change a gate or a reconciliation.
@@ -216,6 +238,32 @@ export function stepEndedRow(data: unknown): OpencodeStepUsageRow | null {
   return read.kind === 'missing'
     ? { kind: 'missing', messageId, reason: read.reason }
     : { kind: 'invalid', messageId, reason: read.reason };
+}
+
+/**
+ * One `session.generate` answer's own reading, or null when the host stated
+ * none (ISSUE-538).
+ *
+ * The declared 2.4.0 shape is `{text, tokens, cost}`: `tokens` is the same
+ * `{input, output, reasoning, cache: {read, write}}` object a step row carries,
+ * so it maps through the same `tokenUsageOf` arithmetic, and `cost` is
+ * telemetry only. `usage` is the open field an earlier host or a bench mock may
+ * state instead (ISSUE-300 item 7); when both are usable the DECLARED `tokens`
+ * wins, because that is the shape 2.4.0's endpoint promises. `askId` is the
+ * mount's own ask identity, never a host message id: the generate request is a
+ * transient call with no assistant message row.
+ */
+export function generateUsageRow(answer: unknown, askId: string): OpencodeUsageRow | null {
+  if (!isRecord(answer)) return null;
+  const declared = tokenUsageOf(answer['tokens']);
+  const read = declared.kind === 'usage' ? declared : tokenUsageOf(answer['usage']);
+  if (read.kind !== 'usage') return null;
+  return {
+    kind: 'usage', messageId: askId,
+    usage: { ...read.usage }, reasoningTokens: read.reasoningTokens,
+    costUsd: costOf(answer['cost']),
+    cacheReadTokens: read.cacheReadTokens, cacheWriteTokens: read.cacheWriteTokens,
+  };
 }
 
 /**

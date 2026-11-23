@@ -456,10 +456,20 @@ function toolTarget(
 
 /**
  * The host's truncation notice on a read result: the line/byte cap cut the body
- * and saved the rest to a file. A read that carries this is not a whole-file
- * observation, so no coverage is claimed.
+ * and saved the rest to a file (or failed to). A read that carries this is not
+ * a whole-file observation, so no coverage is claimed.
+ *
+ * 2.4.0 builds the notice from one template and can emit four forms:
+ *   `[showing lines 1-N of T; full output saved to PATH]`
+ *   `[showing lines 1-N (last line cut) of T; full output saved to PATH]`
+ *   `[showing lines 1-N of T; full output could not be saved: ERROR]`
+ *   `[showing 0 lines of T; full output saved to PATH]`
+ * The match is the notice's opening and tail shape, never one full sentence:
+ * a wording change in between still reads as truncation, and a truncated body
+ * the adapter fails to recognise must never claim full coverage (ISSUE-536).
  */
-const READ_TRUNCATION_NOTICE = /\[showing lines \d+-\d+ of \d+; full output saved to /u;
+const READ_TRUNCATION_NOTICE =
+  /\[showing (?:\d+ lines?|lines \d+(?:-\d+)?)[^\]\n]*; full output /u;
 
 /** The result's own text for the truncation notice; never a tag guess. */
 function resultValueText(result: OpencodeToolResultValue): string {

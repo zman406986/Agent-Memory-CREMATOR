@@ -2,9 +2,9 @@
 //
 // The product never caps, shortens or rewrites a tool result. This suite drives
 // the settlement seam with a 200 KB result and then models the host's own
-// `ToolOutput.truncate` as the installed 2.2.5 binary ran it: head
-// only, 2,000 lines or 50 KiB, full text saved to a file, `metadata.truncated`
-// and `outputPath` written by the host. No binary, no API key, no live call.
+// `ToolOutput.truncate` as the installed 2.4.0 binary runs it: head only, 2,000
+// lines or 50 KiB, full text saved to a file, `metadata.truncated` and
+// `outputPath` written by the host. No binary, no API key, no live call.
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -66,10 +66,13 @@ function requestWith(body: string): OpencodeMessage[] {
 }
 
 /**
- * The host's `ToolOutput.truncate`, modelled from the installed binary. The
- * kept prefix is the leading whole lines that fit both limits; the full text is
- * written to `<data>/tool-output/tool_<12 hex>`; the stored result carries the
- * notice and `metadata.truncated: true` plus `outputPath`.
+ * The host's `ToolOutput.truncate`, modelled from the installed 2.4.0 binary
+ * (`maxLines = 2000`, `maxBytes = 51200`). The kept prefix is the leading whole
+ * lines that fit both limits — the host's byte cut can also keep a partial last
+ * line, which its notice marks `(last line cut)`; this model stops at a line
+ * boundary. The full text is written to `<data>/tool-output/tool_<12 hex>`; the
+ * stored result carries the notice and `metadata.truncated: true` plus
+ * `outputPath`.
  */
 function hostTruncate(content: string, outputRoot: string): {
   text: string; metadata: Readonly<Record<string, unknown>>; outputPath: string | null;

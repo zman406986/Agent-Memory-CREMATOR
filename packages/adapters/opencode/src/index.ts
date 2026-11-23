@@ -45,6 +45,7 @@ export type {
   OpencodeContentPart,
   OpencodeEffortPart, OpencodeGenerateInput, OpencodeGenerateOutput, OpencodeHostEvent,
   OpencodeIdleHookInput,
+  OpencodeLocationInfo,
   OpencodeMediaPart, OpencodeMessage, OpencodeMessageRole, OpencodeModelCatalog,
   OpencodeModelInfo, OpencodePluginContext,
   OpencodePluginDefinition, OpencodeReasoningPart, OpencodeSessionContext, OpencodeTextPart,

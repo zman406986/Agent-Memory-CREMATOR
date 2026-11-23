@@ -5567,8 +5567,9 @@ test('ISSUE-409: a claimed revision is not re-asked after a restart', async () =
       journal: () => {},
     });
     try {
-      // Install boundary first (no tool node), then the unit arrives later.
-      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      // No boundary is claimed for eligibility (ADR-0069); the first request
+      // simply carries no tool node, so the seen set stays empty.
+      await first.transform(sessionId, []);
       const messages = largeHostMessages();
       await first.transform(sessionId, messages);
       assert.equal(calls.length, 0, 'the carrying request tables nothing');
@@ -5689,7 +5690,7 @@ test('ISSUE-468: a durable revision claim is named, not no-eligible', async () =
       journal: () => {},
     });
     try {
-      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, []);
       await first.transform(sessionId, largeHostMessages());
       await first.transform(sessionId, largeHostMessages());
       assert.equal(calls.length, 1, 'the first mount claimed the revision once');
@@ -6087,7 +6088,7 @@ test('ISSUE-486: a restored durable unit claim is named, not no-eligible', async
       journal: () => {},
     });
     try {
-      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, []);
       await first.transform(sessionId, largeHostMessages());
       await first.transform(sessionId, largeHostMessages());
       const entry = first.sessions.get(sessionId);

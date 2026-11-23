@@ -688,6 +688,107 @@ test('the ask journal carries the host generate usage and its cache split', asyn
   } finally { await mount.close(); }
 });
 
+test('the ask reads the declared generate answer: tokens and cost, named as the host source',
+  async () => {
+    const lines = journalLines();
+    const mount = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      askGrammar: 'prune-two-option',
+      /** 2.4.0's `session.generate` answer shape: `{text, tokens, cost}`. */
+      askGenerate: async () => {
+        const answer = {
+          text: '{"1":{"keepall":true}}',
+          tokens: { input: 1_000, output: 40, reasoning: 5, cache: { read: 700, write: 30 } },
+          cost: 0.0125,
+        };
+        return answer;
+      },
+      journal: record => lines.records.push(record as unknown as Record<string, unknown>),
+    });
+    try {
+      const messages = largeReadConversation();
+      await mount.transform(sessionId, messages);
+      await mount.transform(sessionId, messages);
+      const ask = lines.of('ask').at(-1);
+      assert.ok(ask !== undefined, 'the ask fired and wrote its line');
+      assert.equal(ask['usageSource'], 'host-generate',
+        'the declared host answer is named as the source');
+      assert.deepEqual(ask['usage'], {
+        inputTokens: 1_730, outputTokens: 40, cachedInputTokens: 730, reasoningTokens: 5,
+      }, 'all four declared token counts are recorded through the tokenUsageOf mapping');
+      assert.equal(ask['cacheReadTokens'], 700, 'the cache read bucket is carried');
+      assert.equal(ask['cacheWriteTokens'], 30, 'the cache write bucket is carried');
+      assert.equal(ask['costUsd'], 0.0125, 'the declared cost is recorded as telemetry');
+    } finally { await mount.close(); }
+  });
+
+test('the declared generate answer wins over the open usage field', async () => {
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    askGrammar: 'prune-two-option',
+    askGenerate: async () => {
+      const answer = {
+        text: '{"1":{"keepall":true}}',
+        tokens: { input: 10, output: 2, reasoning: 1, cache: { read: 3, write: 4 } },
+        usage: { input: 999, output: 999, reasoning: 9, cache: { read: 9, write: 9 } },
+        cost: 0.5,
+      };
+      return answer;
+    },
+    journal: record => lines.records.push(record as unknown as Record<string, unknown>),
+  });
+  try {
+    const messages = largeReadConversation();
+    await mount.transform(sessionId, messages);
+    await mount.transform(sessionId, messages);
+    const ask = lines.of('ask').at(-1);
+    assert.ok(ask !== undefined, 'the ask fired');
+    assert.deepEqual(ask['usage'], {
+      inputTokens: 17, outputTokens: 2, cachedInputTokens: 7, reasoningTokens: 1,
+    }, 'the declared tokens are the reading; the open field does not override them');
+    assert.equal(ask['costUsd'], 0.5, 'the declared cost is carried');
+  } finally { await mount.close(); }
+});
+
+test('the ask answer\'s reading never consumes a main request estimate', async () => {
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    askGrammar: 'prune-two-option',
+    askGenerate: async () => {
+      const answer = {
+        text: '{"1":{"keepall":true}}',
+        tokens: { input: 900, output: 30, reasoning: 2, cache: { read: 100, write: 0 } },
+        cost: 0.005,
+      };
+      return answer;
+    },
+    journal: record => lines.records.push(record as unknown as Record<string, unknown>),
+  });
+  try {
+    const messages = largeReadConversation();
+    await mount.transform(sessionId, messages);
+    const estimate = mount.sessions.get(sessionId)?.pendingEstimates.at(-1);
+    assert.ok(estimate !== null && estimate !== undefined, 'the mount made a main estimate');
+    await mount.transform(sessionId, messages);
+    assert.equal(lines.of('ask').length, 1, 'the ask fired from the second request');
+    /**
+     * The ask's answer is not a step row: it never shifts the main queue. The
+     * next main row must pair with the estimate the mount made BEFORE the ask.
+     */
+    await mount.event(stepUsage('msg_main', 1_234));
+    const reconciled = lines.of('usage-reconciled');
+    assert.equal(reconciled.length, 1, 'the main row is the only reconciled row');
+    assert.equal(reconciled[0]?.['requestId'], 'msg_main', 'the main row is reconciled');
+    assert.equal(reconciled[0]?.['estimatedInputTokens'], estimate.inputTokens,
+      'the main row pairs with its own estimate');
+    const askMissing = lines.of('usage-missing')
+      .filter(line => line['reason'] === 'ask-request');
+    assert.equal(askMissing.length, 0, 'the ask answer was never treated as a step row');
+  } finally { await mount.close(); }
+});
+
 test('an ask without a host reading says unmeasured, never a zero', async () => {
   const lines = journalLines();
   const mount = createOpencodeMount({
@@ -704,6 +805,7 @@ test('an ask without a host reading says unmeasured, never a zero', async () => 
     assert.ok(ask !== undefined, 'the ask fired');
     assert.equal(ask['usage'], null, 'no host reading is recorded as null, not zero');
     assert.equal(ask['usageSource'], 'unmeasured-host', 'the absence is named');
+    assert.equal(ask['costUsd'], null, 'no host cost is recorded as null, not zero');
     assert.equal(ask['cacheReadTokens'], null, 'the cache read is unknown, not cold');
     assert.equal(ask['cacheWriteTokens'], null, 'the cache write is unknown, not cold');
   } finally { await mount.close(); }

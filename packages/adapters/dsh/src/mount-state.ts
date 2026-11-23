@@ -11,8 +11,10 @@
  *     that were already on the host surface when this session's durable state
  *     was first created. A later mount that reads it knows the state is its own
  *     (a restart); a mount that reads nothing is a fresh install into a session
- *     that may already hold history, and it must not replay, ask about or
- *     remove that history (ISSUE-414).
+ *     that may already hold history, and it records that history as the
+ *     session's inherited set. The set is fork/clone identity evidence
+ *     (ISSUE-422, ISSUE-478); it is never an eligibility gate, so a later pass
+ *     tables and removes those results exactly like one the mount observed land.
  *   - `forgets` — manual forgets the tool answered "scheduled" for and no
  *     boundary has applied yet. Written before the answer leaves, so an unload
  *     replays them instead of losing an accepted request (ISSUE-417).
@@ -54,7 +56,9 @@ export interface DurableInstall {
   /**
    * The tool-result node ids present on the host surface at the first mount.
    * They arrived before this session's state existed, so the mount never
-   * observed them land and never removes, tables or asks about them.
+   * observed them land. The set is retained as the fork/clone identity
+   * evidence (ISSUE-422, ISSUE-478); it gates no eligibility, so a later pass
+   * may table and remove these results like any other.
    */
   readonly preInstallNodeIds: readonly string[];
   /**

@@ -273,13 +273,20 @@ export interface OpencodeGenerateInput {
 export interface OpencodeGenerateOutput {
   readonly text: string;
   /**
-   * The provider's usage for this transient request, when the host reports one.
-   * 2.4.0's `session.generate` returns text only and prints no `step_finish`
-   * row, so this field is absent there; a host or a bench mock that states it
-   * lets the mount journal the ask lane's own reading instead of leaving it
-   * unmeasured. Shape: `TokenUsage.Info` (`input`, `output`, `reasoning`,
-   * `cache: {read, write}`), read through the same `tokenUsageOf` mapping as a
-   * step row.
+   * The host's own reading of this transient request. 2.4.0 declares the
+   * `session.generate` success body as `{text, tokens, cost}`
+   * (`@opencode/protocol@2.4.0` `dist/groups/session.d.ts`;
+   * `@opencode/client@2.4.0` `SessionGenerateResponse`), so the mount records
+   * the ask lane's exact cost and token counts from here. Shape:
+   * `TokenUsage.Info` (`input`, `output`, `reasoning`, `cache: {read, write}`),
+   * read through the same `tokenUsageOf` mapping as a step row.
+   */
+  readonly tokens?: unknown;
+  /** The host's stated cost for this generate call. Telemetry only. */
+  readonly cost?: unknown;
+  /**
+   * The open usage field an older host or a bench mock may state instead of
+   * `tokens`. It is the fallback: a declared `tokens` object wins.
    */
   readonly usage?: unknown;
 }
@@ -360,6 +367,21 @@ export interface OpencodeModelCatalog {
 }
 
 /**
+ * The location one plugin activation serves (`Context.location` in 2.4.0).
+ *
+ * The host activates a plugin once per location. `directory` is the folder the
+ * activation was created for; commands, tools and session hooks registered by
+ * that activation belong to that folder. The fields are optional because a
+ * host that predates the field still mounts; an activation that names no
+ * directory is handled by the process-wide shared mount's primary lease.
+ */
+export interface OpencodeLocationInfo {
+  readonly directory?: string;
+  readonly workspaceID?: string;
+  readonly [field: string]: unknown;
+}
+
+/**
  * The part of the 2.4.0 setup context this adapter uses. Structural, so the
  * real `Context` satisfies it without the adapter importing the host at runtime.
  *
@@ -369,6 +391,12 @@ export interface OpencodeModelCatalog {
  */
 export interface OpencodePluginContext {
   readonly options?: Readonly<Record<string, unknown>>;
+  /**
+   * The location this activation serves. The host calls `setup` once per
+   * location in one process; a single durable mount is shared by all of them
+   * and each activation registers its own location-scoped command and hooks.
+   */
+  readonly location?: OpencodeLocationInfo;
   readonly session: {
     hook(
       name: 'context',

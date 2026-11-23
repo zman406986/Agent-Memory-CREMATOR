@@ -136,8 +136,8 @@ import type {
   OpencodePluginDefinition, OpencodeSessionContext, OpencodeTextPart, OpencodeToolDefinition,
 } from './host.js';
 import {
-  costOf, estimateRequestSplit, estimateRequestTokens, isAskStepRequest, requestKindOf,
-  requestPrefixOf, stepEndedRow, tokenUsageOf, usageObservation,
+  costOf, estimateRequestSplit, estimateRequestTokens, generateUsageRow, isAskStepRequest,
+  requestKindOf, requestPrefixOf, stepEndedRow, usageObservation,
 } from './meter.js';
 import type { OpencodeUsageRow } from './meter.js';
 import { createOpencodePort, opencodeAppliedPlansFromLedger } from './port.js';
@@ -231,6 +231,11 @@ export const OPENCODE_MOUNT_SEAMS: readonly string[] = Object.freeze([
  */
 export type OpencodeJournalKind =
   | 'mounted'
+  // A plugin activation (one host location) joined the process-wide mount for
+  // its durable root, or created it. The host activates a plugin once per
+  // location; without sharing, the second activation's mount was refused as a
+  // duplicate and that folder got no hooks and no `/cremate`.
+  | 'mount-shared'
   | 'capabilities'
   | 'storage-plan'
   | 'storage-unavailable'
@@ -281,8 +286,10 @@ export type OpencodeJournalKind =
   // refused the send by name (ledger-unavailable / recovery-pending /
   // breaker-open) because the apply could not use a table.
   | 'ask-standdown'
-  // ISSUE-419: the durable ledger file decided fresh install vs restart, and
-  // the pre-install nodes were captured for exclusion by the later passes.
+  // The durable ledger file decided fresh install vs restart, and a durable
+  // state that holds no event for this session is named `fork: 'unidentified'`.
+  // The line is identity evidence only: no result is excluded because it
+  // predates the mount (ADR-0069).
   | 'install'
   // ISSUE-422: a `session.compaction.*` event arrived while an ask or its
   // deferred apply was running, so the depth latch's re-arm was deferred to the
@@ -619,21 +626,6 @@ export interface OpencodeSessionEntry {
    */
   pendingSeenNodeIds: Set<NodeId>;
   /**
-   * The install boundary (ISSUE-419): the node ids present in this mount's
-   * first transform of a fresh durable install. Such nodes were produced before
-   * the plugin mounted, so they are never ask-eligible and never removal-eligible
-   * in the ask/L1/dedupe lanes. Null when this mount has no boundary — a restart
-   * on existing durable state, or a test-only `':memory:'` ledger, both keep
-   * today's behavior.
-   */
-  preInstallNodes: Set<NodeId> | null;
-  /**
-   * True until the first transform captured the fresh install's pre-install
-   * surface. A fresh install's first transform is the earliest observation of
-   * the host's history, so it is the boundary.
-   */
-  installBoundaryPending: boolean;
-  /**
    * True when the last `context` hook's step ask left one readable reply. The
    * step ask is primary; the idle ask is a fallback only while this is false, so
    * one turn never asks twice even when the step pass changed the revision.
@@ -684,9 +676,14 @@ export interface OpencodeSessionEntry {
   /**
    * True once this session saw a step row for the ask lane — a declared
    * `ask`/`generate` kind, or an unstated row during a live ask (ISSUE-357).
-   * Vanilla 2.4.0 emits no generate step row, so it stays false there and the
-   * ISSUE-396 abandoned-call guard never touches main accounting; a host that
-   * emits ask rows opens the guard for its timed-out calls' late rows.
+   * The no-ask-step observation was measured on 2.2.5; 2.4.0 declares no
+   * request kind on `session.step.ended` and declares the generate usage as a
+   * replay-only `session.usage.recorded` row (source `generate`) that the
+   * plugin event stream cannot request, so vanilla 2.4.0 stays false here and
+   * the ISSUE-396 abandoned-call guard never touches main accounting. A host
+   * that does emit ask step rows opens the guard for its timed-out calls' late
+   * rows. The ask's own exact reading is the `session.generate` answer, not a
+   * step row (ISSUE-538).
    */
   askStepRowsSeen: boolean;
   /**
@@ -765,8 +762,9 @@ export interface OpencodeSessionEntry {
    * How this mount's durable state was identified (ISSUE-422): `fresh` (no
    * ledger file), `restart` (a ledger file existed before the open), or
    * `no-durable-state` (`':memory:'`). A fork/clone is not identifiable from
-   * the seam this adapter reads; the first transform's boundary line names
-   * inherited history (`fork: 'unidentified'`) instead of guessing.
+   * the seam this adapter reads; the install line names the unidentified state
+   * (`fork: 'unidentified'`) instead of guessing. That is identity evidence
+   * only: inherited results are eligible like any other (ADR-0069).
    */
   readonly installState: 'fresh' | 'restart' | 'no-durable-state';
   /**
@@ -848,13 +846,6 @@ export interface OpencodeAskApplyInput {
    * holds the index itself (a test, a rig) may pass it here instead.
    */
   readonly appliedPlans?: OpencodeAppliedPlanIndex;
-  /**
-   * The install boundary (ISSUE-419): node ids present before this mount
-   * started. A verdict naming one — stored or banked — is dropped, so a ledger
-   * replay cannot remove pre-install history on a fresh install. Defaults to
-   * `entry.preInstallNodes`; a caller holding the boundary may pass it instead.
-   */
-  readonly excludeNodeIds?: ReadonlySet<NodeId>;
   readonly journal: (kind: OpencodeJournalKind, fields: Record<string, unknown>) => void;
 }
 
@@ -947,12 +938,10 @@ export async function applyOpencodeAskVerdicts(
     ? { contentEstimate: window } : { window: hostWindow };
   if (entry.askInFlight) return false;
   if (!Number.isSafeInteger(window) || window <= 0) return false;
-  const excluded = input.excludeNodeIds ?? entry.preInstallNodes ?? undefined;
   const plan = input.plan ?? buildOpencodePassPlan({
     sessionId: entry.sessionId, snapshot, messages,
     round: input.round ?? Math.max(1, entry.passRound),
     ...(entry.dedupeClasses === undefined ? {} : { classes: entry.dedupeClasses }),
-    ...(excluded === undefined ? {} : { excludeNodeIds: excluded }),
   });
   if (plan === null) {
     // Every unit left the array: no stored verdict can name one any more. The
@@ -1011,7 +1000,6 @@ export async function applyOpencodeAskVerdicts(
      * removed (ISSUE-300 item 6). Every other verdict still needs a sent node.
      */
     if (unit === undefined || row === undefined
-      || excluded?.has(unit.nodeId) === true
       || (!bankedUnitIds.has(unitId) && !isSeenUnit(unit, entry.seenNodeIds))) {
       entry.askVerdicts.delete(unitId);
       /**
@@ -1408,8 +1396,19 @@ export interface OpencodeMount {
   ): Promise<void>;
   /** One manual forget call: resolve and queue it, answering the tool value. */
   forget(sessionId: string, args: unknown): Promise<OpencodeForgetValue>;
-  /** One host event firing. Unknown event types are ignored, not guessed at. */
-  event(event: OpencodeHostEvent): Promise<void>;
+  /**
+   * One host event firing. Unknown event types are ignored, not guessed at.
+   *
+   * `options.idleAskOnEvent` overrides the mount-wide `idleAskOnEvent` flag for
+   * one `session.idle` event. The shared mount uses it so the idle-origin ask
+   * runs on the event path only for an activation whose awaited idle hook is not
+   * registered yet (ISSUE-411), even when another activation already flipped the
+   * mount-wide flag.
+   */
+  event(
+    event: OpencodeHostEvent,
+    options?: { readonly idleAskOnEvent?: boolean },
+  ): Promise<void>;
   /**
    * One `tool.hook("execute.after")` firing. Observation only: the product never
    * caps or rewrites a result body (ADR-0048), so the result object is read and
@@ -1950,7 +1949,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * ISSUE-424 / ADR-0066: one live mount per durable root. The check runs here,
    * before any session is opened, so a second mount can never construct a second
    * ledger for the same session. A memory mount has no durable identity and is
-   * not tracked.
+   * not tracked. `createOpencodePlugin` reaches this guard only for its first
+   * activation of a root: later per-location activations join that mount
+   * through `sharedAcquire` instead of constructing a second one.
    */
   const registryKey = mountRegistryKey(selection);
   if (registryKey !== null && activeMounts.has(registryKey)) {
@@ -2068,14 +2069,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * lifecycle opener, which may reopen it and clears the tombstone).
    */
   const released = new Set<string>();
-  /**
-   * The install boundary survives an in-mount eviction/reopen (ISSUE-445).
-   * Keyed by session id for the mount's life: `'pending'` until the first
-   * transform captures the set, then the captured pre-install node ids. A
-   * genuine process restart starts with an empty map, so today's restart
-   * behavior is unchanged.
-   */
-  const installBoundaries = new Map<string, Set<NodeId> | 'pending'>();
   /**
    * Release one session's open state — the same path `close()` uses per entry
    * (ISSUE-379): the entry leaves the open map and, when this mount opened the
@@ -2252,24 +2245,13 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       return null;
     }
     /**
-     * ISSUE-419: the durable ledger file is the per-session record that this
-     * session was mounted before. Its absence at this open means a fresh
-     * install, so the first transform's nodes are the pre-install boundary. A
-     * `':memory:'` ledger has no durable identity and keeps today's behavior.
-     * Read before `open` — the open creates the file.
+     * The durable ledger file is the per-session record that this session was
+     * mounted before. Its absence at this open means a fresh install; that is
+     * identity evidence for the journal only, never an eligibility gate
+     * (ADR-0069). A `':memory:'` ledger has no durable identity. Read before
+     * `open` — the open creates the file.
      */
     const freshInstall = target.kind === 'durable' && !existsSync(target.databasePath);
-    /**
-     * ISSUE-445: a boundary captured earlier in this mount outlives the entry
-     * that held it. A reopen of an id this mount evicted restores the same
-     * pre-install set instead of recomputing it from file existence (the file
-     * now exists, so the recompute would wrongly call it a restart).
-     */
-    const priorBoundary = installBoundaries.get(sessionId);
-    if (priorBoundary === undefined && freshInstall) installBoundaries.set(sessionId, 'pending');
-    const retainedBoundary = priorBoundary instanceof Set ? priorBoundary : null;
-    const boundaryPending = priorBoundary === 'pending'
-      || (priorBoundary === undefined && freshInstall);
     const open = options.openLedger ?? openLedger;
     let ledger: Ledger;
     try {
@@ -2287,13 +2269,14 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       blobRoot: target.blobRoot, node: process.version });
     /**
      * ISSUE-422: the host exposes no fork/clone event in the seam this mount
-     * reads. A child id's storage is its own (fresh install → the first
-     * transform's boundary excludes the inherited history). The one shape the
-     * adapter cannot resolve is a durable file that exists but holds NO events
-     * for this session: that is either a parent's copied ledger or a state-less
-     * earlier mount of this id. It is NAMED on the install line as
-     * `fork: 'unidentified'` and this mount keeps the shipped restart rule —
-     * the adapter records that it cannot identify the fork instead of guessing.
+     * reads. A child id's storage is its own. The one shape the adapter cannot
+     * resolve is a durable file that exists but holds NO events for this
+     * session: that is either a parent's copied ledger or a state-less earlier
+     * mount of this id. It is NAMED on the install line as
+     * `fork: 'unidentified'`. That is identity evidence only — the inherited
+     * results are eligible exactly like results this mount observes land
+     * (ADR-0069) — and the adapter records that it cannot identify the fork
+     * instead of guessing.
      */
     const forkUnidentified = target.kind === 'durable' && !freshInstall
       && !(await ledgerHasAnyEvent(ledger, sessionId));
@@ -2303,17 +2286,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       ...(forkUnidentified
         ? { fork: 'unidentified',
           reason: 'the durable ledger holds no events for this session; a fork/clone cannot be '
-            + 'told apart from a reopen, so the restart rule is kept and no boundary is claimed' }
+            + 'told apart from a reopen, so the adapter names the unidentified state and claims '
+            + 'no boundary' }
         : {}) });
-    // ISSUE-445: a reopen after an in-mount eviction restores the captured
-    // boundary and names that state, so the journal distinguishes it from a
-    // genuine process restart (which starts with an empty map).
-    if (retainedBoundary !== null) {
-      journal('install', { sessionId, state: 'boundary', reopened: true,
-        preInstallNodes: retainedBoundary.size, installState,
-        reason: 'the install boundary is retained by this mount across eviction; the reopened '
-          + 'entry keeps pre-install nodes out of the ask/L1/dedupe lanes' });
-    }
     /**
      * A restart loses the port's in-process applied-plan index, so the durable
      * ledger is read once here: an `applied` row joined to its prepared event's
@@ -2549,7 +2524,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         }
       },
       seenNodeIds: restoredSeen, pendingSeenNodeIds: new Set<NodeId>(),
-      preInstallNodes: retainedBoundary, installBoundaryPending: boundaryPending,
       installState,
       compactionGeneration: 0, askGeneration: 0, verdictGeneration: null,
       applyInFlight: false, compactionRearmDeferred: false,
@@ -2683,15 +2657,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * is why a first-request-only turn asks nothing.
    */
   function promoteShippedNodes(entry: OpencodeSessionEntry): void {
-    for (const nodeId of entry.pendingSeenNodeIds) {
-      /**
-       * ISSUE-419: a node on the install boundary was present before the plugin
-       * mounted. It never enters the seen set, so `isSeenUnit` keeps it out of
-       * every ask table and ask apply for the life of the mount.
-       */
-      if (entry.preInstallNodes?.has(nodeId) === true) continue;
-      entry.seenNodeIds.add(nodeId);
-    }
+    for (const nodeId of entry.pendingSeenNodeIds) entry.seenNodeIds.add(nodeId);
     entry.pendingSeenNodeIds.clear();
   }
 
@@ -2897,29 +2863,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         ? {} : { completedThroughTurnOrdinal: entry.completedThroughTurnOrdinal });
     try {
       let observed = observeRequest(messages);
-      /**
-       * ISSUE-419: the fresh install's first transform is the earliest
-       * observation of the host's stored history, so its nodes are the install
-       * boundary. Recorded once, before any pass runs; from here on "first
-       * observed after mount" is decidable per node.
-       */
-      if (entry.installBoundaryPending) {
-        entry.installBoundaryPending = false;
-        entry.preInstallNodes = new Set(observed.nodes.map(node => node.id));
-        // ISSUE-445: keep the boundary for the mount's life, so an eviction and
-        // reopen of this id restores it instead of recomputing from file existence.
-        installBoundaries.set(sessionId, entry.preInstallNodes);
-        // ISSUE-422: nodes already on the first transform's array were never
-        // seen by this mount. They are excluded from every later lane; when
-        // there are any, the line names them as inherited history, because a
-        // fork/clone and a fresh install into history are the same shape here.
-        journal('install', { sessionId, state: 'boundary',
-          preInstallNodes: entry.preInstallNodes.size,
-          observedNodes: observed.nodes.length, revision: observed.revision,
-          installState: entry.installState,
-          inheritedHistory: entry.preInstallNodes.size > 0,
-          ...(entry.preInstallNodes.size > 0 ? { fork: 'unidentified' } : {}) });
-      }
       // The event id names the request's content and how many times that content
       // has already been rewritten. This host rebuilds every request from its own
       // store (`rewriteHistory: false`), so the ledger's applied count at that
@@ -3028,8 +2971,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               // ISSUE-509: the session's first table ask states 70 percent, every
               // later one 40. The count is durable, so a resumed segment states 40.
               firstTrigger: entry.askFires === 0,
-              ...(entry.preInstallNodes === null
-                ? {} : { excludeNodeIds: entry.preInstallNodes }),
             });
           } catch (error) {
             buildThrew = true;
@@ -3119,8 +3060,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               window: contextWindowTokens
                 ?? Math.max(1, estimateRequestTokens(estimateMeter, snap, prefix)),
               hostWindow: contextWindowTokens,
-              ...(entry.preInstallNodes === null
-                ? {} : { excludeNodeIds: entry.preInstallNodes }),
               journal,
             });
             committed = deferredRemoved || committed;
@@ -3636,17 +3575,18 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (race.status === 'rejected') throw race.error;
       const answer = race.value;
       text = typeof answer?.text === 'string' ? answer.text : '';
-      if (answer?.usage !== undefined && answer.usage !== null) {
-        const read = tokenUsageOf(answer.usage);
-        if (read.kind === 'usage') {
-          usage = {
-            kind: 'usage', messageId: `ask:${String(entry.askFires + 1)}`,
-            usage: { ...read.usage }, reasoningTokens: read.reasoningTokens,
-            costUsd: null, cacheReadTokens: read.cacheReadTokens,
-            cacheWriteTokens: read.cacheWriteTokens,
-          };
-        }
-      }
+      /**
+       * The host's own reading of this ask (ISSUE-538). 2.4.0's
+       * `session.generate` answer declares `{text, tokens, cost}`, so the call
+       * this mount made is the exact source; the open `usage` field is the
+       * older/mock seam and loses to the declared shape. The replay-only
+       * `session.usage.recorded` event is not on the plugin's event stream
+       * (`meter.ts` carries the evidence), so nothing is subscribed for it and
+       * this answer is not a step row: it never enters the main estimate queue.
+       * A host that states neither leaves `usage` null, which the journal names
+       * `unmeasured-host`; the captured estimate stays the bench's fallback.
+       */
+      usage = generateUsageRow(answer, `ask:${String(entry.askFires + 1)}`);
     } catch (error) {
       return fail('generate', error instanceof Error ? error.message : String(error));
     }
@@ -3746,6 +3686,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         ? null : { ...usage.usage, reasoningTokens: usage.reasoningTokens },
       cacheReadTokens: usage?.cacheReadTokens ?? null,
       cacheWriteTokens: usage?.cacheWriteTokens ?? null,
+      /** Telemetry only: the host's stated cost for this ask, or null. */
+      costUsd: usage?.costUsd ?? null,
       usageSource: usage === null ? 'unmeasured-host' : 'host-generate',
     });
     return { outcome: 'fired', answers };
@@ -3970,8 +3912,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           round: entry.passRound, classes: entry.dedupeClasses,
           appliedPlans: entry.appliedPlans,
           firstTrigger: entry.askFires === 0,
-          ...(entry.preInstallNodes === null
-            ? {} : { excludeNodeIds: entry.preInstallNodes }),
         });
       } catch (error) {
         buildThrew = true;
@@ -4075,8 +4015,6 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               round: entry.passRound, classes: entry.dedupeClasses,
               appliedPlans: entry.appliedPlans,
               firstTrigger: entry.askFires === 0,
-              ...(entry.preInstallNodes === null
-                ? {} : { excludeNodeIds: entry.preInstallNodes }),
             });
           } catch (error) {
             buildThrew = true;
@@ -4146,7 +4084,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   }
 
   /** One turn-end observation. The turn is complete, and no array can be committed. */
-  async function idlePass(sessionId: string): Promise<void> {
+  async function idlePass(
+    sessionId: string, askOnEvent: boolean = idleAskOnEvent,
+  ): Promise<void> {
     // ISSUE-407: refuse once close() has started, with a named reason.
     if (closing) {
       if (!disposeComplete) {
@@ -4163,7 +4103,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     // ISSUE-395: the same guard `idleHookAsk` holds — a nested idle during an
     // in-flight step ask is not a pass: its depth reading would consume or arm
     // a baseline for a pass the ask lock refuses (ADR-0050).
-    const idleSnapshot = idleAskOnEvent && !entry.askInFlight
+    const idleSnapshot = askOnEvent && !entry.askInFlight
       ? await idleAsk(entry, sessionId) : null;
     try {
       /**
@@ -4225,7 +4165,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     if (entry.askInFlight) return;
     await idleAsk(entry, sessionId);
   }
-  async function event(value: OpencodeHostEvent): Promise<void> {
+  async function event(
+    value: OpencodeHostEvent, idleEventAsks: boolean = idleAskOnEvent,
+  ): Promise<void> {
     // ISSUE-420: a delivered event after cleanup has no effect.
     if (closing) return;
     const type = typeof value?.type === 'string' ? value.type : '';
@@ -4252,7 +4194,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       return;
     }
     if (type === 'session.idle') {
-      await idlePass(sessionId);
+      await idlePass(sessionId, idleEventAsks);
       return;
     }
     /**
@@ -4468,7 +4410,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     transform: (sessionId, messages, context) => track(
       transformStep(sessionId, messages, context), sessionId),
     forget: (sessionId, args) => track(forgetRequest(sessionId, args), sessionId),
-    event: value => {
+    event: (value, options) => {
       // ISSUE-420: a delivered event after cleanup has no effect.
       if (closing) return Promise.resolve();
       /**
@@ -4487,7 +4429,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       const eventSessionId = typeof eventData['sessionID'] === 'string'
         ? eventData['sessionID'] : null;
       work = track((async () => {
-        await event(value);
+        await event(value, options?.idleAskOnEvent ?? idleAskOnEvent);
         if (value?.type !== 'session.deleted') return;
         const data = isRecord(value.data) ? value.data : {};
         const sessionId = typeof data['sessionID'] === 'string' ? data['sessionID'] : null;
@@ -4540,6 +4482,377 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
 }
 
 /**
+ * The mount-option fields that change what the engine does. Two plugin
+ * activations on one durable root must share one mount (one ledger per
+ * session); when their policies differ, the first mount's values win and the
+ * later activation's `mount-shared` line names every field that did not follow.
+ * Storage is not here: the durable root itself is the sharing key.
+ */
+interface SharedMountPolicy {
+  readonly excludeTools: readonly string[];
+  readonly askGrammar: string | null;
+  readonly contextWindowTokens: number | null;
+  readonly pruneThresholdTokens: number | null;
+  readonly dedupeClasses: DedupeClasses;
+  readonly askTimeoutMs: number | null;
+}
+
+function sharedMountPolicyOf(options: OpencodeMountOptions): SharedMountPolicy {
+  return {
+    excludeTools: [...(options.excludeTools ?? [])].sort(),
+    askGrammar: options.askGrammar ?? null,
+    contextWindowTokens: options.contextWindowTokens ?? null,
+    pruneThresholdTokens: options.pruneThresholdTokens ?? null,
+    dedupeClasses: { ...(options.dedupeClasses ?? {}) },
+    askTimeoutMs: options.askTimeoutMs ?? null,
+  };
+}
+
+function sharedPolicyMismatch(
+  first: SharedMountPolicy, next: SharedMountPolicy,
+): string[] {
+  const out: string[] = [];
+  if (JSON.stringify(first.excludeTools) !== JSON.stringify(next.excludeTools)) {
+    out.push('excludeTools');
+  }
+  if (first.askGrammar !== next.askGrammar) out.push('askGrammar');
+  if (first.contextWindowTokens !== next.contextWindowTokens) out.push('contextWindowTokens');
+  if (first.pruneThresholdTokens !== next.pruneThresholdTokens) out.push('pruneThresholdTokens');
+  if (JSON.stringify(first.dedupeClasses) !== JSON.stringify(next.dedupeClasses)) {
+    out.push('dedupeClasses');
+  }
+  if (first.askTimeoutMs !== next.askTimeoutMs) out.push('askTimeoutMs');
+  return out;
+}
+
+/**
+ * One plugin activation's claim on a shared mount. The host calls `setup`
+ * once per location in one process; each activation registers its own
+ * location-scoped command, tools and hooks and forwards the work to the shared
+ * mount. The lease is removed when that activation's cleanup runs; the mount
+ * closes with the last lease.
+ */
+interface SharedMountLease {
+  readonly id: string;
+  /** The normalized location directory this activation serves, or null. */
+  readonly directory: string | null;
+  /** The journal this activation writes its own setup lines to. */
+  readonly sink: OpencodeJournalSink | null;
+  /** Identity of `sink` for the group's fan-out: one writer per file/function. */
+  readonly sinkKey: string | null;
+  /** The host's `session.generate` for this location, when the ask lane is on. */
+  readonly askGenerate: ((input: OpencodeGenerateInput) => Promise<OpencodeGenerateOutput>) | null;
+  readonly resolveModelWindow: ((ref: OpencodeModelRef) => number | null) | null;
+  /**
+   * True once this activation's awaited `experimental.idle` hook registered.
+   * The shared mount's event path asks on `session.idle` only for an activation
+   * whose hook is not registered yet, so one turn never asks twice.
+   */
+  idleHookRegistered: boolean;
+  /** Set by the activation's cleanup; every forwarded callback checks it. */
+  disposed: boolean;
+}
+
+interface SharedMountGroup {
+  readonly root: string;
+  readonly policy: SharedMountPolicy;
+  readonly leases: Map<string, SharedMountLease>;
+  readonly sinks: Map<string, { sink: OpencodeJournalSink; count: number }>;
+  /** Session id -> the lease that most recently served its context hook. */
+  readonly sessionLease: Map<string, string>;
+  mount: OpencodeMount | null;
+  closing: boolean;
+  closePromise: Promise<void> | null;
+}
+
+/**
+ * The process-level shared mounts, keyed by the normalized durable root. The
+ * host activates a plugin per location; a per-location mount would collide on
+ * the root (the second activation was refused as a duplicate, so that folder
+ * got no hooks and no `/cremate`). One mount per root means one ledger per
+ * session, one ask lane per session and one mount lock, while every activation
+ * still registers its own location-scoped command and tools.
+ *
+ * The registry lives on `globalThis` under a versioned symbol, not only in this
+ * module: a host that evaluates the plugin module once per location must still
+ * see one registry. A second module copy's `createOpencodeMount` would
+ * otherwise hit the root lock and fail that folder exactly as before.
+ */
+interface SharedMountGlobals {
+  readonly groups: Map<string, SharedMountGroup>;
+  /** A stable id per lease, so `sessionLease` names exactly one activation. */
+  leaseSeq: number;
+  /** A stable key per journal function, so two leases sharing one sink write once. */
+  sinkSeq: number;
+  readonly sinks: WeakMap<OpencodeJournalSink, string>;
+}
+
+const SHARED_MOUNT_GLOBALS = Symbol.for('cremator-opencode.shared-mount.v1');
+
+function sharedMountGlobals(): SharedMountGlobals {
+  const host = globalThis as unknown as Record<symbol, SharedMountGlobals | undefined>;
+  const existing = host[SHARED_MOUNT_GLOBALS];
+  if (existing !== undefined) return existing;
+  const created: SharedMountGlobals = {
+    groups: new Map(), leaseSeq: 0, sinkSeq: 0, sinks: new WeakMap(),
+  };
+  host[SHARED_MOUNT_GLOBALS] = created;
+  return created;
+}
+
+const sharedMountState = sharedMountGlobals();
+
+function sharedSinkKeyOf(sink: OpencodeJournalSink): string {
+  const existing = sharedMountState.sinks.get(sink);
+  if (existing !== undefined) return existing;
+  const key = `fn:${String(++sharedMountState.sinkSeq)}`;
+  sharedMountState.sinks.set(sink, key);
+  return key;
+}
+
+/**
+ * The directory key two activations are compared by. It is lexical and
+ * case-folded on Windows: no filesystem read runs per event. `resolve` handles
+ * `.`/`..` and trailing separators; a symlink spelling that differs from the
+ * event's is simply unmatched, and the primary lease forwards that event once.
+ */
+function sharedLocationKey(directory: string): string {
+  const lexical = resolve(stripWindowsExtendedPrefix(directory));
+  return process.platform === 'win32' ? lexical.toLowerCase() : lexical;
+}
+
+/** The activation's location directory key, or null when it named none. */
+function sharedLocationKeyOf(
+  location: OpencodePluginContext['location'],
+): string | null {
+  if (!isRecord(location)) return null;
+  const directory = location['directory'];
+  return typeof directory === 'string' && directory.length > 0
+    ? sharedLocationKey(directory) : null;
+}
+
+/** The event's own location directory key, or null when it carries none. */
+function sharedEventLocationKey(event: OpencodeHostEvent): string | null {
+  const location = event['location'];
+  if (!isRecord(location)) return null;
+  const directory = location['directory'];
+  return typeof directory === 'string' && directory.length > 0
+    ? sharedLocationKey(directory) : null;
+}
+
+/** The first active lease: the fallback owner for a global or unlocated fact. */
+function sharedPrimaryLease(group: SharedMountGroup): SharedMountLease | null {
+  for (const lease of group.leases.values()) return lease;
+  return null;
+}
+
+/**
+ * Whether this lease is the one activation that should process an event.
+ *
+ * The host's event bus is server-wide, so every location's subscription sees
+ * every event. Exactly one lease may forward a given event to the shared mount:
+ *   - an event with a location whose directory matches a lease belongs to that
+ *     lease (the first with that directory, so a reload overlap still picks one);
+ *   - otherwise the event belongs to the lease that most recently served its
+ *     session's context hook (the event names a `sessionID`);
+ *   - otherwise — a global event with no known session — the primary lease.
+ * This is routing, not a dedupe set: it holds no growing state and cannot drop
+ * an event when at least one lease is active.
+ */
+function sharedAcceptsEvent(
+  group: SharedMountGroup, lease: SharedMountLease, event: OpencodeHostEvent,
+): boolean {
+  const directory = sharedEventLocationKey(event);
+  if (directory !== null) {
+    for (const candidate of group.leases.values()) {
+      if (candidate.directory === directory) return candidate === lease;
+    }
+  }
+  const data = isRecord(event['data']) ? event['data'] : null;
+  const sessionId = data !== null && typeof data['sessionID'] === 'string'
+    ? data['sessionID'] : null;
+  if (sessionId !== null) {
+    const owner = group.leases.get(group.sessionLease.get(sessionId) ?? '');
+    if (owner !== undefined) return owner === lease;
+  }
+  return sharedPrimaryLease(group) === lease;
+}
+
+/**
+ * Whether this lease should forward a session-scoped hook (`idle`,
+ * `execute.after`). The activation that most recently served the session's
+ * context hook owns it; before any context hook, the primary lease is the one
+ * caller. A hook that a global registration delivers to every location is
+ * therefore processed once, and an idle ask never runs twice.
+ */
+function sharedAcceptsSessionHook(
+  group: SharedMountGroup, lease: SharedMountLease, sessionId: string,
+): boolean {
+  const owner = group.sessionLease.get(sessionId);
+  if (owner !== undefined) return owner === lease.id;
+  return sharedPrimaryLease(group) === lease;
+}
+
+/** The journal function a group fan-out calls, isolating every sink. */
+function sharedAddSink(group: SharedMountGroup, lease: SharedMountLease): void {
+  if (lease.sink === null || lease.sinkKey === null) return;
+  const existing = group.sinks.get(lease.sinkKey);
+  if (existing === undefined) {
+    group.sinks.set(lease.sinkKey, { sink: lease.sink, count: 1 });
+    return;
+  }
+  group.sinks.set(lease.sinkKey, { sink: existing.sink, count: existing.count + 1 });
+}
+
+function sharedRemoveSink(group: SharedMountGroup, lease: SharedMountLease): void {
+  if (lease.sinkKey === null) return;
+  const existing = group.sinks.get(lease.sinkKey);
+  if (existing === undefined) return;
+  if (existing.count <= 1) {
+    group.sinks.delete(lease.sinkKey);
+    return;
+  }
+  group.sinks.set(lease.sinkKey, { sink: existing.sink, count: existing.count - 1 });
+}
+
+/** Emit one mount line to every distinct sink once. A sink never changes an outcome. */
+function sharedEmit(
+  group: SharedMountGroup, record: OpencodeJournalRecord,
+): void {
+  for (const { sink } of group.sinks.values()) {
+    try { sink(record); } catch { /* a journal sink must never change an outcome */ }
+  }
+}
+
+/**
+ * The ask seam for one session: the activation that served the session's
+ * context hook supplies its own `session.generate`; before any hook, the
+ * primary lease does. This keeps a shared mount usable after the activation
+ * that created it is gone, and keeps each location's generate where the host
+ * scoped it.
+ */
+function sharedGenerateFor(
+  group: SharedMountGroup, input: OpencodeGenerateInput,
+): Promise<OpencodeGenerateOutput> {
+  const owner = group.sessionLease.get(input.sessionID);
+  const lease = owner === undefined ? undefined : group.leases.get(owner);
+  const generate = lease?.askGenerate ?? sharedPrimaryLease(group)?.askGenerate;
+  if (generate === undefined || generate === null) {
+    return Promise.reject(new Error(
+      'cremator: no session.generate seam is available for this session'));
+  }
+  return generate(input);
+}
+
+function sharedResolveWindowFor(
+  group: SharedMountGroup, ref: OpencodeModelRef,
+): number | null {
+  const first = sharedPrimaryLease(group);
+  const resolveWindow = first?.resolveModelWindow ?? null;
+  return resolveWindow === null ? null : resolveWindow(ref);
+}
+
+/**
+ * Detach one activation from the group before stopping its event consumer, so
+ * an event already queued on its stream is routed to the remaining lease
+ * instead of being dropped with the departing one.
+ */
+function sharedDetachLease(group: SharedMountGroup, lease: SharedMountLease): void {
+  lease.disposed = true;
+  group.leases.delete(lease.id);
+  sharedRemoveSink(group, lease);
+  for (const [sessionId, owner] of group.sessionLease) {
+    if (owner === lease.id) group.sessionLease.delete(sessionId);
+  }
+}
+
+/**
+ * Close the mount when the last activation leaves. The group stays in the
+ * registry until the close finishes (a setup arriving meanwhile waits on
+ * `closePromise` instead of reusing a closing mount), then a later setup
+ * creates a fresh mount and re-claims the root.
+ */
+async function sharedCloseIfIdle(group: SharedMountGroup): Promise<void> {
+  if (group.leases.size > 0 || group.closing) {
+    if (group.closePromise !== null) await group.closePromise;
+    return;
+  }
+  group.closing = true;
+  group.closePromise = (async () => {
+    try { await group.mount?.close(); } finally {
+      if (sharedMountState.groups.get(group.root) === group) sharedMountState.groups.delete(group.root);
+    }
+  })();
+  await group.closePromise;
+}
+
+/**
+ * Join or create the process-wide mount for one durable root. A memory mount
+ * has no shared identity and never reaches here.
+ */
+async function sharedAcquire(
+  params: {
+    readonly root: string;
+    readonly options: OpencodeMountOptions;
+    readonly lease: Omit<SharedMountLease, 'disposed' | 'idleHookRegistered'>;
+  },
+): Promise<{ readonly group: SharedMountGroup; readonly lease: SharedMountLease }> {
+  for (;;) {
+    const existing = sharedMountState.groups.get(params.root);
+    if (existing === undefined) break;
+    if (existing.closing) {
+      if (existing.closePromise !== null) await existing.closePromise;
+      else sharedMountState.groups.delete(params.root);
+      continue;
+    }
+    const lease: SharedMountLease = {
+      ...params.lease, idleHookRegistered: false, disposed: false,
+    };
+    existing.leases.set(lease.id, lease);
+    sharedAddSink(existing, lease);
+    const mismatch = sharedPolicyMismatch(existing.policy, sharedMountPolicyOf(params.options));
+    sharedEmit(existing, {
+      kind: 'mount-shared', atMs: Date.now(), status: 'reused',
+      storageRoot: params.root, leases: existing.leases.size,
+      ...(mismatch.length === 0 ? {} : { policy: 'first-wins', optionsMismatch: mismatch }),
+    });
+    return { group: existing, lease };
+  }
+  const policy = sharedMountPolicyOf(params.options);
+  const group: SharedMountGroup = {
+    root: params.root, policy,
+    leases: new Map(), sinks: new Map(), sessionLease: new Map(),
+    mount: null, closing: false, closePromise: null,
+  };
+  const lease: SharedMountLease = {
+    ...params.lease, idleHookRegistered: false, disposed: false,
+  };
+  group.leases.set(lease.id, lease);
+  sharedAddSink(group, lease);
+  try {
+    group.mount = createOpencodeMount({
+      ...params.options,
+      // One fan-out for every activation's journal; the mount's own lines are
+      // written once per distinct sink, never once per location.
+      journal: record => { sharedEmit(group, record); },
+      ...(params.options.askGrammar === undefined
+        ? {} : { askGenerate: (input) => sharedGenerateFor(group, input) }),
+      resolveModelWindow: ref => sharedResolveWindowFor(group, ref),
+    });
+  } catch (error) {
+    group.leases.clear();
+    group.sinks.clear();
+    throw error;
+  }
+  sharedMountState.groups.set(params.root, group);
+  sharedEmit(group, {
+    kind: 'mount-shared', atMs: Date.now(), status: 'created',
+    storageRoot: params.root, leases: 1,
+  });
+  return { group, lease };
+}
+
+/**
  * The plugin a host mounts through its `plugins` list. `setup` registers the
  * context hook, the tool, the manual `/cremate` command (when the host exposes
  * `context.command`) and the observer, starts one event consumer, and returns
@@ -4574,15 +4887,79 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
               ? declared : null;
           }
           : undefined);
-      // One sink for every line this mount writes, including the two the plugin
-      // itself emits when a seam fails to register or its event stream throws.
-      const emit = merged.journal
-        ?? (merged.journalFile === undefined ? () => {} : createFileJournalSink(merged.journalFile));
-      const mount = createOpencodeMount({
-        ...merged, journal: emit,
-        ...(askGenerate === undefined ? {} : { askGenerate }),
-        ...(resolveModelWindow === undefined ? {} : { resolveModelWindow }),
-      });
+      /**
+       * One sink for every line this activation writes itself (registration
+       * outcomes, event-loop failures). The mount's own lines go through the
+       * shared group's fan-out, which writes each distinct sink once.
+       */
+      const sink: OpencodeJournalSink | null = merged.journal
+        ?? (merged.journalFile === undefined ? null : createFileJournalSink(merged.journalFile));
+      const emit: OpencodeJournalSink = (record) => {
+        try { sink?.(record); } catch { /* a journal sink must never change an outcome */ }
+      };
+      /**
+       * The host calls `setup` once per location. Every location shares the one
+       * process-wide mount for its durable root (one ledger per session, one
+       * ask lane, one mount lock); each activation still registers its own
+       * location-scoped command, tools and hooks and forwards them here. A
+       * mount with a private seam (a test opener/port/clock) is never shared,
+       * and neither is a `':memory:'` mount: it has no durable identity.
+       */
+      const selection = resolveStorage(merged.storage);
+      const sharedRoot = mountRegistryKey(selection);
+      const canShare = sharedRoot !== null
+        && merged.openLedger === undefined
+        && merged.createPort === undefined
+        && merged.nowMs === undefined;
+      const leaseDirectory = sharedLocationKeyOf(context.location);
+      const leaseId = `lease-${String(++sharedMountState.leaseSeq)}`;
+      let group: SharedMountGroup | null = null;
+      let lease: SharedMountLease | null = null;
+      let mount: OpencodeMount;
+      if (canShare) {
+        const acquired = await sharedAcquire({
+          root: sharedRoot,
+          options: merged,
+          lease: {
+            id: leaseId,
+            directory: leaseDirectory,
+            sink,
+            sinkKey: sink === null ? null : (
+              merged.journal !== undefined
+                ? sharedSinkKeyOf(merged.journal)
+                : `file:${resolve(merged.journalFile ?? '')}`),
+            askGenerate: askGenerate ?? null,
+            resolveModelWindow: resolveModelWindow ?? null,
+          },
+        });
+        group = acquired.group;
+        lease = acquired.lease;
+        if (group.mount === null) throw new Error('cremator: the shared mount was not created');
+        mount = group.mount;
+      } else {
+        mount = createOpencodeMount({
+          ...merged, journal: emit,
+          ...(askGenerate === undefined ? {} : { askGenerate }),
+          ...(resolveModelWindow === undefined ? {} : { resolveModelWindow }),
+        });
+      }
+      /** A disposed mount, or this activation's own cleanup, makes every callback inert. */
+      const inert = (): boolean => mount.disposed || (lease?.disposed ?? false);
+      /**
+       * Detach this activation before stopping its event consumer, so a queued
+       * event routes to the remaining lease instead of dying with this one. The
+       * mount closes only when the last activation has detached.
+       */
+      const detach = (): void => {
+        if (group !== null && lease !== null) sharedDetachLease(group, lease);
+      };
+      const closeMount = async (): Promise<void> => {
+        if (group !== null && lease !== null) {
+          await sharedCloseIfIdle(group);
+          return;
+        }
+        await mount.close().catch(() => {});
+      };
       /**
        * ISSUE-420: setup is one transaction. Every registration below runs
        * inside this try; a throw from a required seam stops the consumer, closes
@@ -4592,6 +4969,7 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
        * leaves no context hook behind and a host retry registers exactly one.
        */
       let iterator: AsyncIterator<OpencodeHostEvent> | null = null;
+      let rpcRegistration: { dispose?: () => Promise<void> | void } | null = null;
       let stopped = false;
       let loop: Promise<void> | null = null;
       const stopLoop = async (): Promise<void> => {
@@ -4607,7 +4985,10 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
       };
       try {
         await context.tool.hook('execute.after', async (input) => {
-          if (mount.disposed) return;
+          if (inert()) return;
+          const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : '';
+          if (group !== null && lease !== null
+            && !sharedAcceptsSessionHook(group, lease, sessionId)) return;
           await mount.afterTool(input);
         });
         try {
@@ -4637,7 +5018,7 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
                 name: OPENCODE_PRUNE_COMMAND,
                 description: 'Run one CREMATOR table pass now.',
                 execute: async (input) => {
-                  if (mount.disposed) return;
+                  if (inert()) return;
                   const id = typeof input?.sessionID === 'string' ? input.sessionID : '';
                   await mount.cremate(id);
                 },
@@ -4669,9 +5050,9 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
          */
         if (context.rpc !== undefined) {
           try {
-            await context.rpc.register(CREMATE_RPC_DEFINITION, {
+            const registration = await context.rpc.register(CREMATE_RPC_DEFINITION, {
               cremate: async (input: unknown) => {
-                if (mount.disposed) return { ok: false };
+                if (inert()) return { ok: false };
                 const id = isRecord(input) && typeof input['sessionID'] === 'string'
                   ? input['sessionID'] : '';
                 if (id === '') return { ok: false };
@@ -4682,6 +5063,14 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
                 }
               },
             });
+            /**
+             * The RPC registry keeps the LAST registration for an id. Dispose
+             * this activation's registration with its cleanup, or a disabled
+             * location's inert handler would shadow a live one.
+             */
+            if (isRecord(registration) && typeof registration['dispose'] === 'function') {
+              rpcRegistration = { dispose: registration['dispose'] as () => Promise<void> | void };
+            }
             try {
               emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
                 status: 'registered', name: 'cremate-rpc' }));
@@ -4728,8 +5117,30 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
             while (!stopped) {
               const next = await source.next();
               if (next.done) break;
-              if (mount.disposed) return;
-              await mount.event(next.value);
+              if (inert()) return;
+              /**
+               * The event bus is server-wide, so every location's stream sees
+               * every event. Exactly one lease forwards an event: the lease
+               * whose location the event names, else the session owner, else
+               * the primary lease.
+               */
+              if (group !== null && lease !== null
+                && !sharedAcceptsEvent(group, lease, next.value)) continue;
+              /**
+               * ISSUE-411 with a shared mount: this activation's event path owns
+               * the idle ask only while its awaited hook is not registered yet.
+               * Another activation's hook may already have flipped the
+               * mount-wide flag; the per-event override keeps this window live.
+               */
+              await mount.event(next.value, group !== null && lease !== null
+                ? { idleAskOnEvent: !lease.idleHookRegistered } : undefined);
+              if (next.value.type === 'session.deleted') {
+                // Forget the owner after the eviction, so a second stream that
+                // delivers the same unlocated event still routes to this lease.
+                const data = isRecord(next.value.data) ? next.value.data : {};
+                const deleted = typeof data['sessionID'] === 'string' ? data['sessionID'] : '';
+                if (deleted.length > 0) group?.sessionLease.delete(deleted);
+              }
             }
           } catch (error) {
             try {
@@ -4748,7 +5159,15 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
          * a real session, not a mount that never saw a request.
          */
         await context.session.hook('context', async (input: OpencodeSessionContext) => {
-          if (mount.disposed) return;
+          if (inert()) return;
+          /**
+           * The activation that served this session's context hook owns its
+           * idle and observation hooks and its `session.generate`; a shared
+           * mount routes those facts by session id.
+           */
+          if (group !== null && lease !== null) {
+            group.sessionLease.set(input.sessionID, lease.id);
+          }
           if (merged.excludeTools !== undefined && input.tools !== undefined) {
             for (const name of merged.excludeTools) delete input.tools[name];
           }
@@ -4773,9 +5192,15 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
          */
         try {
           await context.session.hook('experimental.idle', async (input: OpencodeIdleHookInput) => {
-            if (mount.disposed) return;
-            await mount.idle(typeof input?.sessionID === 'string' ? input.sessionID : '');
+            if (inert()) return;
+            const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : '';
+            // The host may deliver the idle hook to every location; only the
+            // session's owner runs the idle lane, so it never asks twice.
+            if (group !== null && lease !== null
+              && !sharedAcceptsSessionHook(group, lease, sessionId)) return;
+            await mount.idle(sessionId);
           });
+          if (lease !== null) lease.idleHookRegistered = true;
           mount.idleAskOnEvent = false;
           // ISSUE-411: mark the hook as registered, so a journal can tell a
           // host that accepted it from one that never called it.
@@ -4791,15 +5216,24 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           } catch { /* a journal sink must never change an outcome */ }
         }
       } catch (error) {
-        // A required seam failed: stop the consumer, close the mount so every
-        // registered callback is inert, then let the host see the failure.
-        await stopLoop();
-        await mount.close().catch(() => {});
+        // A required seam failed: stop the consumer, release this activation
+        // (closing the shared mount only when no other location holds it), then
+        // let the host see the failure.
+        try {
+          await rpcRegistration?.dispose?.();
+        } catch { /* the host may already have disposed it */ }
+        rpcRegistration = null;
+        detach();
+        try { await stopLoop(); } finally { await closeMount().catch(() => {}); }
         throw error;
       }
       return async () => {
-        await stopLoop();
-        await mount.close();
+        try {
+          await rpcRegistration?.dispose?.();
+        } catch { /* the host may already have disposed it */ }
+        rpcRegistration = null;
+        detach();
+        try { await stopLoop(); } finally { await closeMount(); }
       };
     },
   });

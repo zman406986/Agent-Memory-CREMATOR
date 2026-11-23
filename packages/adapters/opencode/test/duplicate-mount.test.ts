@@ -237,22 +237,40 @@ test('ISSUE-481: a trailing dot, space or extended-length spelling is one root o
   }
 });
 
-test('setup refuses a second plugin on the same durable configuration', async () => {
+test('setup shares one mount across activations on the same durable configuration', async () => {
+  /*
+   * The host activates a plugin once per location in one process. A second
+   * activation must join the live mount, not open a second ledger; every
+   * activation still registers its own location-scoped command. The mount
+   * closes with the last activation, and the root becomes claimable again.
+   */
   const dir = scratch();
   const storage = { crematorStorageRoot: join(dir, 'store') };
-  const cleanupFirst = await createOpencodePlugin({ storage }).setup(setupHost());
+  const records: Record<string, unknown>[] = [];
+  const journal = (record: { kind: string }): void => {
+    records.push(record as unknown as Record<string, unknown>);
+  };
+  const cleanupFirst = await createOpencodePlugin({ storage, journal }).setup(setupHost());
+  let cleanupSecond: (() => void | Promise<void>) | null = null;
   try {
-    await assert.rejects(createOpencodePlugin({ storage }).setup(setupHost()),
-      (error: unknown) => error instanceof OpencodeDuplicateMountError
-        && error.code === OPENCODE_DUPLICATE_MOUNT_CODE,
-      'the second setup is refused by name');
-  } finally { await cleanupFirst(); }
-
-  const cleanupAgain = await createOpencodePlugin({ storage }).setup(setupHost());
-  try {
-    assert.equal(typeof cleanupAgain, 'function');
+    cleanupSecond = await createOpencodePlugin({ storage, journal }).setup(setupHost());
+    assert.equal(records.filter(line => line['kind'] === 'mounted').length, 1,
+      'one mount is constructed for the durable root');
+    const shared = records.filter(line => line['kind'] === 'mount-shared');
+    assert.deepEqual(shared.map(line => line['status']), ['created', 'reused'],
+      'the second activation records that it reused the live mount');
   } finally {
-    await cleanupAgain();
+    await cleanupFirst();
+  }
+  try {
+    assert.equal(typeof cleanupSecond, 'function');
+  } finally { await cleanupSecond?.(); }
+
+  // The last activation released the root: a later mount can claim it.
+  const reopened = createOpencodeMount({ storage });
+  try { await reopened.transform(sessionId, conversation()); }
+  finally {
+    await reopened.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
