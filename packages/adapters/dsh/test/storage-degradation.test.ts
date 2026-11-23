@@ -39,7 +39,7 @@ import { PRUNE_COMMAND } from '../src/prune.js';
 
 const ROUTE = { provider: 'p', model: 'm' };
 /** The one table answer the pass gets: the first row is removed whole. */
-const FORGET = '{"1":{"forgetall":"oversized read"}}';
+const FORGET = '{"1":{"forgetall":true,"summary":"oversized read"}}';
 
 interface FakeLlm {
   stream(options: DshLlmStreamOptions): AsyncIterable<DshLlmChunk>;

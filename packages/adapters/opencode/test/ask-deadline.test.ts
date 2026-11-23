@@ -95,7 +95,7 @@ test('ISSUE-425: the boundary deadline mounts and a normal ask still answers',
     const askGenerate = async (input: OpencodeGenerateInput) => {
       calls.push(input);
       await new Promise<void>(resolve => { setTimeout(resolve, 20); });
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     };
     const mount = createOpencodeMount(askOptions(askGenerate, MAX_PLATFORM_TIMER_MS,
       lines.records));

@@ -204,7 +204,7 @@ test("the four-action vocabulary is closed, and keephead refuses as an unknown a
     "forget", "drop", "dropall", "keepnone", "keeplast", "keepbytes", "forgetlines2", "cap"]) {
     refuses(JSON.stringify({ [key]: key === "keepalllines" ? true : 3 }), "unknown-action");
   }
-  for (const text of ['{"keep":3}', '{"forgetlinesN":[[1,2],"s"]}', '{"Keepall":true}',
+  for (const text of ['{"keep":3}', '{"forgetlinesN":[[1,2],"s"]}',
     '{"":3}', '{"forgetall2":"s"}']) {
     refuses(text, "unknown-action");
   }
@@ -306,4 +306,39 @@ test("both lanes read the same four actions, and keephead is on neither", () => 
       assert.equal(error.code, expected, `${action} is on the gate vocabulary too`);
     }
   }
+});
+
+test("the action key is read case- and number-insensitively (ISSUE-515)", () => {
+  // The key's spelling folds; the payload is still read from the key the model
+  // wrote, and a true misspelling or two action keys still refuse.
+  assert.deepEqual(parseEntryAnswer('{"KEEPLINES":[[1,2],"s"]}'),
+    { action: "keeplines", ranges: [{ from: 1, to: 2 }], summary: "s" });
+  assert.deepEqual(parseEntryAnswer('{"Keepall":true}'), { action: "keepall" });
+  assert.deepEqual(parseEntryAnswer('{"FORGETALL":"s"}'),
+    { action: "forgetall", summary: "s" });
+  assert.deepEqual(parseEntryAnswer('{"forgetline":[[1,2],"s"]}'),
+    { action: "forgetlines", ranges: [{ from: 1, to: 2 }], summary: "s" });
+  refuses('{"kleplines":[[1,2],"s"]}', "unknown-action");
+  refuses('{"keeplines":[[1,2]],"KEEPLINES":[[1,2]],"summary":"s"}', "mixed-keys");
+  refuses('{"KEEPLINES":[[1,2],"s"],"summary":"t"}', "mixed-keys");
+});
+
+test("forgotten is the canonical partial key and summary its legacy alias (ISSUE-525)", () => {
+  const canonical = parseEntryAnswer(
+    '{"keeplines":[[1,2]],"forgotten":"the stale log lines"}');
+  assert.deepEqual(canonical, {
+    action: "keeplines", ranges: [{ from: 1, to: 2 }], summary: "the stale log lines",
+  });
+  assert.deepEqual(parseEntryAnswer('{"keeplines":[[1,2]],"summary":"the stale log lines"}'),
+    canonical, "the legacy key reads as the same answer");
+  assert.deepEqual(parseEntryAnswer(
+    '{"forgetlines":[[1,2]],"forgotten":"the stale log lines"}'),
+  { action: "forgetlines", ranges: [{ from: 1, to: 2 }], summary: "the stale log lines" });
+  refuses('{"keeplines":[[1,2]],"forgotten":"a","summary":"b"}',
+    "both-forgotten-and-summary", "a row carrying both keys is refused, never merged");
+  refuses('{"forgetlines":[[1,2]],"forgotten":"a","summary":"b"}',
+    "both-forgotten-and-summary");
+  const missing = refuses('{"keeplines":[[1,2]]}', "summary-missing");
+  assert.equal(missing.message.includes("forgotten"), true,
+    "the summary-missing message names the canonical key");
 });

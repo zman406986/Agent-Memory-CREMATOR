@@ -174,3 +174,26 @@ test("the wire gate refuses every keeplines on a zero-line unit", () => {
   }, null)), true, "the action gate still applies");
   assert.throws(() => normalizeWireTwoVerdictAnswer(answer, 0), RangeError);
 });
+
+test("both gates fold a raw action spelling before they decide (ISSUE-515)", () => {
+  // A caller that hands the gate a non-canonical action gets the canonical one
+  // back, so nothing downstream sees `KEEPLINES` as an action.
+  const rawEntry = {
+    action: "KEEPLINES", ranges: [{ from: 1, to: 4 }], summary: "cut",
+  } as unknown as EntryAnswer;
+  assert.deepEqual(normalizeTwoVerdictAnswer(rawEntry, 10), {
+    status: "answered",
+    answer: { action: "keeplines", ranges: [{ from: 1, to: 4 }], summary: "cut" },
+  });
+  const rawWire = {
+    verdict: { unitId: UNIT, answeredInRound: 7, action: "FORGETALL", summary: "old" },
+  } as unknown as WireAnswer;
+  assert.deepEqual(normalizeWireTwoVerdictAnswer(rawWire, 10), {
+    status: "answered",
+    answer: { verdict: { unitId: UNIT, answeredInRound: 7, action: "forgetall",
+      summary: "old" } },
+  });
+  // A `keepall` in any spelling is still an action this grammar does not offer.
+  assert.equal(normalizeTwoVerdictAnswer(
+    { action: "KEEPALL" } as unknown as EntryAnswer, 10).status, "refused");
+});

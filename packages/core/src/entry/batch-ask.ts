@@ -44,10 +44,17 @@
  * is a function replacement so a table carrying `$&` or `` $` `` lands literally
  * (ISSUE-172).
  *
+ * ISSUE-508 makes this message the BULK table's too: the dsh depth table sends
+ * `entryBatchAskMessage(rows, "jsonl-20-nokeepall", firstTrigger)` byte for byte
+ * (`packages/adapters/dsh/src/judge-tables.ts`). Its row therefore accepts the
+ * prune renderer's two extra facts — the call's `path` and a refused anchor's
+ * `refusal` — so the bulk row reads exactly as a prune row always did.
+ *
  * Pure and deterministic: same rows, same bytes, no I/O, nothing mutated. Only
  * invalid options throw, because those are caller bugs, not answer data.
  */
 
+import type { PruneAnchorRefusal, PruneAnchorResult } from "../prune/anchor.js";
 import { renderPruneAskRows } from "../prune/ask-message.js";
 import type { PruneAskRow } from "../prune/ask-message.js";
 import { parsePruneAnswer } from "../prune/ask-answer.js";
@@ -95,8 +102,29 @@ export interface EntryBatchRow {
    * it is collapsed to one line by the renderer exactly as a table row's is.
    */
   readonly call: string;
+  /**
+   * The call's target, when the caller knows one. The bulk table's rows carry
+   * their target here, so a row the prune pass asks reads exactly as the prune
+   * renderer writes it (`[Read] config.ts`). Absent leaves the row pathless, the
+   * entry lane's own shape.
+   */
+  readonly path?: string;
   /** The quotes from the unit's own lines, rendered by the anchor subsystem. */
   readonly anchorLines: readonly string[];
+  /**
+   * Why the row has no quotes (a refused prune anchor). When present the row
+   * renders the refusal note instead of an anchor list, never an empty one that
+   * would read as "no anchor needed".
+   */
+  readonly anchorRefusal?: PruneAnchorRefusal;
+  /**
+   * The occurrence ordinal of this row's whole call (same kind and path), when
+   * the caller already computed one. The bulk table's rows carry the pass's own
+   * `anchor.callOrdinal`, so a row reads the same ordinal in every message of a
+   * pass — including a carried re-ask. Absent numbers the row by its own
+   * `call`/`path` within this message, the entry lane's convention.
+   */
+  readonly callOrdinal?: number;
   /**
    * The result's line count `N`. Required when this row's message states it:
    * the batch's ONLY row under `3option` (today's `entryAskMessage` names `N`),
@@ -381,23 +409,39 @@ function checkedRows(rows: readonly EntryBatchRow[]): readonly EntryBatchRow[] {
 
 /**
  * The table renderer's own row shape, built from the batch's data. `call` rides
- * the `[kind]` slot so the row reads "1. [Read config.ts] (call #1) — …" and no
- * row grammar is restated here. Identical calls are numbered 1, 2, 3… in row
- * order, the same convention `assignCallOrdinals` applies to a table's rows.
+ * the `[kind]` slot so the row reads "1. [Read] config.ts (call #1) — …" and no
+ * row grammar is restated here.
+ *
+ * The ordinal is the row's own `callOrdinal` when the caller computed one (the
+ * bulk table passes the pass's `assignCallOrdinals` value), so one unit keeps
+ * its number across every message of a pass, carried re-asks included. Absent,
+ * this message numbers identical calls — same kind AND same target, the same
+ * key `assignCallOrdinals` uses — 1, 2, 3… in row order.
  */
 function rendererRows(rows: readonly EntryBatchRow[]): readonly PruneAskRow[] {
   const counts = new Map<string, number>();
   return rows.map(row => {
-    const ordinal = (counts.get(row.call) ?? 0) + 1;
-    counts.set(row.call, ordinal);
+    const key = `${row.call}\u0000${row.path ?? ''}`;
+    const next = (counts.get(key) ?? 0) + 1;
+    counts.set(key, next);
     return {
       index: row.index,
       // The renderer reads `anchor` alone; `unit` is the table's carry key and
       // never leaves this module, so the slot holds a placeholder of its shape.
       unit: placeholderUnit(row.index),
-      anchor: { kind: row.call, callOrdinal: ordinal, anchors: row.anchorLines },
+      anchor: anchorOf(row, row.callOrdinal ?? next),
     };
   });
+}
+
+/** The row's anchor, exactly as the prune renderer writes it (refusal included). */
+function anchorOf(row: EntryBatchRow, ordinal: number): PruneAnchorResult {
+  const head = row.path === undefined
+    ? { kind: row.call, callOrdinal: ordinal }
+    : { kind: row.call, path: row.path, callOrdinal: ordinal };
+  return row.anchorRefusal === undefined
+    ? { ...head, anchors: [...row.anchorLines] }
+    : { ...head, refusal: row.anchorRefusal };
 }
 
 /** A unit-shaped hole for `renderPruneAskRows`, which never reads it. */

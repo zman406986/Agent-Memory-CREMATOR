@@ -13,18 +13,18 @@ revert planner.
 
 ## Install
 
-The package is not published to npm . Build it from this repo, then
+The package is not published to npm (owner decision, ISSUE-069). Build it from this repo, then
 install the built folder into your project:
 
 ```sh
 npm install
 npm run build
 # in your project:
-npm install file:///path/to/Agent-Memory-CREMATOR/packages/core
+npm install file:///C:/Users/TZhen/Desktop/racoons/packages/core
 ```
 
 On the other owner device the path is
-`file:///path/to/Agent-Memory-CREMATOR/packages/core`. Requires Node
+`file:///C:/Users/TZ/Desktop/racoons/packages/core`. Requires Node
 `>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`).
 
 ## Use
@@ -37,7 +37,7 @@ const tokens = meter.estimate(new TextEncoder().encode('a tool result body'));
 ```
 
 `CoverageMeter` answers the other question — bytes per source path — and adds no threshold of its
-own. The engine, guard and ledger are the other entry points; every export is typed and
+own (ADR-0006). The engine, guard and ledger are the other entry points; every export is typed and
 declared in `dist/`. Most users want a harness adapter instead of wiring the engine themselves.
 
 ## Related

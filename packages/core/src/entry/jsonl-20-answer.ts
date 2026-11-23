@@ -37,6 +37,12 @@
  * range. The reader tolerates a summary up to 30 words while the prompt asks
  * for under 20; the tolerance is wider than the ask on purpose.
  *
+ * The action KEY is read case- and plural-insensitively (ISSUE-515):
+ * `KEEPLINES`, `keepline`, `KEEPline` and `keepLines` are one action, through
+ * `normalizeActionKey`. The prompt still teaches the canonical spelling, and a
+ * true misspelling (`kleplines`) stays out. Two action keys that normalize to
+ * one action are still two keys and still refused `mixed-keys`.
+ *
  * The behaviour is the simulator's `jsonl20RowsOf`
  * (`dev/sim/sim-batch-grammar.mjs:506-680`) ported without a wording change to
  * the refusal rules. Pure and deterministic: same text, same indices, same
@@ -44,6 +50,7 @@
  */
 
 import { normalizeTwoVerdictAnswer } from "../prune/two-verdict.js";
+import { normalizeActionKey } from "../verdicts/action-keys.js";
 import { descriptorWordCount } from "../verdicts/labels.js";
 import type { EntryAnswer } from "../verdicts/entry-wire.js";
 
@@ -70,7 +77,8 @@ const JSONL_20_ACTIONS: readonly string[] = Object.freeze(["keepall", "forgetall
  */
 export const JSONL_20_REFUSAL_CODES = Object.freeze([
   "answer-unreadable", "unknown-index", "duplicate-index", "missing-index",
-  "action-not-in-grammar", "malformed-row", "mixed-keys", "summary-missing",
+  "action-not-in-grammar", "malformed-row", "mixed-keys",
+  "both-forgotten-and-summary", "summary-missing",
   "summary-too-long", "bad-range", "ranges-unordered", "spans-outside-result",
 ] as const);
 
@@ -311,9 +319,14 @@ export function jsonl20MessageOf(code: Jsonl20RefusalCode): string {
   if (code === "mixed-keys") {
     return "The verdict carried more than one action key or an extra key; the row is kept.";
   }
-  if (code === "summary-missing") return "The verdict forgot without a summary; the row is kept.";
+  if (code === "both-forgotten-and-summary") {
+    return "The verdict carried both forgotten and summary; the row is kept.";
+  }
+  if (code === "summary-missing") {
+    return "The verdict forgot without a forgotten value (legacy summary is accepted); the row is kept.";
+  }
   if (code === "summary-too-long") {
-    return `The summary runs past ${String(JSONL_20_SUMMARY_WORDS)} words; the row is kept.`;
+    return `The forgotten value runs past ${String(JSONL_20_SUMMARY_WORDS)} words; the row is kept.`;
   }
   if (code === "bad-range") {
     return "keeplines is not an array of positive [start,end] integer pairs; the row is kept.";
@@ -462,9 +475,12 @@ function skipValue(text: string, at: number): number {
 
 /**
  * One line's verdict. `mixed-keys` is any second action key or any key other
- * than the action and `summary`; `action-not-in-grammar` is no action key at
- * all or a `keepall` that is not exactly `true`; `malformed-row` is a
- * `forgetall` that is not exactly `true`.
+ * than the action and `forgotten` (legacy alias `summary`); `action-not-in-grammar`
+ * is no action key at
+ * all, an action this grammar does not offer, or a `keepall` that is not
+ * exactly `true`; `malformed-row` is a `forgetall` that is not exactly `true`.
+ * Keys are matched through `normalizeActionKey`, and the payload is read from
+ * the key's own raw spelling.
  */
 function readingOfValue(
   value: unknown,
@@ -476,26 +492,39 @@ function readingOfValue(
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
-  const actions = keys.filter(key => JSONL_20_ACTIONS.includes(key));
-  if (actions.length === 0) return { code: "action-not-in-grammar" };
-  if (actions.length > 1) return { code: "mixed-keys" };
-  const action = actions[0];
-  if (action === undefined) return { code: "action-not-in-grammar" };
-  if (keys.some(key => key !== action && key !== "summary")) return { code: "mixed-keys" };
+  // A key that names an action in any case, singular or plural, is an action
+  // key. `summary` is not one and is never normalized.
+  const actionKeys = keys.filter(key => normalizeActionKey(key) !== null);
+  if (actionKeys.length === 0) return { code: "action-not-in-grammar" };
+  // Two action keys stay two keys even when they normalize to one action.
+  if (actionKeys.length > 1) return { code: "mixed-keys" };
+  const rawAction = actionKeys[0];
+  if (rawAction === undefined) return { code: "action-not-in-grammar" };
+  const action = normalizeActionKey(rawAction);
+  if (action === null || !JSONL_20_ACTIONS.includes(action)) {
+    return { code: "action-not-in-grammar" };
+  }
+  if (keys.some(key => key !== rawAction && key !== "forgotten" && key !== "summary")) {
+    return { code: "mixed-keys" };
+  }
+  const descriptors = keys.filter(key => key === "forgotten" || key === "summary");
+  if (descriptors.length > 1) return { code: "both-forgotten-and-summary" };
+  const payload = record[rawAction];
   if (action === "keepall") {
     if (keys.length !== 1) return { code: "mixed-keys" };
-    return record["keepall"] === true
+    return payload === true
       ? { answer: { action: "keepall" } }
       : { code: "action-not-in-grammar" };
   }
-  if (action === "forgetall" && record["forgetall"] !== true) return { code: "malformed-row" };
-  const summary = record["summary"];
+  if (action === "forgetall" && payload !== true) return { code: "malformed-row" };
+  // `forgotten` is the canonical wire key; `summary` is the legacy alias.
+  const summary = record["forgotten"] ?? record["summary"];
   if (typeof summary !== "string") return { code: "summary-missing" };
   if (descriptorWordCount(summary) > JSONL_20_SUMMARY_WORDS) {
     return { code: "summary-too-long" };
   }
   if (action === "forgetall") return { answer: { action: "forgetall", summary } };
-  return readingOfKeeps(record["keeplines"], summary, lineCounts, index);
+  return readingOfKeeps(payload, summary, lineCounts, index);
 }
 
 /**

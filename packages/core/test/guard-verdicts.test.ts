@@ -7,6 +7,7 @@ import { checkSources, checkTranscript } from "../src/guard/checks-sources.js";
 import { checkVerdicts, readVerdict } from "../src/guard/checks-verdicts.js";
 import { Guard } from "../src/guard/guard.js";
 import type { ValidationCode, ValidationInput, ValidationIssue } from "../src/guard/types.js";
+import { salvageShare } from "../src/engine/telemetry.js";
 import type { RulePlan } from "../src/rules/types.js";
 import type { CapabilityFlags, MessageNode, SessionSnapshot, ToolResultNode } from "../src/types/transcript.js";
 import { UnitTracker, unitIdFor } from '../src/units/tracker.js';
@@ -329,6 +330,26 @@ test("a keeplines and a forgetlines answer both pass the guard and remove the sa
   assert.equal(mirrorValidation.application.mode, "revert");
   assert.match(new TextDecoder().decode(mirrorValidation.application.appendRecords[0]?.bytes),
     /lines 2–3 · necromancy recall:sha256:/u);
+});
+
+test("a partial keep prices its dropped ranges as freed and its kept lines as kept (ISSUE-509)", async () => {
+  const trimmed = trimmedScene([{ from: 1, to: 1 }, { from: 4, to: 4 }]);
+  const validation = await guard().validate(verdictInput(trimmed));
+  if (!validation.ok) assert.fail(JSON.stringify(validation.issues));
+  const revert = validation.application.revert;
+  assert.ok(revert !== undefined, "a partial keep is applied by checkpoint-revert");
+  const receiptBytes = validation.application.appendRecords[0]?.bytes.length ?? 0;
+  assert.ok(receiptBytes > 0, "the receipt is a rendered record");
+  // Unit 1's body is 33 bytes ("head 1\nbanner 1\nvalue 1\nfooter 1\n"). Lines 2–3
+  // are the dropped 7..24 span: 17 freed bytes. The kept lines 1 and 4 (16 bytes)
+  // stay in the request, beside the suffix after the cut: result-2's 33 bytes and
+  // the tiny node's 5.
+  assert.deepEqual(revert.cost, {
+    cutIndex: 2, freedBytes: 17, keptBytes: 54, receiptBytes,
+    netFreedBytes: 17 - 54 - receiptBytes,
+  }, "row: partial keep — only the dropped ranges are freed");
+  assert.equal(salvageShare(revert.cost.keptBytes, revert.cost.freedBytes), 54 / 71,
+    "row: the journal's salvage share is priced on the corrected numbers");
 });
 
 test("a receipt names the removed ranges, and unsorted spans normalise to the same plan", () => {

@@ -21,11 +21,15 @@
  *     tableable unit. The pass is core's `planPrunePass`: L1
  *     (`stale-exact-reread`, `closed-episode`, `byte-identical-duplicates`),
  *     the superseded-read dedupe (default off), and every remaining unit above
- *     the 512 floor as one table row, with no row cap. A readable `forgetall`
- *     applies with the pass's L1 and dedupe removals through one core prune
- *     document (ADR-0054); a `keepall` keeps and re-tables at a later crossing;
- *     `keeplines`/`forgetlines` are refused `action-not-in-grammar` because the
- *     host's typed tool-result part cannot carry a partial keep. A failed ask or
+ *     the 512 floor as one table row, with no row cap. The prompt is core's
+ *     `jsonl-20-nokeepall` message: `forgetall` and `keeplines`, 70 percent on
+ *     the first ask and 40 percent later. A readable `forgetall` applies with
+ *     the pass's L1 and dedupe removals through one core prune document
+ *     (ADR-0054); a partial `keeplines` is handed to the partial-apply path,
+ *     which re-emits the kept lines inside the result part (or refuses a
+ *     non-text result by name); a whole-range `keeplines` normalizes to a keep
+ *     and re-tables at a later crossing; a literal `keepall` is the terminal
+ *     `action-not-in-grammar` refusal. A failed ask or
  *     an unreadable reply is an `ask-error`, never a fire; a timeout is an
  *     `ask-error` too and is terminal for its units (the abandoned host call
  *     cannot be cancelled, so they keep their claim and no retry); a refused row
@@ -118,7 +122,7 @@ import {
 import type { OpencodeAppliedPlan, OpencodeAppliedPlanIndex } from './apply.js';
 import {
   buildOpencodeAskBatch, buildOpencodePassPlan, isSeenUnit, readOpencodeAskAnswer,
-  OPENCODE_ASK_FLOOR_BYTES, OPENCODE_ASK_GRAMMAR,
+  OPENCODE_ASK_FLOOR_BYTES, OPENCODE_ASK_GRAMMAR, OPENCODE_ASK_PROMPT_GRAMMAR,
 } from './ask.js';
 import type { OpencodeAskBatch, OpencodeAskGrammar } from './ask.js';
 import { createOpencodeCapabilities } from './capabilities.js';
@@ -182,10 +186,9 @@ export const OPENCODE_ASK_RETRY = 'next revision at most once';
  * What a refused row retries (ADR-0050 decision 3; PRD §6.2/§6.5). A readable
  * table that refuses a row carries that row's unit to one later table; a second
  * refusal is final. A row answered keep or remove is not a refusal and never
- * spends this retry. A terminal `action-not-in-grammar` refusal — an action the
- * prompt does not offer, `keeplines` or `forgetlines` — spends no re-ask at all:
- * a second identical question cannot change the reading (ADR-0053 §3, as
- * amended for this host).
+ * spends this retry. A terminal `action-not-in-grammar` refusal — a literal
+ * `keepall`, which the prompt does not offer — spends no re-ask at all: a second
+ * identical question cannot change the reading (ADR-0053 §3).
  */
 export const OPENCODE_ASK_REFUSED_RETRY =
   'one later table; a second refusal is final; an action the prompt does not offer is terminal';
@@ -252,7 +255,7 @@ export type OpencodeJournalKind =
   // build failure.
   | 'prune-outcome'
   | 'command-error'
-  // ADR-0068 / ISSUE-531: the host command seam was present or absent, so a
+  // ADR-0068 / ISSUE-530: the host command seam was present or absent, so a
   // journal can tell a missing `/cremate` menu entry from a failed registration.
   | 'command-registration'
   | 'cremate'
@@ -473,13 +476,15 @@ export interface OpencodeRequestEstimate {
 }
 
 /**
- * One session's stored ask verdicts: the readable `forgetall` answers only,
- * keyed by the unit each names, with the ask fire round on
- * `verdict.answeredInRound`. A `keepall` is a keep, never a stored verdict, and
- * a `keeplines`/`forgetlines` reply is a terminal `action-not-in-grammar`
- * refusal that keeps the unit and is never re-asked (ADR-0053 §Amendment
- * 2026-11-19). The map is written to durable state and restored at open; a
- * plugin reload keeps the unapplied verdicts (ISSUE-409; ADR-0063).
+ * One session's stored ask verdicts: the readable removals, keyed by the unit
+ * each names, with the ask fire round on `verdict.answeredInRound`. That is a
+ * `forgetall` and a partial `keeplines` (ISSUE-509; the apply path re-emits the
+ * kept lines or refuses a non-text result by name). A `keepall`, including the
+ * clean keep the reader normalizes a whole-range `keeplines` into, is a keep and
+ * never a stored verdict, and a literal `keepall` reply is the terminal
+ * `action-not-in-grammar` refusal that keeps the unit and is never re-asked.
+ * The map is written to durable state and restored at open; a plugin reload
+ * keeps the unapplied verdicts (ISSUE-409; ADR-0063).
  */
 export type OpencodeAskVerdicts = Map<UnitId, WireAnswer>;
 
@@ -563,18 +568,23 @@ export interface OpencodeSessionEntry {
    */
   readonly refusedRetriedUnitIds: Set<UnitId>;
   /**
-   * The readable `forgetall` answers this session's ask has read, keyed by the
-   * unit each names. A `keepall` answer is a keep and is not stored; a
-   * `keeplines`/`forgetlines` reply is a terminal refusal and is not stored
-   * either (ADR-0053 §Amendment 2026-11-19).
+   * The readable removal verdicts this session's ask has read, keyed by the
+   * unit each names: a `forgetall` or a partial `keeplines` (ISSUE-509). A
+   * `keepall` answer — including the clean keep the reader normalizes a
+   * whole-range `keeplines` into — is a keep and is not stored; a literal
+   * `keepall` reply is the terminal `action-not-in-grammar` refusal and is not
+   * stored either (ADR-0053 decision 3).
    */
   readonly askVerdicts: OpencodeAskVerdicts;
   /**
    * The verdicts the durable record still owes an apply (ISSUE-409; ADR-0063).
    * Kept apart from `askVerdicts`: an applied verdict stays in that map so a
    * host rebuild re-applies the banked removal, while the durable record is
-   * cleared once the apply landed and the ledger's applied row owns it. Only
-   * this map is serialized.
+   * cleared once the apply landed and the ledger's applied row owns it. The
+   * exception is a partial `keeplines` (ISSUE-509): its banked row is a
+   * blank-summary `forgetall` and cannot reconstruct the kept lines, so the
+   * verdict stays durable across a process boundary and a remount re-applies the
+   * rewrite. Only this map is serialized.
    */
   readonly durableAskVerdicts: Map<UnitId, DurableAskVerdict>;
   /**
@@ -678,8 +688,16 @@ export interface OpencodeSessionEntry {
    * emits ask rows opens the guard for its timed-out calls' late rows.
    */
   askStepRowsSeen: boolean;
-  /** Fires this session has recorded: one per readable ask reply. Uncapped; it
-   * is a count of fires issued, never a ceiling (ADR-0060). */
+  /**
+   * Fires this session has recorded: one per readable ask reply (answered rows,
+   * or rows refused with a code other than unreadable). Uncapped; it is a count
+   * of fires issued, never a ceiling (ADR-0060). ISSUE-509 makes it the
+   * first/later share selector — `0` states 70 percent, every later value 40
+   * percent — and it is restored from durable state so a resumed segment does
+   * not restate the first ask. It moves only when a request actually left and
+   * was answered or refused with rows: a throw, a timeout, a refused-before-send
+   * standdown and an ask-off mount leave it unchanged.
+   */
   askFires: number;
   /**
    * The pass round stamp. Every plan this session builds gets the next value;
@@ -809,10 +827,11 @@ export interface OpencodeAskApplyInput {
   readonly round?: number;
   /**
    * The accepted answers from this fire, already gated by
-   * `readOpencodeAskAnswer`: only `forgetall` re-encoded here becomes a
-   * removal; a `keepall` removes nothing. The raw reply text is never handed
-   * to the core merge, so an action the prompt did not offer cannot slip
-   * through the adapter's gate.
+   * `readOpencodeAskAnswer`: a `forgetall` and a partial `keeplines` are
+   * re-encoded here and become removals (the partial apply path owns how); a
+   * `keepall` removes nothing. The raw reply text is never handed to the core
+   * merge, so an action the prompt did not teach cannot slip through the
+   * adapter's gate.
    */
   readonly answers?: ReadonlyMap<UnitId, WireAnswer>;
   /**
@@ -896,8 +915,12 @@ export function releaseCancelledUnits(
  *     by a prior applied plan: a banked removal stays in effect;
  *   - a verdict the guard rejects terminally (`descriptor-too-long`) is dropped
  *     after the rejection, so every rebuilt request does not retry it;
- *   - a non-`forgetall` verdict is dropped. The reader never stores one; this
- *     covers a legacy in-memory row, and the host cannot apply a partial keep.
+ *   - a partial `keeplines` verdict is re-encoded into the wire notation as a
+ *     line-level removal and rides the same prune document beside the
+ *     `forgetall` rows (ISSUE-509); the apply path re-emits the kept lines
+ *     inside the result part, or refuses a non-text result by name. A
+ *     whole-range `keeplines`/`keepall` is a keep and is never encoded: the
+ *     reader normalizes a whole-range keep to `keepall` and this loop drops it.
  *
  * A re-application on a later request is expected: `rewriteHistory: false`
  * means the host rebuilds the request, so the stored verdict (and every L1 and
@@ -950,8 +973,10 @@ export async function applyOpencodeAskVerdicts(
   const rowOfUnit = new Map(plan.askRows.map(row => [row.unit.id, row] as const));
   /**
    * The stored verdicts and this fire's accepted answers, keyed by unit. A
-   * `keepall` carries no removal and is simply absent from the merge; only a
-   * `forgetall` is re-encoded into the core's wire notation.
+   * `keepall` carries no removal and is simply absent from the merge; a
+   * `forgetall` and a partial `keeplines` are re-encoded into core's wire
+   * notation, so one prune document carries every removal the pass decided
+   * (ISSUE-509).
    */
   const wanted = new Map<UnitId, WireAnswer>(entry.askVerdicts);
   for (const [unitId, answer] of input.answers ?? []) wanted.set(unitId, answer);
@@ -1004,24 +1029,29 @@ export async function applyOpencodeAskVerdicts(
       }
       continue;
     }
-    if (answer.verdict.action !== 'forgetall') {
-      // The prompt offers no partial action, and a literal keep removes
-      // nothing. A legacy row of either shape is not applied.
+    if (answer.verdict.action !== 'forgetall' && answer.verdict.action !== 'keeplines') {
+      // A literal keep removes nothing, and the reader never stores one: a row
+      // of that shape here is a legacy in-memory verdict.
       entry.askVerdicts.delete(unitId);
       continue;
     }
     /**
-     * A stored summary the wire parser would refuse is terminal here: the
-     * reader never stores one, so this is a legacy in-memory row, and keeping
-     * it would refuse the same row on every rebuilt request (ISSUE-269). It is
-     * dropped before the merge, and named.
+     * The verdict's own descriptor. A stored summary the wire parser would
+     * refuse is terminal here (ISSUE-269): the reader never stores one, so this
+     * is a legacy in-memory row, and keeping it would refuse the same row on
+     * every rebuilt request. It is dropped before the merge, and named. A
+     * `keeplines` carriage names its summary in `keeplinesSummary`; the wire
+     * parser caps it at the same receipt limit.
      */
-    if (descriptorIssue(answer.verdict.summary ?? '') !== null) {
+    const summary = answer.verdict.action === 'keeplines'
+      ? answer.keeplinesSummary ?? ''
+      : answer.verdict.action === 'forgetall' ? answer.verdict.summary ?? '' : '';
+    if (descriptorIssue(summary) !== null) {
       entry.askVerdicts.delete(unitId);
       journal('ask-error', {
         sessionId: entry.sessionId, revision: snapshot.revision, origin: 'step',
         stage: 'descriptor', unitId, nodeId: unit.nodeId, code: 'summary-too-long',
-        message: 'a stored forgetall summary runs past the receipt descriptor limit; the row '
+        message: 'a stored ask summary runs past the receipt descriptor limit; the row '
           + 'is dropped and the unit keeps',
       });
       continue;
@@ -1048,7 +1078,25 @@ export async function applyOpencodeAskVerdicts(
         continue;
       }
     }
-    entries.push([String(row.index), { forgetall: answer.verdict.summary ?? '' }]);
+    if (answer.verdict.action === 'keeplines') {
+      /**
+       * A partial `keeplines` is a line-level removal, not a dropped verdict
+       * (ISSUE-509). The wire notation names the spans the unit KEEPS plus its
+       * summary; the apply path re-emits those lines inside the typed result
+       * part while the archive keeps the dropped lines' receipt and recall
+       * range. A whole-range keep never reaches here: the reader normalizes it
+       * to a clean `keepall`, which this loop drops above.
+       */
+      entries.push([String(row.index), {
+        keeplines: [
+          ...answer.verdict.ranges.map(range => [range.from, range.to]),
+          summary,
+        ],
+      }]);
+      indices.push(row.index);
+      continue;
+    }
+    entries.push([String(row.index), { forgetall: summary }]);
     indices.push(row.index);
   }
   journal('prune-plan', { sessionId: entry.sessionId, round: plan.round,
@@ -1124,8 +1172,9 @@ export async function applyOpencodeAskVerdicts(
    * A guard refusal the same content causes on every rebuilt request is terminal
    * (ISSUE-269): drop the offending verdict so the next transform does not retry
    * a removal the guard can never accept. The path this build produces is
-   * `descriptor-too-long`; the ask reader refuses a 26-word summary before
-   * storage too, and this drop covers a verdict already in the map.
+   * `descriptor-too-long`; the reader tolerates up to 30 words while the wire
+   * and the guard cap the receipt descriptor at 25, so a 26-30-word summary is
+   * stored, refused here by the guard, and this drop settles it.
    */
   if (result.validation !== null && !result.validation.ok) {
     const refusedNodes = new Set<NodeId>();
@@ -1141,10 +1190,18 @@ export async function applyOpencodeAskVerdicts(
   const committed = result.committed === true || entry.port.commit();
   const applied = committed && result.status === 'applied' && result.receipt !== null;
   if (applied) {
-    // ISSUE-409: the ledger's `applied` row now owns these removals. A later
-    // host rebuild re-applies them through the banked applied-plan index, so
-    // the durable ask record stops owing them.
+    /**
+     * ISSUE-409: the ledger's `applied` row now owns a WHOLE-unit removal, and a
+     * later host rebuild re-applies it from the banked applied-plan row, so the
+     * durable ask record stops owing it. A partial `keeplines` is the exception
+     * (ISSUE-509): its banked row is a blank-summary `forgetall`
+     * (`bankedRows` -> the apply loop), which cannot reconstruct the kept lines,
+     * so deleting the verdict would make a remount remove the unit whole. The
+     * verdict therefore stays durable, and a remount re-applies the line-level
+     * rewrite exactly as this process does on every rebuilt request.
+     */
     for (const removal of document.removals) {
+      if (entry.askVerdicts.get(removal.unitId)?.verdict.action === 'keeplines') continue;
       entry.durableAskVerdicts.delete(removal.unitId);
     }
   }
@@ -2363,7 +2420,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       engineAtRest: engineCapabilities.atRest === true,
       ...(askGrammar === undefined
         ? {}
-        : { ask: { grammar: askGrammar, transientModelCalls: 'one per fire',
+        : { ask: { grammar: askGrammar, promptGrammar: OPENCODE_ASK_PROMPT_GRAMMAR,
+          transientModelCalls: 'one per fire',
           applied: false, floorBytes: OPENCODE_ASK_FLOOR_BYTES,
           retry: OPENCODE_ASK_RETRY,
           // ADR-0063: the asked set, the revision claims and an unapplied
@@ -2385,13 +2443,22 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
      * ISSUE-467 / ADR-0063 clause 3: the drop is a durable write, not a
      * read-time filter. An ask-off mount clears the record it would otherwise
      * leave for a later ask-on mount to resurrect, and loads no verdict or
-     * claim of its own, so `ask-state-dropped` is true.
+     * claim of its own, so `ask-state-dropped` is true. The fire count is not a
+     * claim: it survives the drop, because it records asks that already left.
      */
     const seededAsk = askGrammar === undefined ? null : durableAsk;
     if (askGrammar === undefined && durableAsk !== null) {
       const cleared = writeDurableAskState(target, {
         revisions: [], askedUnitIds: [], retriedUnitIds: [], refusedRetriedUnitIds: [],
         verdicts: [], deferredApply: false, deferredFailures: 0,
+        /**
+         * The share selector is a fact about asks that already LEFT, not an ask
+         * claim: an ask-off mount erases the claims and verdicts it would
+         * resurrect, but it must not rewind the 70/40 line. Rewinding it would
+         * restate the first share on a later ask-on mount whose earlier ask was
+         * answered (ISSUE-509).
+         */
+        askFires: durableAsk.askFires,
       });
       if (!cleared.ok) {
         // ISSUE-483: a failed clear has its own line; claiming the drop would
@@ -2446,9 +2513,12 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       durableAskVerdicts,
       persistAskState: () => {
         if (target.kind !== 'durable') return;
-        // A verdict an apply or a guard settled is no longer owed. It may stay
-        // in `askVerdicts` so a rebuilt host request re-applies the banked
-        // removal, but the ledger's applied row owns it from here (ISSUE-409).
+        // A verdict an apply or a guard settled is no longer owed, and the
+        // ledger's applied row owns it (ISSUE-409). The exception is a partial
+        // `keeplines`: it stays in `askVerdicts` after its apply precisely so a
+        // rebuilt request or a remount can re-apply the kept-lines rewrite, and
+        // its durable row is kept for the same reason (ISSUE-509). This prune
+        // therefore drops only durable rows whose verdict left `askVerdicts`.
         for (const unitId of entry.durableAskVerdicts.keys()) {
           if (!entry.askVerdicts.has(unitId)) entry.durableAskVerdicts.delete(unitId);
         }
@@ -2460,6 +2530,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           verdicts: [...entry.durableAskVerdicts.values()],
           deferredApply: entry.deferredApply,
           deferredFailures: entry.deferredFailures,
+          // ISSUE-509: the first/later share line is a durable fact. A resumed
+          // segment states 40 percent once one ask has left and been read.
+          askFires: entry.askFires,
         } satisfies DurableAskState);
         if (!written.ok) {
           journal('mount-state-error', { sessionId, fact: 'ask',
@@ -2482,7 +2555,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       stepAskFired: false, askInFlight: false, abandonedAsks: 0, abandonedAsksConsumed: 0,
       askInterrupts: new Set(), askStepRowsSeen: false,
       abandonedAskPromptDigests: new Set<string>(),
-      askFires: 0, passRound: 0, passRemovalsApplied: false,
+      askFires: seededAsk?.askFires ?? 0, passRound: 0, passRemovalsApplied: false,
       deferredApply: (seededAsk?.deferredApply ?? false) || restoredVerdicts.length > 0,
       deferredFailures: seededAsk?.deferredFailures ?? 0,
       completedThroughTurnOrdinal: null,
@@ -2951,6 +3024,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               round: entry.passRound,
               classes: entry.dedupeClasses,
               appliedPlans: entry.appliedPlans,
+              // ISSUE-509: the session's first table ask states 70 percent, every
+              // later one 40. The count is durable, so a resumed segment states 40.
+              firstTrigger: entry.askFires === 0,
               ...(entry.preInstallNodes === null
                 ? {} : { excludeNodeIds: entry.preInstallNodes }),
             });
@@ -3302,9 +3378,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    *
    * The pass is core's: the caller built it with `planPrunePass`, so this
    * function only sends the table, reads the reply through the adapter's
-   * two-option gate, records the bookkeeping, and returns the accepted
-   * `forgetall` answers for the one apply that follows. L1 and the dedupe are in
-   * the same plan and apply with the answers, exactly as dsh's pass does.
+   * `jsonl-20-nokeepall` reader, records the bookkeeping, and returns the
+   * accepted `forgetall` and partial `keeplines` answers for the one apply that
+   * follows. L1 and the dedupe are in the same plan and apply with the answers,
+   * exactly as dsh's pass does.
    *
    * **It runs after the at-rest commit, before the prune apply.** That is dsh's
    * order: the at-rest rules run first, then the prune reads the surface they
@@ -3412,7 +3489,14 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     const promptSha256 = sha256Of(batch.prompt ?? '');
     const startedAtMs = clock.nowMs();
     const claimed = {
-      sessionId: entry.sessionId, origin, revision: batch.revision, grammar: askGrammar,
+      sessionId: entry.sessionId, origin, revision: batch.revision,
+      /**
+       * The mount-option id this mount was opened with (`crematorAskGrammar`).
+       * It is not the wire grammar: `promptGrammar` below names the message and
+       * reader that actually ran (`jsonl-20-nokeepall`, ISSUE-509).
+       */
+      grammar: askGrammar,
+      promptGrammar: OPENCODE_ASK_PROMPT_GRAMMAR,
       generation: entry.askGeneration,
       /** The pass round the answers are stamped with, not a separate fire count. */
       round: batch.round,
@@ -3628,7 +3712,12 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     const answers = new Map<UnitId, WireAnswer>();
     for (const row of parsed) {
       if (row.status !== 'answered') continue;
-      if (row.answer.verdict.action !== 'forgetall') continue;
+      const action = row.answer.verdict.action;
+      // A `keepall` (or a whole-range `keeplines` the reader normalized to it)
+      // removes nothing, so it never reaches the merge. A `forgetall` and a
+      // partial `keeplines` both go to the apply path as themselves; that path
+      // re-emits a kept-line result or refuses a non-text one by name.
+      if (action !== 'forgetall' && action !== 'keeplines') continue;
       const unitId = unitByIndex.get(row.index);
       if (unitId !== undefined) answers.set(unitId, row.answer);
     }
@@ -3639,9 +3728,11 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       kept: outcome.kept, carried: outcome.carried, excluded: outcome.excluded,
       terminal: outcome.terminal,
       /**
-       * Every answered row is `keepall` or `forgetall`: the reader refuses every
-       * other action as `action-not-in-grammar` before this line is written, so
-       * a journal reader never sees an action the prompt did not offer.
+       * Every answered row is `keepall`, `forgetall` or a partial `keeplines`.
+       * The reader refuses a literal `keepall` as `action-not-in-grammar` and
+       * normalizes a whole-range `keeplines` to a clean `keepall`, so a journal
+       * reader never sees an action the prompt did not teach as a keep or a
+       * removal.
        */
       parsed: parsed.map(row => row.status === 'answered'
         ? { index: row.index, status: row.status, action: row.answer.verdict.action }
@@ -3665,15 +3756,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * Every tabled unit was claimed before the request left. This function then
    * decides what the claim means:
    *
-   * - an answered `forgetall` stays claimed forever and its verdict is stored;
-   * - an answered `keepall` releases the unit, so a later crossing tables it
-   *   again (ADR-0050 decision 3; ISSUE-300 item 4). The model chose to keep
-   *   the bytes now, not to forbid a later question;
+   * - an answered `forgetall` or partial `keeplines` stays claimed forever and
+   *   its verdict is stored for the apply path;
+   * - an answered `keepall` — the keep the reader normalized a whole-range
+   *   `keeplines` into — releases the unit, so a later crossing tables it again
+   *   (ADR-0050 decision 3; ISSUE-300 item 4). The model chose to keep the
+   *   bytes now, not to forbid a later question;
    * - a refused row releases the unit for exactly one later table; a second
    *   refusal keeps the permanent claim;
-   * - a terminal `action-not-in-grammar` refusal keeps the permanent claim and
-   *   spends no re-ask: the prompt never offered the action, so a second ask
-   *   cannot change the reading.
+   * - a terminal `action-not-in-grammar` refusal (a literal `keepall`) keeps the
+   *   permanent claim and spends no re-ask: the prompt never offered the action,
+   *   so a second ask cannot change the reading.
    */
   function bookkeepAnswers(
     entry: OpencodeSessionEntry,
@@ -3707,7 +3800,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       if (unitId === undefined) continue;
       if (row.status === 'answered') {
         entry.refusedRetriedUnitIds.delete(unitId);
-        if (row.answer.verdict.action === 'forgetall') {
+        const action = row.answer.verdict.action;
+        if (action === 'forgetall' || action === 'keeplines') {
           entry.askedUnitIds.add(unitId);
           entry.askVerdicts.set(unitId, row.answer);
           // ISSUE-409: an unapplied verdict is durable from the moment it is
@@ -3717,8 +3811,9 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
             entry.durableAskVerdicts.set(unitId, { unitId, nodeId, answer: row.answer });
           }
         } else {
-          // `keepall`: tableable again at a later crossing; this revision is
-          // still guarded by `askedRevisions`.
+          // `keepall` (a whole-range `keeplines` the reader normalized to it):
+          // tableable again at a later crossing; this revision is still guarded
+          // by `askedRevisions`.
           entry.askedUnitIds.delete(unitId);
           kept.push({ index: row.index, unitId, action: 'keepall' });
         }
@@ -3873,6 +3968,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
           seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
           round: entry.passRound, classes: entry.dedupeClasses,
           appliedPlans: entry.appliedPlans,
+          firstTrigger: entry.askFires === 0,
           ...(entry.preInstallNodes === null
             ? {} : { excludeNodeIds: entry.preInstallNodes }),
         });
@@ -3977,6 +4073,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
               seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
               round: entry.passRound, classes: entry.dedupeClasses,
               appliedPlans: entry.appliedPlans,
+              firstTrigger: entry.askFires === 0,
               ...(entry.preInstallNodes === null
                 ? {} : { excludeNodeIds: entry.preInstallNodes }),
             });

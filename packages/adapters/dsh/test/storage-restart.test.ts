@@ -29,12 +29,20 @@ import type {
   RacoonsJournalRecord, RacoonsPluginConfig,
 } from '../src/plugin.js';
 import { createRacoonsPlugin, resolveSessionStorage } from '../src/plugin.js';
+import { readTableAskFired } from '../src/prune-round-store.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
 
 const ROUTE = { provider: 'p', model: 'm' };
-/** The one table answer the pass gets: the first row is removed whole. */
-const FORGET = '{"1":{"forgetall":"oversized read"}}';
-/** A keep-all table answer: the pass settles and applies nothing. */
+/**
+ * The one table answer the pass gets: the first row is removed whole. One JSON
+ * object per line, the shape the shipped `jsonl-20-nokeepall` ask teaches.
+ */
+const FORGET = '{"1":{"forgetall":true,"summary":"oversized read"}}';
+/**
+ * A literal `keepall` on the depth table: the shipped grammar does not offer
+ * that action, so the row is a terminal `action-not-in-grammar` refusal — the
+ * unit keeps and nothing is applied.
+ */
 const KEEP = '{"1":{"keepall":true}}';
 
 interface FakeLlm {
@@ -413,6 +421,101 @@ test('the first-ask share line is not repeated after a restart (ISSUE-406)', asy
   }
 });
 
+test('the depth table keeps its first-ask share line across a restart (ISSUE-508)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'racoons-restart-table-ask-'));
+  const root = join(dir, 'racoons');
+  const journal1: JournalLine[] = [];
+  const journal2: JournalLine[] = [];
+  // The shipped default grammar (`nokeepall`): the table IS the entry three-piece
+  // message, so the first table ask states 70 percent and every later one 40.
+  const first = fakeMount(root, journal1, [KEEP]);
+  const second = fakeMount(root, journal2, [KEEP]);
+  try {
+    // 1. A genuinely first table ask states the 70 percent share line.
+    await first.apply();
+    const session = fakeSession('session-restart-table-ask');
+    attach(first, session);
+    step(session, oversizedBody(8_000), 'c1');
+    session.append('turn/end', { turn: 1 });
+    first.wire(session.id);
+    requestPrune(session);
+    await preStep(first.listeners, session);
+    assert.equal(first.llm.calls.length, 1, 'the first table ask left the seam');
+    assert.ok(promptText(first.llm.calls[0] as DshLlmStreamOptions)
+      .includes('keep at most 70 percent'), 'the first table ask states 70');
+    // The flag landed on the per-session store beside the round.
+    const target = resolveSessionStorage(root, 'session-restart-table-ask');
+    assert.equal(readTableAskFired(target), true, 'the table-ask flag is persisted');
+    await first.close();
+
+    // 2. The restart: a fresh mount and surface over the SAME durable state.
+    await second.apply();
+    const resumed = fakeSession('session-restart-table-ask');
+    attach(second, resumed);
+    step(resumed, oversizedBody(8_000), 'r1');
+    resumed.append('turn/end', { turn: 1 });
+    second.wire(resumed.id);
+    requestPrune(resumed);
+    await preStep(second.listeners, resumed);
+    assert.equal(second.llm.calls.length, 1, 'the resumed table ask left the seam');
+    const later = promptText(second.llm.calls[0] as DshLlmStreamOptions);
+    assert.ok(later.includes('keep at most 40 percent'),
+      'the restart\'s first table ask states the later share');
+    assert.equal(later.includes('keep at most 70 percent'), false);
+  } finally {
+    await first.close();
+    await second.close();
+    cleanup(dir);
+  }
+});
+
+test('the first-table-ask flag is per session, never shared (ISSUE-508 F7)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'racoons-table-ask-sessions-'));
+  const root = join(dir, 'racoons');
+  const journal: JournalLine[] = [];
+  const KEEP_TWO = '{"1":{"keepall":true}}\n{"2":{"keepall":true}}';
+  // Call order: session A's first pass, session B's first pass, session A's second.
+  const mount = fakeMount(root, journal, [KEEP, KEEP, KEEP_TWO]);
+  try {
+    await mount.apply();
+    const sessionA = fakeSession('session-table-ask-a');
+    const sessionB = fakeSession('session-table-ask-b');
+    attach(mount, sessionA);
+    attach(mount, sessionB);
+    const runOnePass = async (session: FakeSession, callId: string): Promise<string> => {
+      const before = mount.llm.calls.length;
+      step(session, oversizedBody(8_000), callId);
+      session.append('turn/end', { turn: 1 });
+      mount.wire(session.id);
+      requestPrune(session);
+      await preStep(mount.listeners, session);
+      assert.equal(mount.llm.calls.length, before + 1, `${session.id}: one table ask left`);
+      return promptText(mount.llm.calls[before] as DshLlmStreamOptions);
+    };
+
+    const firstA = await runOnePass(sessionA, 'a1');
+    assert.ok(firstA.includes('keep at most 70 percent'), 'session A states 70 first');
+
+    // A second session on the same mount and root: its own first ask is still 70.
+    const firstB = await runOnePass(sessionB, 'b1');
+    assert.ok(firstB.includes('keep at most 70 percent'),
+      'session B states 70, not the 40 that session A has earned');
+    assert.equal(firstB.includes('keep at most 40 percent'), false);
+
+    // A's next pass states 40: its own flag moved, B's did not.
+    const laterA = await runOnePass(sessionA, 'a2');
+    assert.ok(laterA.includes('keep at most 40 percent'), 'session A now states 40');
+
+    const targetA = resolveSessionStorage(root, 'session-table-ask-a');
+    const targetB = resolveSessionStorage(root, 'session-table-ask-b');
+    assert.equal(readTableAskFired(targetA), true);
+    assert.equal(readTableAskFired(targetB), true);
+  } finally {
+    await mount.close();
+    cleanup(dir);
+  }
+});
+
 test('removal applies after restart — ledger is record of record', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'racoons-restart-removal-'));
   const root = join(dir, 'racoons');
@@ -421,7 +524,7 @@ test('removal applies after restart — ledger is record of record', async () =>
   // Pass 1 keeps the first result; pass 2 removes the second and keeps the
   // first again (the prune asks every candidate on every pass).
   const first = fakeMount(root, journal1, [KEEP,
-    '{"1":{"keepall":true},"2":{"forgetall":"oversized read"}}']);
+    '{"1":{"keepall":true}}\n{"2":{"forgetall":true,"summary":"oversized read"}}']);
   const second = fakeMount(root, journal2);
   const target = resolveSessionStorage(root, 'session-restart-removal');
   try {

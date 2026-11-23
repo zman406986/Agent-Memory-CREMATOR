@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  DEFAULT_CONFIG, PRUNE_ASK_FINAL_LINE, PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT,
+  DEFAULT_CONFIG, ENTRY_ASK_END_ANCHOR,
   CharHeuristicTokenMeter, Meter, UnitTracker, revertBytes, sha256Sync, toBytes,
 } from '@cremator/core';
 import type {
@@ -30,10 +30,11 @@ import {
 import type { OpencodeAppliedPlanIndex } from '../src/apply.js';
 import { createOpencodeCapabilities } from '../src/capabilities.js';
 import { buildOpencodeAskBatch } from '../src/ask.js';
+import { MOUNT_STATE_FILE, readDurableAskState } from '../src/mount-state.js';
 import type {
   OpencodeAfterToolInput, OpencodeCommandDefinition, OpencodeGenerateInput,
   OpencodeHostEvent, OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext,
-  OpencodeSessionContext, OpencodeToolDefinition,
+  OpencodeSessionContext, OpencodeToolDefinition, OpencodeToolResultValue,
 } from '../src/host.js';
 import {
   OPENCODE_PRUNE_COMMAND, OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
@@ -48,7 +49,7 @@ import type { OpencodePortOptions } from '../src/port.js';
 import { createOpencodePort } from '../src/port.js';
 import type { OpencodeStaging } from '../src/port.js';
 import { OPENCODE_RECORD_ID_FIELD, deriveOpencodeSnapshot, opencodeToolNodeId } from '../src/snapshot.js';
-import { openLedger } from '../src/storage.js';
+import { openLedger, resolveStorage, sessionStorage } from '../src/storage.js';
 import {
   assistantMessage, errorResult, minimalConversation, sessionContext, sessionId, text,
   textResult, toolCall, toolMessage, toolResult, userMessage,
@@ -521,7 +522,7 @@ function fakeHost(
     commands,
     generateCalls,
     subscribedTypes,
-    generateReply: '{"1":{"forgetall":"mock ask answer"}}',
+    generateReply: '{"1":{"forgetall":true,"summary":"mock ask answer"}}',
     generateError: null,
     contextHook: null,
     afterHook: null,
@@ -1216,7 +1217,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"nothing yet"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"nothing yet"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1245,7 +1246,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1279,7 +1280,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1355,7 +1356,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1389,12 +1390,13 @@ const ASK_ROWS: readonly Row[] = [
         await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
         assert.equal(calls.length, 1, at('the idle fallback does not ask twice'));
         assert.equal(calls[0]?.sessionID, sessionId, at('the request names the live session'));
-        assert.ok(calls[0]?.prompt.includes(PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT),
-          at('the prompt is the two-option bulk contract'));
-        assert.ok(calls[0]?.prompt.endsWith(PRUNE_ASK_FINAL_LINE),
-          at('the prompt closes on the contract own final line'));
-        assert.match(calls[0]?.prompt ?? '', /^1\. \[read\] NOTES\.md \(call #1\)/mu,
-          at('the prompt tables the result an earlier request carried'));
+        assert.match(calls[0]?.prompt ?? '',
+          /keep at most 70 percent of the total lines/u,
+          at('the first table ask states the 70 percent share'));
+        assert.ok(String(calls[0]?.prompt).trimEnd().endsWith(ENTRY_ASK_END_ANCHOR),
+          at('the message closes on the entry ask end anchor'));
+        assert.match(calls[0]?.prompt ?? '', /^1\. \[read\] NOTES\.md \(call #1\).* \[3 lines\]$/mu,
+          at('the prompt tables the result an earlier request carried with its line count'));
         const ask = lines.of('ask');
         assert.equal(ask.length, 1, at('one ask line per fire'));
         const line = ask[0];
@@ -1442,7 +1444,9 @@ const ASK_ROWS: readonly Row[] = [
           at('the engine still receives the at-rest pass'));
         const askBlock = capabilities?.['ask'] as Record<string, unknown> | undefined;
         assert.equal(askBlock?.['grammar'], 'prune-two-option',
-          at('the capability line records the grammar'));
+          at('the capability line records the mount-option id'));
+        assert.equal(askBlock?.['promptGrammar'], 'jsonl-20-nokeepall',
+          at('the capability line names the wire grammar that actually ran'));
         // Idle re-entry for the same array cannot loop the transient request.
         const deliveries = lines.of('ask').length;
         await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
@@ -1450,19 +1454,10 @@ const ASK_ROWS: readonly Row[] = [
         assert.equal(lines.of('ask').length, deliveries, at('a repeated idle writes no second line'));
       } finally { await mount.close(); }
     } },
-  { name: 'a literal keepall is the offered keep, journalled and never applied',
+  { name: 'a literal keepall is the terminal not-in-grammar refusal and keeps',
     async run(at) {
       const lines = journalLines();
       const calls: OpencodeGenerateInput[] = [];
-      const probe = largeHostMessages();
-      const probeBatch = buildOpencodeAskBatch({
-        sessionId, messages: probe,
-        port: createOpencodePort({ sessionId, clock: { nowMs: () => 1 }, messages: probe }),
-        round: 1,
-      });
-      assert.ok(probeBatch !== null, at('the probe pass is built'));
-      const unitId = probeBatch.unitIds[0];
-      assert.ok(unitId !== undefined, at('the probe names the unit'));
       const mount = createOpencodeMount({
         storage: { databasePath: ':memory:' },
         askGrammar: 'prune-two-option',
@@ -1480,54 +1475,15 @@ const ASK_ROWS: readonly Row[] = [
         await mount.transform(sessionId, messages);
         assert.equal(calls.length, 1, at('the step after the carrying request asks once'));
         const ask = lines.of('ask');
-        assert.equal(ask.length, 1, at('the reply is one readable fire line'));
-        assert.equal(ask[0]?.['status'], 'read', at('the line records a readable reading'));
-        assert.equal(ask[0]?.['answered'], 1, at('the keepall row was answered'));
-        assert.equal(ask[0]?.['refused'], 0, at('no row was refused'));
-        assert.deepEqual(ask[0]?.['parsed'], [
-          { index: 1, status: 'answered', action: 'keepall' },
-        ], at('the journal names the offered keep, never a refusal'));
-        assert.equal(ask[0]?.['applied'], false, at('the ask applied nothing'));
-        assert.deepEqual(messages, untouched,
-          at('a keep changes no host message'));
-        const entry = mount.sessions.get(sessionId);
-        assert.ok(entry !== undefined, at('the context hook built the session'));
-        assert.equal(entry.askedUnitIds.size, 0,
-          at('a keep releases the unit for a later crossing'));
-        assert.equal(entry.refusedRetriedUnitIds.size, 0,
-          at('a keep never enters the refusal retry set'));
-        assert.deepEqual(ask[0]?.['kept'], [{ index: 1, unitId, action: 'keepall' }],
-          at('the ask line journals the kept row'));
-      } finally { await mount.close(); }
-    } },
-  { name: 'a keeplines answer is terminal and is never stored or applied',
-    async run(at) {
-      const lines = journalLines();
-      const mount = createOpencodeMount({
-        storage: { databasePath: ':memory:' },
-        askGrammar: 'prune-two-option',
-        askGenerate: async () => ({
-          text: '{"1":{"keeplines":[[1,2],"keep the head"]}}',
-        }),
-        journal: record => lines.records.push(record),
-      });
-      try {
-        // Step 1 carries the unit; step 2 is the one that may table it.
-        await mount.transform(sessionId, largeHostMessages());
-        const messages = largeHostMessages();
-        const untouched = structuredClone(messages);
-        await mount.transform(sessionId, messages);
-        const ask = lines.of('ask');
         assert.equal(ask.length, 1, at('the refusal is still one readable fire line'));
         assert.equal(ask[0]?.['answered'], 0, at('no row was answered'));
-        assert.equal(ask[0]?.['refused'], 1, at('the keeplines row was refused'));
+        assert.equal(ask[0]?.['refused'], 1, at('the keepall row was refused'));
         assert.deepEqual(ask[0]?.['parsed'], [
           { index: 1, status: 'refused', code: 'action-not-in-grammar' },
-        ], at('the journal names the grammar refusal, never a stored keeplines'));
+        ], at('the journal names the grammar refusal, never an offered keep'));
         const shownUnitId = (ask[0]?.['unitIds'] as string[] | undefined)?.[0];
         assert.deepEqual(ask[0]?.['terminal'], [{
-          index: 1, unitId: shownUnitId,
-          code: 'action-not-in-grammar',
+          index: 1, unitId: shownUnitId, code: 'action-not-in-grammar',
         }], at('a not-in-grammar refusal is terminal and is not carried'));
         assert.deepEqual(ask[0]?.['carried'], [],
           at('a terminal refusal spends no re-ask'));
@@ -1542,6 +1498,55 @@ const ASK_ROWS: readonly Row[] = [
           at('a terminal refusal never enters the retry set'));
       } finally { await mount.close(); }
     } },
+  { name: 'a whole-range keeplines keeps whole and releases the unit',
+    async run(at) {
+      const lines = journalLines();
+      const probe = largeHostMessages();
+      const probeBatch = buildOpencodeAskBatch({
+        sessionId, messages: probe,
+        port: createOpencodePort({ sessionId, clock: { nowMs: () => 1 }, messages: probe }),
+        round: 1,
+      });
+      assert.ok(probeBatch !== null, at('the probe pass is built'));
+      const unitId = probeBatch.unitIds[0];
+      assert.ok(unitId !== undefined, at('the probe names the unit'));
+      // The row's own L: the unit body is the result text, so a whole-range
+      // `keeplines` names 1..L, not 1..1 (ISSUE-509).
+      const rowLineCount = (probeBatch.rows[0]?.unit.span.lineRange?.endLineInclusive ?? 0)
+        - (probeBatch.rows[0]?.unit.span.lineRange?.startLine ?? 0) + 1;
+      assert.ok(rowLineCount > 1, at('the probe row is the result\'s multi-line body'));
+      const mount = createOpencodeMount({
+        storage: { databasePath: ':memory:' },
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => ({
+          text: `{"1":{"keeplines":[[1,${String(rowLineCount)}]],"summary":"None"}}`,
+        }),
+        journal: record => lines.records.push(record),
+      });
+      try {
+        // Step 1 carries the unit; step 2 is the one that may table it.
+        await mount.transform(sessionId, largeHostMessages());
+        const messages = largeHostMessages();
+        const untouched = structuredClone(messages);
+        await mount.transform(sessionId, messages);
+        const ask = lines.of('ask');
+        assert.equal(ask.length, 1, at('the answer is one readable fire line'));
+        assert.equal(ask[0]?.['answered'], 1, at('the whole-range keeplines was read'));
+        assert.equal(ask[0]?.['refused'], 0, at('no row was refused'));
+        assert.deepEqual(ask[0]?.['parsed'], [
+          { index: 1, status: 'answered', action: 'keepall' },
+        ], at('a whole-range keeplines is the clean keep, never a stored removal'));
+        assert.deepEqual(messages, untouched,
+          at('a keep changes no host message'));
+        const entry = mount.sessions.get(sessionId);
+        assert.ok(entry !== undefined, at('the context hook built the session'));
+        assert.equal(entry.askedUnitIds.size, 0,
+          at('a keep releases the unit for a later crossing'));
+        assert.equal(entry.askVerdicts.size, 0, at('no keep is stored for apply'));
+        assert.deepEqual(ask[0]?.['kept'], [{ index: 1, unitId, action: 'keepall' }],
+          at('the ask line journals the kept row'));
+      } finally { await mount.close(); }
+    } },
   { name: 'an unasked unit is the fire condition; a new revision with nothing new stays quiet',
     async run(at) {
       const calls: OpencodeGenerateInput[] = [];
@@ -1550,7 +1555,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"already asked"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"already asked"}}' };
         },
       });
       try {
@@ -1563,8 +1568,10 @@ const ASK_ROWS: readonly Row[] = [
         const second = [...structuredClone(first), assistantMessage('msg_a3', [text('more')])];
         await mount.transform(sessionId, second);
         assert.equal(calls.length, 1, at('the step after the carrying request asks once'));
-        assert.doesNotMatch(calls[0]?.prompt ?? '', /at most 70 percent|at most 40 percent/u,
-          at('the product table states no keep-share line'));
+        assert.match(calls[0]?.prompt ?? '', /keep at most 70 percent of the total lines/u,
+          at('the session\'s first table ask states the 70 percent share'));
+        assert.doesNotMatch(calls[0]?.prompt ?? '', /keep at most 40 percent/u,
+          at('the first ask never mixes in the later share'));
         // A revision that carries the same already-asked unit asks nothing.
         await mount.transform(sessionId, second);
         assert.equal(calls.length, 1, at('a revision with no new unit asks nothing'));
@@ -1583,8 +1590,10 @@ const ASK_ROWS: readonly Row[] = [
         const fourth = [...structuredClone(third)];
         await mount.transform(sessionId, fourth);
         assert.equal(calls.length, 2, at('the step after the carrying request asks again'));
-        assert.doesNotMatch(calls[1]?.prompt ?? '', /at most 40 percent/u,
-          at('a later trigger states no keep-share line'));
+        assert.match(calls[1]?.prompt ?? '', /keep at most 40 percent of the total lines/u,
+          at('a later trigger states the 40 percent share'));
+        assert.doesNotMatch(calls[1]?.prompt ?? '', /keep at most 70 percent/u,
+          at('a later trigger never restates the first share'));
         assert.doesNotMatch(calls[1]?.prompt ?? '', /\[read\] NOTES\.md/u,
           at('the already-asked unit is not retabled'));
         assert.match(calls[1]?.prompt ?? '', /\[read\] MORE\.md/u,
@@ -1659,7 +1668,7 @@ const ASK_ROWS: readonly Row[] = [
       askGrammar: 'prune-two-option',
       askGenerate: async (input) => {
         calls.push(input);
-        return { text: '{"1":{"forgetall":"after ask"}}' };
+        return { text: '{"1":{"forgetall":true,"summary":"after ask"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -1702,7 +1711,7 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1783,7 +1792,7 @@ const ASK_ROWS: readonly Row[] = [
         askGenerate: async (input) => {
           calls.push(input);
           if (calls.length === 1) throw new Error('step seam down');
-          return { text: '{"1":{"forgetall":"other note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"other note"}}' };
         },
         journal: record => lines.records.push(record),
       });
@@ -1858,7 +1867,8 @@ const ASK_ROWS: readonly Row[] = [
       askGrammar: 'prune-two-option',
       askGenerate: async (input) => {
         calls.push(input);
-        return { text: '{"1":{"forgetall":"alpha"},"2":{"forgetall":"bravo"}}' };
+        return { text: '{"1":{"forgetall":true,"summary":"alpha"}}\n'
+          + '{"2":{"forgetall":true,"summary":"bravo"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -1922,6 +1932,11 @@ const ASK_ROWS: readonly Row[] = [
     assert.ok(firstUnit !== undefined, at('the first unit is tabled'));
     assert.ok(secondUnit !== undefined, at('the second unit is tabled'));
     assert.ok(thirdUnit !== undefined, at('the third unit is tabled'));
+    // Row 2's own L: the unit body is the result text, so a whole-range
+    // `keeplines` names 1..L, not 1..1 (ISSUE-509).
+    const secondUnitLines = (probeBatch.rows[1]?.unit.span.lineRange?.endLineInclusive ?? 0)
+      - (probeBatch.rows[1]?.unit.span.lineRange?.startLine ?? 0) + 1;
+    assert.ok(secondUnitLines > 1, at('the kept row is the result\'s multi-line body'));
     const lines = journalLines();
     const calls: OpencodeGenerateInput[] = [];
     const mount = createOpencodeMount({
@@ -1930,14 +1945,16 @@ const ASK_ROWS: readonly Row[] = [
       askGenerate: async (input) => {
         calls.push(input);
         if (calls.length === 1) {
-          // Row 1 forgets, row 2 keeps whole, row 3 is a malformed row (the
-          // forgetall payload is not a string). One JSON object, three readings.
-          return { text: '{"1":{"forgetall":"old read"},"2":{"keepall":true},'
-            + '"3":{"forgetall":true}}' };
+          // Row 1 forgets, row 2 keeps whole, row 3 is a malformed row (its
+          // forgetall carries no summary). One JSON object per line, three
+          // readings.
+          return { text: '{"1":{"forgetall":true,"summary":"old read"}}\n'
+            + `{"2":{"keeplines":[[1,${String(secondUnitLines)}]],"summary":"None"}}\n`
+            + '{"3":{"forgetall":true}}' };
         }
         // The later table carries the kept row (index 2) and the refused row
         // (index 3); only the kept one is answered again.
-        return { text: '{"2":{"forgetall":"new read"}}' };
+        return { text: '{"2":{"forgetall":true,"summary":"new read"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -2051,6 +2068,11 @@ const ASK_ROWS: readonly Row[] = [
       const [forgottenUnitId, keptUnitId] = probeBatch.unitIds;
       assert.ok(forgottenUnitId !== undefined, at('the forgetall unit is tabled'));
       assert.ok(keptUnitId !== undefined, at('the keeplines unit is tabled'));
+      // Row 2's own L: the body is the result text, so a whole-range keep is
+      // 1..L (ISSUE-509).
+      const keptLines = (probeBatch.rows[1]?.unit.span.lineRange?.endLineInclusive ?? 0)
+        - (probeBatch.rows[1]?.unit.span.lineRange?.startLine ?? 0) + 1;
+      assert.ok(keptLines > 1, at('the kept row is the result\'s multi-line body'));
       const lines = journalLines();
       const calls: OpencodeGenerateInput[] = [];
       const mount = createOpencodeMount({
@@ -2058,9 +2080,10 @@ const ASK_ROWS: readonly Row[] = [
         askGrammar: 'prune-two-option',
         askGenerate: async (input) => {
           calls.push(input);
-          // Row 1 forgets whole; row 2 keeps whole (the offered keep action),
+          // Row 1 forgets whole; row 2 keeps whole (a whole-range keeplines),
           // so it never reaches the stored verdict map.
-          return { text: '{"1":{"forgetall":"old note"},"2":{"keepall":true}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"old note"}}\n'
+            + `{"2":{"keeplines":[[1,${String(keptLines)}]],"summary":"None"}}` };
         },
         journal: record => lines.records.push(record),
       });
@@ -2143,7 +2166,7 @@ const ASK_ROWS: readonly Row[] = [
         storage: { databasePath: ':memory:' },
         askGrammar: 'prune-two-option',
         askGenerate: async () => ({
-          text: '{"1":{"forgetall":"old note"}}',
+          text: '{"1":{"forgetall":true,"summary":"old note"}}',
         }),
         journal: record => lines.records.push(record),
       });
@@ -2199,7 +2222,237 @@ test('the bench-only ask: off by default, one request per unasked revision, forg
     await runRows(ASK_ROWS);
   });
 
-test('a keepall row is re-tabled at a later crossing; a forgetall row never is', async () => {
+/** Six lines above the floor: line numbers a `keeplines` answer can address. */
+const PARTIAL_KEEP_LINES = [
+  `line-one ${'-'.repeat(120)}`,
+  `line-two ${'-'.repeat(120)}`,
+  `line-three KEEP_A ${'-'.repeat(110)}`,
+  `line-four KEEP_B ${'-'.repeat(110)}`,
+  `line-five KEEP_C ${'-'.repeat(110)}`,
+  `line-six ${'-'.repeat(124)}`,
+];
+const PARTIAL_KEEP_BODY = `${PARTIAL_KEEP_LINES.join('\n')}\n`;
+const PARTIAL_KEPT_TEXT = `${PARTIAL_KEEP_LINES[2]}\n${PARTIAL_KEEP_LINES[3]}\n`
+  + `${PARTIAL_KEEP_LINES[4]}\n`;
+
+function partialKeepConversation(): OpencodeMessage[] {
+  return [
+    userMessage('msg_u1', [text('Read the note.')]),
+    assistantMessage('msg_a1', [
+      text('Reading NOTES.md.'),
+      toolCall('call_1', 'read', { filePath: 'NOTES.md' }),
+    ]),
+    toolMessage('msg_t1', [toolResult('call_1', 'read', textResult(PARTIAL_KEEP_BODY))]),
+    assistantMessage('msg_a2', [text('The note is read.')]),
+  ];
+}
+
+/** The first tool-result part's decoded result text, as the host carries it. */
+function resultTextOf(messages: readonly OpencodeMessage[]): string {
+  for (const message of messages) {
+    for (const part of Array.isArray(message.content) ? message.content : []) {
+      if (part.type !== 'tool-result') continue;
+      const result = (part as unknown as { readonly result: OpencodeToolResultValue }).result;
+      return result.type === 'text' && typeof result.value === 'string'
+        ? result.value : JSON.stringify(result.value);
+    }
+  }
+  throw new Error('the fixture carries no tool result');
+}
+
+test('ISSUE-509: a partial keeplines rides the prune document; a whole-range keep never does',
+  async () => {
+    // Partial: rows 3-5 are kept, 1-2 and 6 leave. The mount's own ask lane
+    // reads the answer and the one prune document carries the removal.
+    const lines = journalLines();
+    const partial = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({
+        text: '{"1":{"keeplines":[[3,5]],"summary":"keep the middle"}}',
+      }),
+      journal: record => lines.records.push(record),
+    });
+    try {
+      await partial.transform(sessionId, partialKeepConversation());
+      const messages = partialKeepConversation();
+      await partial.transform(sessionId, messages);
+      const ask = lines.of('ask').at(-1);
+      assert.deepEqual(ask?.['parsed'], [
+        { index: 1, status: 'answered', action: 'keeplines' },
+      ], 'the reader answered the partial keep, never refused it');
+      const applied = lines.of('ask-apply');
+      assert.equal(applied.length, 1, 'the one prune document carries the partial removal');
+      assert.equal(applied[0]?.['action'], 'keeplines', 'the removal is the line-level action');
+      assert.equal(applied[0]?.['applied'], true, 'the apply landed a receipt');
+      assert.equal(resultTextOf(messages), PARTIAL_KEPT_TEXT,
+        'the typed result part carries ONLY the kept lines');
+      assert.equal(messages.some(message => Array.isArray(message.content)
+        && message.content.some(part => part.type === 'tool-call' && part['id'] === 'call_1')),
+      true, 'the call part stays: the unit is kept, the unlisted lines leave');
+      const receipt = messages.find(message =>
+        typeof message[OPENCODE_RECORD_ID_FIELD] === 'string');
+      assert.ok(receipt !== undefined, 'the removal appended its receipt');
+      const entry = partial.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the session exists');
+      const recallId = applied[0]?.['recallId'];
+      assert.equal(typeof recallId, 'string', 'the removal names the recall id');
+      const recalled = await entry.ledger.recall(String(recallId));
+      const restored = recalled.parts
+        .map(part => new TextDecoder().decode(part.bytes)).join('');
+      assert.match(restored, /line-one/u, 'the recall restores the dropped lines');
+      // The next request: the host rebuilds the array and the mount re-applies
+      // the stored verdict, so the request it ships still carries only the kept
+      // lines and still holds the unit's call part.
+      messages.push(assistantMessage('msg_a3', [text('Continue.')]));
+      await partial.transform(sessionId, messages);
+      assert.equal(resultTextOf(messages), PARTIAL_KEPT_TEXT,
+        'the next request still carries only the kept lines');
+      assert.equal(messages.some(message => message.id === 'msg_t1'), true,
+        'a partial keep never removes the unit whole');
+    } finally { await partial.close(); }
+
+    // Whole range: the reader normalizes it to a clean keep, so the prune
+    // document carries no removal and the host array is unchanged byte for byte.
+    const wholeLines = journalLines();
+    const whole = createOpencodeMount({
+      storage: { databasePath: ':memory:' },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({
+        text: '{"1":{"keeplines":[[1,6]],"summary":"None"}}',
+      }),
+      journal: record => wholeLines.records.push(record),
+    });
+    try {
+      await whole.transform(sessionId, partialKeepConversation());
+      const messages = partialKeepConversation();
+      const untouched = structuredClone(messages);
+      await whole.transform(sessionId, messages);
+      const ask = wholeLines.of('ask').at(-1);
+      assert.deepEqual(ask?.['parsed'], [
+        { index: 1, status: 'answered', action: 'keepall' },
+      ], 'a whole-range keeplines is the clean keep');
+      assert.deepEqual(wholeLines.of('ask-apply'), [],
+        'a whole-range keep is never part of the prune document');
+      assert.deepEqual(messages, untouched, 'a keep changes no host message');
+    } finally { await whole.close(); }
+  });
+
+test('ISSUE-509: a remount re-applies a partial keep, never a whole-unit forgetall', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  try {
+    // Process 1: the ask answers a partial keep and the apply rewrites the
+    // result part. The durable ask record must keep the line-level verdict.
+    const firstLines = journalLines();
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({
+        text: '{"1":{"keeplines":[[3,5]],"summary":"keep the middle"}}',
+      }),
+      journal: record => firstLines.records.push(record),
+    });
+    try {
+      // Fresh install: the boundary is captured before the unit arrives.
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, partialKeepConversation());
+      const applied = partialKeepConversation();
+      await first.transform(sessionId, applied);
+      assert.equal(firstLines.of('ask-apply')[0]?.['action'], 'keeplines',
+        'the first process applied the line-level removal');
+      assert.equal(resultTextOf(applied), PARTIAL_KEPT_TEXT,
+        'the first process kept lines 3-5');
+    } finally { await first.close(); }
+
+    // Process 2: the host rebuilds from its own store, so the full body is
+    // back. The banked applied-plan row is a blank-summary forgetall and cannot
+    // reconstruct the kept lines; the durable keeplines verdict must.
+    const secondLines = journalLines();
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({ text: '{}' }),
+      journal: record => secondLines.records.push(record),
+    });
+    try {
+      const rebuilt = partialKeepConversation();
+      await second.transform(sessionId, rebuilt);
+      assert.equal(resultTextOf(rebuilt), PARTIAL_KEPT_TEXT,
+        'the remount still keeps lines 3-5, not the whole unit');
+      assert.equal(rebuilt.some(message => message.id === 'msg_t1'), true,
+        'the remount does not remove the result message whole');
+      assert.equal(rebuilt.some(message => Array.isArray(message.content)
+        && message.content.some(part => part.type === 'tool-call' && part['id'] === 'call_1')),
+      true, 'the remount does not remove the call part whole');
+      const resumedLines = secondLines.of('ask-apply');
+      assert.equal(resumedLines.length, 1,
+        'the remount lands exactly one removal for the unit');
+      const resumed = resumedLines[0];
+      assert.equal(resumed?.['action'], 'keeplines',
+        'the remount re-applied the line-level rewrite');
+      assert.equal(resumed?.['applied'], true, 'the remount landed its receipt');
+      assert.deepEqual(secondLines.of('ask'), [],
+        'the banked unit is never re-asked after the remount');
+    } finally { await second.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-509: a partial keep whose unit leaves the array takes its durable record with it',
+  async () => {
+    const dir = scratch();
+    const root = join(dir, 'root');
+    const target = () =>
+      sessionStorage(resolveStorage({ crematorStorageRoot: root }), sessionId);
+    try {
+      const lines = journalLines();
+      const mount = createOpencodeMount({
+        storage: { crematorStorageRoot: root },
+        askGrammar: 'prune-two-option',
+        askGenerate: async () => ({
+          text: '{"1":{"keeplines":[[3,5]],"summary":"keep the middle"}}',
+        }),
+        journal: record => lines.records.push(record),
+      });
+      try {
+        // Fresh install, then the ask answers and the apply rewrites the part.
+        await mount.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+        await mount.transform(sessionId, partialKeepConversation());
+        await mount.transform(sessionId, partialKeepConversation());
+        const entry = mount.sessions.get(sessionId);
+        assert.ok(entry !== undefined, 'the session exists');
+        assert.equal(entry.durableAskVerdicts.size, 1,
+          'the partial keep is owed after its apply');
+        assert.equal(readDurableAskState(target())?.verdicts.length, 1,
+          'the durable file carries the partial keep');
+        // The host drops the unit but keeps a conversation (a compaction or a
+        // different rebuild): the obligation ends with the unit, so the record
+        // must not outlive it. One other above-floor unit keeps the pass real.
+        const survivors: OpencodeMessage[] = [
+          userMessage('msg_survivor_u', [text('Read the other note.')]),
+          assistantMessage('msg_survivor_a',
+            [toolCall('call_other', 'read', { filePath: 'OTHER.md' })]),
+          toolMessage('msg_survivor_t', [toolResult('call_other', 'read',
+            textResult(PARTIAL_KEEP_BODY))]),
+          assistantMessage('msg_survivor_end', [text('Done.')]),
+        ];
+        await mount.transform(sessionId, survivors);
+        assert.equal(entry.durableAskVerdicts.size, 0,
+          'the owed verdict is gone with its unit');
+        assert.equal(entry.askVerdicts.size, 0, 'the in-memory verdict is gone');
+        assert.equal(readDurableAskState(target())?.verdicts.length, 0,
+          'the durable file no longer carries the partial keep');
+        assert.equal(survivors.some(message => message.id === 'msg_survivor_t'), true,
+          'the surviving unit is untouched');
+      } finally { await mount.close(); }
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+test('a whole-range keeplines row is re-tabled at a later crossing; a forgetall row never is', async () => {
   const probe = largeTwoResultMessages();
   const probeBatch = buildOpencodeAskBatch({
     sessionId, messages: probe,
@@ -2217,14 +2470,28 @@ test('a keepall row is re-tabled at a later crossing; a forgetall row never is',
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
+      /**
+       * The row's own line count from the table, so a whole-range `keeplines`
+       * names 1..L. The body is the result text now (ISSUE-509), so L is the
+       * result's own line count, never one.
+       */
+      const wholeRangeOf = (prompt: string, index: number): number => {
+        const row = new RegExp(`^${String(index)}\\. \\[.*\\[([0-9]+) lines?\\]$`, 'mu')
+          .exec(prompt);
+        assert.ok(row?.[1] !== undefined, 'the row states its own line count');
+        return Number(row[1]);
+      };
       if (calls.length === 1) {
-        // Row 1 forgets whole; row 2 keeps whole (the offered keep action).
-        return { text: '{"1":{"forgetall":"old note"},"2":{"keepall":true}}' };
+        // Row 1 forgets whole; row 2 keeps whole (a whole-range keeplines).
+        return { text: '{"1":{"forgetall":true,"summary":"old note"}}\n'
+          + `{"2":{"keeplines":[[1,${String(wholeRangeOf(input.prompt, 2))}]],"summary":"None"}}` };
       }
       // The later table carries only the kept unit; its index is the pass's own
       // (the settled row leaves a gap), so the reply answers the shown index.
       const shown = Number(/^([1-9]\d*)\. \[read\] OTHER/mu.exec(input.prompt)?.[1] ?? 1);
-      return { text: JSON.stringify({ [String(shown)]: { keepall: true } }) };
+      return { text: JSON.stringify({
+        [String(shown)]: { keeplines: [[1, wholeRangeOf(input.prompt, shown)]], summary: 'None' },
+      }) };
     },
     journal: record => lines.records.push(record),
   });
@@ -2281,6 +2548,193 @@ test('a keepall row is re-tabled at a later crossing; a forgetall row never is',
   } finally { await mount.close(); }
 });
 
+test('ISSUE-509: the first ask states 70 percent and a resumed segment states 40', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const firstPrompts: string[] = [];
+  const secondPrompts: string[] = [];
+  try {
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async (input) => {
+        firstPrompts.push(input.prompt);
+        // A whole-range keep: nothing is applied, but the ask did fire.
+        return { text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}' };
+      },
+      journal: () => {},
+    });
+    try {
+      // Install boundary first (no tool node), then the unit arrives later.
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, largeHostMessages());
+      await first.transform(sessionId, largeHostMessages());
+      const entry = first.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first mount built the session');
+      assert.equal(firstPrompts.length, 1, 'the first mount asked once');
+      assert.match(firstPrompts[0] ?? '', /keep at most 70 percent of the total lines/u,
+        'the session\'s first table ask states 70 percent');
+      assert.equal(entry.askFires, 1, 'the answered ask advanced the fire count');
+    } finally { await first.close(); }
+
+    const second = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async (input) => {
+        secondPrompts.push(input.prompt);
+        return { text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}' };
+      },
+      journal: () => {},
+    });
+    try {
+      // A new revision carries the same unit plus one new read. The first
+      // transform promotes the shipped nodes; the second is the one that asks.
+      const withNew = (): OpencodeMessage[] => [
+        ...largeHostMessages(),
+        assistantMessage('msg_a_more', [toolCall('call_more', 'read', { filePath: 'MORE.md' })]),
+        toolMessage('msg_t_more', [toolResult('call_more', 'read',
+          textResult(`# More\n\n${'more-'.repeat(200)}\n`))]),
+      ];
+      await second.transform(sessionId, withNew());
+      await second.transform(sessionId, withNew());
+      assert.equal(secondPrompts.length, 1, 'the resumed segment asked once');
+      assert.match(secondPrompts[0] ?? '', /keep at most 40 percent of the total lines/u,
+        'a resumed segment states the later 40 percent share, not the first one');
+      assert.doesNotMatch(secondPrompts[0] ?? '', /keep at most 70 percent/u,
+        'the restored fire count does not restate the first share');
+    } finally { await second.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-509: an ask-off mount never rewinds the 70/40 share line', async () => {
+  const dir = scratch();
+  const root = join(dir, 'root');
+  const prompts: string[] = [];
+  try {
+    const first = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async () => ({
+        // A whole-range keep: the ask fires and removes nothing.
+        text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}',
+      }),
+    });
+    try {
+      await first.transform(sessionId, [userMessage('msg_install_u', [text('Session start.')])]);
+      await first.transform(sessionId, largeHostMessages());
+      await first.transform(sessionId, largeHostMessages());
+      const entry = first.sessions.get(sessionId);
+      assert.ok(entry !== undefined, 'the first mount built the session');
+      assert.equal(entry.askFires, 1, 'the first ask was answered');
+    } finally { await first.close(); }
+
+    // An ask-off mount opens the same session. It drops the restored claims and
+    // verdicts, but the fire count is a fact about asks that already left.
+    const off = createOpencodeMount({ storage: { crematorStorageRoot: root } });
+    try {
+      await off.transform(sessionId, [userMessage('msg_off_u', [text('Ask off.')])]);
+    } finally { await off.close(); }
+
+    const resumed = createOpencodeMount({
+      storage: { crematorStorageRoot: root },
+      askGrammar: 'prune-two-option',
+      askGenerate: async (input) => {
+        prompts.push(input.prompt);
+        return { text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}' };
+      },
+    });
+    try {
+      // A new revision with one new unit; the second transform is the one
+      // that may ask.
+      const withNew = (): OpencodeMessage[] => [
+        ...largeHostMessages(),
+        assistantMessage('msg_a_more', [toolCall('call_more', 'read', { filePath: 'MORE.md' })]),
+        toolMessage('msg_t_more', [toolResult('call_more', 'read',
+          textResult(`# More\n\n${'more-'.repeat(200)}\n`))]),
+      ];
+      await resumed.transform(sessionId, withNew());
+      await resumed.transform(sessionId, withNew());
+      assert.equal(prompts.length, 1, 'the ask-on mount asked once');
+      assert.match(prompts[0] ?? '', /keep at most 40 percent of the total lines/u,
+        'the ask-off mount did not rewind the count, so the later ask states 40 percent');
+      assert.doesNotMatch(prompts[0] ?? '', /keep at most 70 percent/u,
+        'the earlier answered ask is not restated as the session first');
+    } finally { await resumed.close(); }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-509: an invalid durable askFires reads as no fire, never a bad share', () => {
+  const dir = scratch();
+  const target = {
+    kind: 'durable' as const,
+    root: dir,
+    sessionId,
+    databasePath: join(dir, 'ledger.sqlite'),
+    blobRoot: join(dir, 'blobs'),
+  };
+  const askDoc = (askFires: unknown): string => JSON.stringify({
+    version: 1,
+    ask: {
+      revisions: [], askedUnitIds: [], retriedUnitIds: [], refusedRetriedUnitIds: [],
+      verdicts: [], deferredApply: false, deferredFailures: 0, askFires,
+    },
+  });
+  try {
+    writeFileSync(join(dir, MOUNT_STATE_FILE), askDoc(-1), 'utf8');
+    assert.equal(readDurableAskState(target)?.askFires, 0,
+      'a negative count reads as no fire');
+    writeFileSync(join(dir, MOUNT_STATE_FILE), askDoc('many'), 'utf8');
+    assert.equal(readDurableAskState(target)?.askFires, 0,
+      'a non-number count reads as no fire');
+    writeFileSync(join(dir, MOUNT_STATE_FILE), JSON.stringify({
+      version: 1,
+      ask: {
+        revisions: [], askedUnitIds: [], retriedUnitIds: [], refusedRetriedUnitIds: [],
+        verdicts: [], deferredApply: false, deferredFailures: 0,
+      },
+    }), 'utf8');
+    assert.equal(readDurableAskState(target)?.askFires, 0,
+      'an absent count reads as no fire');
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('ISSUE-509: a failed ask never advances the first/later share flag', async () => {
+  const prompts: string[] = [];
+  let calls = 0;
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    askGrammar: 'prune-two-option',
+    askGenerate: async (input) => {
+      prompts.push(input.prompt);
+      calls += 1;
+      if (calls === 1) throw new Error('transient seam down');
+      return { text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}' };
+    },
+  });
+  try {
+    // Step 1 carries the unit; step 2's ask throws.
+    await mount.transform(sessionId, largeHostMessages());
+    await mount.transform(sessionId, largeHostMessages());
+    const entry = mount.sessions.get(sessionId);
+    assert.ok(entry !== undefined, 'the context hook built the session');
+    assert.equal(prompts.length, 1, 'the first attempt left the process');
+    assert.equal(entry.askFires, 0, 'a throw is never a fire');
+    // The one retry, at a later revision, still states the session's first share.
+    await mount.transform(sessionId, [...largeHostMessages(),
+      assistantMessage('msg_turn_retry', [text('a later turn')])]);
+    assert.equal(prompts.length, 2, 'the one retry was sent');
+    assert.match(prompts[1] ?? '', /keep at most 70 percent of the total lines/u,
+      'an unanswered throw leaves the 70 percent first share in place');
+    assert.equal(entry.askFires, 1, 'the readable retry is the first fire');
+  } finally { await mount.close(); }
+});
+
 // --- the depth trigger (ADR-0050): the mount-level latch --------------------
 //
 // The latch itself is core's `PruneWindowTrigger` (proven in the dsh suite).
@@ -2300,7 +2754,7 @@ test('the depth trigger asks at 60k on a 400k window, and not below it', async (
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -2338,7 +2792,7 @@ test('after an ask pass the post-removal reading is the baseline; the next fire 
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -2391,7 +2845,7 @@ test('ISSUE-357: an unstated nested-ask row never consumes a main estimate', asy
         sessionID: sessionId, assistantMessageID: 'msg_ask_nested', finish: 'stop', cost: 0,
         tokens: { input: 9, output: 4, reasoning: 0, cache: { read: 0, write: 0 } },
       } });
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -2554,7 +3008,7 @@ test('ISSUE-359: a thrown batch build leaves the crossing live on step, idle and
       contextWindowTokens: 400_000,
       pruneThresholdTokens: 100,
       askGrammar: 'prune-two-option',
-      askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+      askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
       journal: record => lines.records.push(record),
     });
 
@@ -2878,7 +3332,7 @@ test('an idle fire re-arms from its post-removal surface, not the next pre-apply
         calls.push(input);
         const prompt = String(input.prompt ?? '');
         return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -2949,7 +3403,7 @@ test('a deferred pass that removes nothing keeps the fire reading as the baselin
       calls.push(input);
       const prompt = String(input.prompt ?? '');
       return { text: /^2\. \[/mu.test(prompt)
-        ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+        ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3002,7 +3456,7 @@ test('a failed deferred apply retries and re-arms from the post-removal host rea
       calls.push(input);
       const prompt = String(input.prompt ?? '');
       return { text: /^2\. \[/mu.test(prompt)
-        ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+        ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3076,7 +3530,7 @@ test('a permanently failing deferred apply drops once and unfreezes the depth tr
         calls.push(input);
         const prompt = String(input.prompt ?? '');
         return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -3165,7 +3619,7 @@ test('ISSUE-431: a permanently failing step-origin apply retries once and drops'
         calls.push(input);
         const prompt = String(input.prompt ?? '');
         return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -3244,7 +3698,7 @@ test('a deferred pass whose bytes the forget lane removed re-arms from the host 
         calls.push(input);
         const prompt = String(input.prompt ?? '');
         return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -3301,7 +3755,7 @@ test('a fractional 75% line is journalled as the first integer at or above it', 
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       belowCalls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => belowLines.records.push(record),
   });
@@ -3326,7 +3780,7 @@ test('a fractional 75% line is journalled as the first integer at or above it', 
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3355,7 +3809,7 @@ test('a /cremate fire re-arms from its post-removal surface, not the next pre-ap
         calls.push(input);
         const prompt = String(input.prompt ?? '');
         return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":"the doomed read"}}' : '{}' };
+          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -3410,7 +3864,7 @@ test('no automatic ask at or above 75% of the host window', async () => {
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       belowCalls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => belowLines.records.push(record),
   });
@@ -3433,7 +3887,7 @@ test('no automatic ask at or above 75% of the host window', async () => {
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3463,7 +3917,7 @@ test('session.compaction.ended re-arms the depth latch', async () => {
     askGrammar: 'prune-two-option',
     askGenerate: async (input) => {
       calls.push(input);
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3569,7 +4023,7 @@ test('with no bar or window the mount observes no depth and keeps the per-revisi
       askGrammar: 'prune-two-option',
       askGenerate: async (input) => {
         calls.push(input);
-        return { text: '{"1":{"forgetall":"stale note"}}' };
+        return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -3606,16 +4060,16 @@ test('the depth-trigger mount options are validated by name', () => {
     'a bar without a window is refused at mount');
 });
 
-test('a summary past the guard cap is refused, retried once, then excluded', async () => {
+test('a summary past the reader tolerance is refused, retried once, then excluded', async () => {
   const lines = journalLines();
   let calls = 0;
-  const summary = Array.from({ length: 26 }, (_, index) => `w${String(index)}`).join(' ');
+  const summary = Array.from({ length: 31 }, (_, index) => `w${String(index)}`).join(' ');
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     askGrammar: 'prune-two-option',
     askGenerate: async () => {
       calls += 1;
-      return { text: JSON.stringify({ 1: { forgetall: summary } }) };
+      return { text: JSON.stringify({ 1: { forgetall: true, summary } }) };
     },
     journal: record => lines.records.push(record),
   });
@@ -3791,7 +4245,7 @@ test('the mount restore route proves the archived bytes from the receipt recall 
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     askGrammar: 'prune-two-option',
-    askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+    askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
     journal: record => lines.records.push(record),
   });
   try {
@@ -3834,7 +4288,7 @@ test('the ask fires past the old 32-fire boundary when triggers keep demanding',
     askGrammar: 'prune-two-option',
     askGenerate: async () => {
       calls += 1;
-      return { text: '{"1":{"forgetall":"uncapped"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"uncapped"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3846,7 +4300,7 @@ test('the ask fires past the old 32-fire boundary when triggers keep demanding',
         [toolCall(`call_${String(index)}`, 'read', { filePath: `f${String(index)}.txt` })]));
       messages.push(toolMessage(`msg_t_${String(index)}`,
         [toolResult(`call_${String(index)}`, 'read',
-          textResult(`f-${String(index)}-`.repeat(120)))]));
+          textResult(`f-${String(index)}-`.repeat(200)))]));
       await mount.transform(sessionId, messages);
     }
     assert.ok(calls > 32, 'the ask fires past the removed 32-fire boundary');
@@ -3892,7 +4346,7 @@ test('the double-fire guards still bound the uncapped ask', async () => {
     askGrammar: 'prune-two-option',
     askGenerate: async () => {
       calls += 1;
-      return { text: '{"1":{"forgetall":"guarded"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"guarded"}}' };
     },
     journal: record => lines.records.push(record),
   });
@@ -3940,7 +4394,7 @@ test('a failed ask retries at most once', async () => {
     askGenerate: async () => {
       retryCalls += 1;
       if (retryCalls === 1) throw new Error('seam down');
-      return { text: '{"1":{"forgetall":"retried"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"retried"}}' };
     },
     journal: record => retryLines.records.push(record),
   });
@@ -3981,7 +4435,7 @@ test('a cancelled l2 verdict releases the retry claim, so the unit is tabled and
       askGenerate: async () => {
         calls += 1;
         if (calls <= 2) throw new Error('seam down');
-        return { text: '{"1":{"forgetall":"retried after release"}}' };
+        return { text: '{"1":{"forgetall":true,"summary":"retried after release"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -4038,7 +4492,7 @@ test('the ask fires only on a readable reply; prose and an empty reply are error
       askGenerate: async () => {
         calls += 1;
         return { text: calls === 1 ? unreadable
-          : '{"1":{"forgetall":"readable now"}}' };
+          : '{"1":{"forgetall":true,"summary":"readable now"}}' };
       },
       journal: record => lines.records.push(record),
     });
@@ -4059,7 +4513,6 @@ test('the ask fires only on a readable reply; prose and an empty reply are error
         `${label}: every row was unreadable`);
       assert.equal(errors[0]?.['applied'], false, `${label}: the error applied nothing`);
       const entry = mount.sessions.get(sessionId);
-      assert.equal(entry?.askFires, 0, `${label}: the error consumed no fire`);
       assert.equal(entry?.askFires, 0, `${label}: the error consumed no fire`);
       assert.equal(entry?.askedUnitIds.size, 0, `${label}: the unit was released for retry`);
       assert.equal(entry?.retriedUnitIds.size, 1, `${label}: one retry was granted`);
@@ -4091,7 +4544,7 @@ test('a valid table with one answered row still fires and records the refused ro
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     askGrammar: 'prune-two-option',
-    askGenerate: async () => ({ text: '{"1":{"forgetall":"one of two"}}' }),
+    askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"one of two"}}' }),
     journal: record => lines.records.push(record),
   });
   try {
@@ -4372,7 +4825,7 @@ test('the /cremate command tables a unit first carried by the last sent request'
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     askGrammar: 'prune-two-option',
-    askGenerate: async () => ({ text: '{"1":{"forgetall":"command unit"}}' }),
+    askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"command unit"}}' }),
     journal: record => lines.records.push(record),
   });
   try {
@@ -4433,11 +4886,9 @@ test('the ledger scan runs per request boundary and apply, never per removal', a
     const mount = createOpencodeMount({
       storage: { databasePath: ':memory:' },
       askGrammar: 'prune-two-option',
-      askGenerate: async () => ({ text: JSON.stringify(Object.fromEntries(
-        Array.from({ length: units }, (_, index) => [
-          String(index + 1), { forgetall: `note ${String(index + 1)}` },
-        ]),
-      )) }),
+      askGenerate: async () => ({ text: Array.from({ length: units }, (_, index) =>
+        JSON.stringify({ [String(index + 1)]:
+          { forgetall: true, summary: `note ${String(index + 1)}` } })).join('\n') }),
       journal: record => lines.records.push(record),
     });
     try {
@@ -5039,7 +5490,7 @@ test('ISSUE-409: an unapplied verdict survives a restart and applies without re-
         askGrammar: 'prune-two-option',
         askGenerate: async () => {
           calls.push('first');
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: () => {},
       });
@@ -5170,7 +5621,7 @@ test('ISSUE-467: an ask-off mount durably drops the verdicts and claims it names
         askGrammar: 'prune-two-option',
         askGenerate: async () => {
           calls.push('first');
-          return { text: '{"1":{"forgetall":"stale note"}}' };
+          return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
         },
         journal: () => {},
       });
@@ -5322,7 +5773,7 @@ test('ISSUE-483: an ask-off drop never reports a clear that failed', async () =>
       storage: { crematorStorageRoot: root },
       contextWindowTokens: 400_000, pruneThresholdTokens: 100,
       askGrammar: 'prune-two-option',
-      askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+      askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
       journal: () => {},
     });
     try {
@@ -5425,7 +5876,7 @@ test('ISSUE-484: a refused mount-state file is never overwritten by a write',
         storage: { crematorStorageRoot: root },
         contextWindowTokens: 400_000, pruneThresholdTokens: 100,
         askGrammar: 'prune-two-option',
-        askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+        askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
         journal: record => lines.records.push(record),
       });
       try {
@@ -5728,7 +6179,7 @@ test('ISSUE-356: cleanup drains an in-flight ask before closing the ledgers', as
     askGenerate: async () => {
       asked += 1;
       await askGate;
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
     journal: record => lines.records.push(record),
   });

@@ -107,11 +107,26 @@ export interface RecordOnlyPruneOptions {
    * The bulk ask's answer grammar (ISSUE-221), passed straight from the mount's
    * resolved config. The mount's shipped default is `nokeepall` (ADR-0056); a
    * direct caller that omits it gets `3option`, the original contract byte for
-   * byte. `nokeepall` selects that grammar's prompt, closing line, row shape and
-   * answer gate. The plan carries it, so the table, correction and estimate
-   * paths all select the same one.
+   * byte. `nokeepall` sends the `jsonl-20-nokeepall` three-piece message and
+   * reads it with that grammar's reader (ISSUE-508); `3option` keeps the shipped
+   * bytes. The plan carries it, so the table, correction and estimate paths all
+   * select the same one.
    */
   readonly grammar?: PruneAskGrammar;
+  /**
+   * Whether this pass's first table ask is the session's first table ask
+   * (ISSUE-508). The mount reads it from its persisted `tableAskFired` fact:
+   * `true` (a fresh session) states the 70 percent share line, `false` (a
+   * restart, or a pass after any table ask left) states 40 percent. Omitted is
+   * `true`, a first ask.
+   */
+  readonly firstTrigger?: boolean;
+  /**
+   * Called when a table request actually left the seam and was answered or
+   * refused after the send (ISSUE-508). The mount persists `tableAskFired` here;
+   * a refused append, a refused send and a throw never call it.
+   */
+  readonly onTableAskLeft?: () => void;
 }
 
 /**
@@ -274,6 +289,8 @@ export async function runRecordOnlyPrune(
   const loop = await runTables({ sessionId, round: plan.round, fork,
     rows: plan.askRows, stamps: plan.stamps, llm: options.llm,
     route, journal, grammar: plan.grammar,
+    ...(options.firstTrigger === undefined ? {} : { firstTrigger: options.firstTrigger }),
+    ...(options.onTableAskLeft === undefined ? {} : { onTableAskLeft: options.onTableAskLeft }),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.signal === undefined ? {} : { signal: options.signal }) });
   // The pass's ONE correction turn (ISSUE-113): rows whose last attempt still

@@ -28,8 +28,9 @@ import {
 } from '../src/plugin.js';
 import { DatabaseSync } from 'node:sqlite';
 import { readPendingForgets, writePendingForgets } from '../src/mount-state.js';
-import { readEntryAskFired, readPruneRound, readPruneTriggerState, writeEntryAskFired,
-  writePendingAppends, writePruneRound } from '../src/prune-round-store.js';
+import { readEntryAskFired, readPruneRound, readPruneTriggerState, readTableAskFired,
+  writeEntryAskFired, writePendingAppends, writePruneRound,
+  writeTableAskFired } from '../src/prune-round-store.js';
 import { PREINSTALL_RECORD_FILE } from '../src/preinstall-record.js';
 import { PRUNE_COMMAND } from '../src/prune.js';
 
@@ -470,6 +471,8 @@ test('ISSUE-457: a fork resets the parent round, latch and first-ask flag', asyn
     writePruneRound(parentTarget, 3, () => {}, 'session-parent',
       { lastFireUsage: 100, belowSinceFire: true, baselinePending: false });
     writeEntryAskFired(parentTarget, true, () => {}, 'session-parent');
+    // ISSUE-508: the depth table's first-ask flag is parent history too.
+    writeTableAskFired(parentTarget, true, () => {}, 'session-parent');
   });
   const childTarget = resolveSessionStorage(fixture.root, 'session-child');
   const parentTarget = resolveSessionStorage(fixture.root, 'session-parent');
@@ -491,16 +494,20 @@ test('ISSUE-457: a fork resets the parent round, latch and first-ask flag', asyn
   try {
     const entry = await second.sessionFor(fixture.child.id, fixture.child);
     assert.equal(entry.entryAskFired, false, 'the child starts with no ask history');
+    assert.equal(entry.tableAskFired, false, 'and no table-ask history');
     assert.deepEqual(JSON.parse(readFileSync(roundFile(childTarget), 'utf8')),
-      { round: 0, entryAskFired: false },
+      { round: 0, entryAskFired: false, tableAskFired: false },
       'the child\'s round file carries none of the parent\'s facts');
     assert.equal(readPruneRound(parentTarget), 3, 'the parent keeps its round');
     assert.notEqual(readPruneTriggerState(parentTarget), null, 'the parent keeps its latch');
     assert.equal(readEntryAskFired(parentTarget), true, 'the parent keeps its first-ask history');
+    assert.equal(readTableAskFired(parentTarget), true,
+      'the parent keeps its table-ask history');
     const dropped = kinds(journal, 'fork-state-dropped').at(-1);
     assert.equal(dropped?.['round'], 3, 'the drop line names the dropped round');
     assert.equal(dropped?.['latch'], true, 'and the latch');
     assert.equal(dropped?.['entryAskFired'], true, 'and the first-ask flag');
+    assert.equal(dropped?.['tableAskFired'], true, 'and the table-ask flag');
 
     // The child's first real ask uses the first-ask share line.
     second.observeWire({ sessionId: fixture.child.id, provider: ROUTE.provider,

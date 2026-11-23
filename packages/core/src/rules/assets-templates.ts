@@ -115,11 +115,14 @@ const PRUNE_ASK_AGGRESSIVELY = PRUNE_ASK_PROMPT_LINES[PRUNE_ASK_PROMPT_LINES.len
  * The text is the sim's `TWO_OPTION_PROMPT_LINES` word for word
  * (`dev/sim/sim-batch-grammar.mjs`), which was derived from this same asset.
  * Each `{"` line is a whole readable answer. Selected by
- * `entryAskGrammar: "two-option"`, and by the opencode adapter's
- * `prune-two-option` table (it offers exactly these two actions because its
- * host cannot apply a partial `keeplines`; ADR-0053 §Amendment 2026-11-19).
- * Under it a row that names lines is refused (`action-not-in-grammar`) and
- * keeps, so the contract it teaches is the one the parser admits.
+ * `entryAskGrammar: "two-option"`, the entry seam's second contract. It is NOT
+ * the opencode table: that adapter sends the same `jsonl-20-nokeepall`
+ * three-piece message dsh sends, and it applies a partial `keeplines` by
+ * re-emitting the kept lines inside the typed result part (ISSUE-509;
+ * ADR-0053 §Amendment 2026-11-23; ADR-0054 §Amendment 2026-11-19, corrected
+ * 2026-11-23). Under this contract a row that names lines is refused
+ * (`action-not-in-grammar`) and keeps, so the contract it teaches is the one
+ * the parser admits.
  */
 const PRUNE_ASK_TWO_OPTION_PROMPT_LINES: readonly string[] = [
   PRUNE_ASK_OPENER,
@@ -148,8 +151,9 @@ export const PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT = PRUNE_ASK_TWO_OPTION_PROMPT_LI
 /**
  * The two-verdict grammars' whole-result note (ISSUE-221). `keepall` is not an
  * action there, so a whole result is stated as a `keeplines` over its whole
- * range with this exact summary. The note is the same string on the bulk ask
- * and the entry ask, so one reader can recognise the form in both places.
+ * range with this exact forgotten value. The note is the same string on the
+ * bulk ask and the entry ask, so one reader can recognise the form in both
+ * places.
  */
 export const KEEP_WHOLE_SUMMARY = "None";
 
@@ -159,7 +163,7 @@ export const KEEP_WHOLE_SUMMARY = "None";
  * range ends at that row's own L, the count its `[L line(s)]` suffix shows.
  */
 export const KEEP_WHOLE_RULE =
-  "A whole result is kept by a keeplines answer over its whole range with summary "
+  "A whole result is kept by a keeplines answer over its whole range with forgotten "
   + `${KEEP_WHOLE_SUMMARY}; the range ends at that row's own L, the count its`
   + " [L line(s)] suffix shows.";
 
@@ -167,7 +171,7 @@ export const KEEP_WHOLE_RULE =
  * The bulk prune ask's two-verdict contract (`pruneAskGrammar: "nokeepall"`):
  * the shipped index-keyed table ask with `keepall` removed. A row answers
  * `{"forgetall":"…"}` or `{"keeplines":[[start,end],"…"]}`; a whole unit is a
- * `keeplines` over its whole range with summary `None`. The opener names the
+ * `keeplines` over its whole range with forgotten `None`. The opener names the
  * `[L line(s)]` count each row carries, because rule-free `keeplines` cannot
  * state a whole range without it. Every `{"` line is a whole readable answer
  * and `test/assets.test.ts` reads each one through `parsePruneAnswer`.
@@ -186,7 +190,7 @@ const PRUNE_ASK_NOKEEPALL_PROMPT_LINES: readonly string[] = [
   "",
   `{"1":{"forgetall":"a stale build log from the old host"},"2":{"keeplines":[[1,6],"${KEEP_WHOLE_SUMMARY}"]}}`,
   "",
-  "keeplines keeps the named ranges (1-based, counted on that unit's own lines, inside 1..L); the rest is replaced by a required summary, a few words, aim under 15, never over 25. forgetall replaces the whole unit with its summary. "
+  "keeplines keeps the named ranges (1-based, counted on that unit's own lines, inside 1..L); the rest is replaced by a required forgotten value, a few words, aim under 15, never over 25. forgetall replaces the whole unit with its forgotten value. "
     + KEEP_WHOLE_RULE
     + " Answer every index exactly once; a missing, unknown or repeated key refuses that unit, and a refused unit keeps.",
   "",
@@ -365,8 +369,8 @@ export const PRUNE_ASK_JSONL_20_SLOT =
 
 /**
  * `jsonl-20`'s pre-table contract (ISSUE-143; ISSUE-183's shipped copy): one
- * JSON object per row per line, a short summary beside the action key, and the
- * rules that make a bad line a row refusal instead of a batch refusal.
+ * JSON object per row per line, a short forgotten value beside the action key,
+ * and the rules that make a bad line a row refusal instead of a batch refusal.
  *
  * LAYOUT. This block ends with `PRUNE_ASK_JSONL_20_SLOT`, the table's place;
  * `PRUNE_ASK_JSONL_20_REPEAT` follows the rendered table. The share line appears
@@ -392,26 +396,28 @@ const PRUNE_ASK_JSONL_20_PROMPT_LINES = (target: string): readonly string[] => [
   "Rules:",
   "1. One object per line. One row per object. Nothing else on the line.",
   "2. Exactly one action key per row: keepall, forgetall, or keeplines.",
-  "3. keepall carries nothing else. forgetall and keeplines must also carry summary.",
+  "3. keepall carries nothing else. forgetall and keeplines must also carry forgotten: what is "
+    + "being dropped and why.",
   "4. forgetall forgets the whole row. keeplines keeps the listed lines and forgets every line "
     + "not listed.",
   "5. keeplines is an ascending array of non-overlapping [start,end] pairs, integers, inside 1..L, "
     + "where L is that row's line count shown in the table.",
-  "6. summary is one line of plain text, less than 20 words. It names what the forgotten content "
-    + "was about so it can be recalled. Use no raw newline. Escape a double quote as \\\".",
+  "6. forgotten is one line of plain text, less than 20 words. It names what is being dropped and "
+    + "why, so it can be recalled. It never describes the lines you keep. Use no raw newline. "
+    + "Escape a double quote as \\\".",
   "7. Every row in the table appears exactly once. Add no other rows, keys, or text.",
-  "8. Before sending, check each line: one object, one action key, summary present when "
+  "8. Before sending, check each line: one object, one action key, forgotten present when "
     + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own.",
   "",
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",
@@ -438,13 +444,13 @@ export const PRUNE_ASK_JSONL_20_LATER_SYSTEM_PROMPT =
 const PRUNE_ASK_JSONL_20_REPEAT_LINES = (target: string): readonly string[] => [
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",
@@ -474,7 +480,7 @@ export const PRUNE_ASK_JSONL_20_NOKEEPALL_LATER_TARGET =
 /**
  * The core port of the line-per-row two-verdict prompt (ISSUE-221): `jsonl-20`'s
  * rules with `keepall` removed from the action list, the formats and the worked
- * example. A whole row is the full-range `keeplines` with summary `None`. Every
+ * example. A whole row is the full-range `keeplines` with forgotten `None`. Every
  * `{"` line is a whole readable answer with real numbers, and
  * `test/assets.test.ts` reads each one through `readJsonl20Answer` with the
  * row's own L.
@@ -492,29 +498,34 @@ const PRUNE_ASK_JSONL_20_NOKEEPALL_PROMPT_LINES = (target: string): readonly str
   "Rules:",
   "1. One object per line. One row per object. Nothing else on the line.",
   "2. Exactly one action key per row: forgetall, or keeplines.",
-  "3. forgetall and keeplines must also carry summary.",
+  "3. forgetall and keeplines must also carry forgotten: what is being dropped and why.",
   "4. forgetall forgets the whole row. keeplines keeps the listed lines and forgets every line "
     + "not listed.",
   "5. keeplines is an ascending array of non-overlapping [start,end] pairs, integers, inside 1..L, "
-    + "where L is that row's line count shown in the table.",
-  "6. summary is one line of plain text, less than 20 words. It names what the forgotten content "
-    + "was about so it can be recalled. Use no raw newline. Escape a double quote as \\\".",
+    + "where L is that row's line count shown in the table. Use that row's own 1..L numbering, not "
+    + "the line numbers printed inside the quoted content.",
+  "6. forgotten is one line of plain text, less than 20 words. It names what is being dropped and "
+    + "why, so it can be recalled. It never describes the lines you keep. Use no raw newline. "
+    + "Escape a double quote as \\\".",
   "7. Every row in the table appears exactly once. Add no other rows, keys, or text.",
-  "8. Before sending, check each line: one object, one action key, summary present when "
-    + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own.",
+  "8. Before sending, check each line: one object, one action key, forgotten present when "
+    + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own, "
+    + "with both closing braces — the row object and its verdict object.",
   `9. ${KEEP_WHOLE_RULE}`,
   "",
   "Answer format:",
-  '{"1":{"forgetall":true,"summary":"stale build log from the old host"}}',
+  '{"1":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
   "Row 2 has 6 lines here; a whole row uses its own L:",
-  `{"2":{"keeplines":[[1,6]],"summary":"${KEEP_WHOLE_SUMMARY}"}}`,
-  '{"3":{"keeplines":[[1,3],[11,18]],"summary":"the config keys and the two error strings"}}',
+  `{"2":{"keeplines":[[1,6]],"forgotten":"${KEEP_WHOLE_SUMMARY}"}}`,
+  '{"3":{"keeplines":[[1,3],[11,18]],"forgotten":"the stale build log and the old host block"}}',
   "Answer Example:",
   "Row 1 has 6 lines here; a whole row uses its own L:",
-  `{"1":{"keeplines":[[1,6]],"summary":"${KEEP_WHOLE_SUMMARY}"}}`,
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  `{"1":{"keeplines":[[1,6]],"forgotten":"${KEEP_WHOLE_SUMMARY}"}}`,
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
+  'Never: {"1":{"forgetall":true},"2":{"forgetall":true}} — one object naming two rows is invalid.',
+  "Each row is its own line.",
   "",
   target,
   "",
@@ -535,16 +546,18 @@ export const PRUNE_ASK_JSONL_20_NOKEEPALL_LATER_SYSTEM_PROMPT =
  */
 const PRUNE_ASK_JSONL_20_NOKEEPALL_REPEAT_LINES = (target: string): readonly string[] => [
   "Answer format:",
-  '{"1":{"forgetall":true,"summary":"stale build log from the old host"}}',
+  '{"1":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
   "Row 2 has 6 lines here; a whole row uses its own L:",
-  `{"2":{"keeplines":[[1,6]],"summary":"${KEEP_WHOLE_SUMMARY}"}}`,
-  '{"3":{"keeplines":[[1,3],[11,18]],"summary":"the config keys and the two error strings"}}',
+  `{"2":{"keeplines":[[1,6]],"forgotten":"${KEEP_WHOLE_SUMMARY}"}}`,
+  '{"3":{"keeplines":[[1,3],[11,18]],"forgotten":"the stale build log and the old host block"}}',
   "Answer Example:",
   "Row 1 has 6 lines here; a whole row uses its own L:",
-  `{"1":{"keeplines":[[1,6]],"summary":"${KEEP_WHOLE_SUMMARY}"}}`,
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  `{"1":{"keeplines":[[1,6]],"forgotten":"${KEEP_WHOLE_SUMMARY}"}}`,
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
+  'Never: {"1":{"forgetall":true},"2":{"forgetall":true}} — one object naming two rows is invalid.',
+  "Each row is its own line.",
   "",
   target,
   "",

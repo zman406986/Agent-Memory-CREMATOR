@@ -298,7 +298,7 @@ test('ISSUE-259 fix 1: the ask never offers the recall answer, a normal result s
         // The recalled row keeps its pass index, so the normal row is addressed
         // by the index the table shows, not by position 1.
         const shown = Number(/^([1-9]\d*)\. \[read\]/mu.exec(input.prompt)?.[1] ?? 1);
-        return { text: JSON.stringify({ [String(shown)]: { forgetall: 'old read' } }) };
+        return { text: JSON.stringify({ [String(shown)]: { forgetall: true, summary: 'old read' } }) };
       },
       journal: record => lines.records.push(record),
     });
@@ -340,11 +340,13 @@ test('ISSUE-259 fix 2: the ask skips a contained unit, keeps the containing one 
         prompts.push(input.prompt);
         // The table shows the pass's own indices; the contained row leaves a
         // gap, so answer the indices the table actually shows, in row order.
-        const shown = [...input.prompt.matchAll(/^([1-9]\d*)\. \[/gmu)].map(match => match[1]);
-        const answers = Object.fromEntries(shown.map((index, position) => [
-          index, { forgetall: position === 0 ? 'whole tree' : 'specs' },
-        ]));
-        return { text: JSON.stringify(answers) };
+        // The grammar is one JSON object per line.
+        const shown = [...input.prompt.matchAll(/^([1-9]\d*)\. \[/gmu)]
+          .flatMap(match => (match[1] === undefined ? [] : [match[1]]));
+        const answers = shown.map((index, position) => JSON.stringify({
+          [index]: { forgetall: true, summary: position === 0 ? 'whole tree' : 'specs' },
+        })).join('\n');
+        return { text: answers };
       },
       journal: record => lines.records.push(record),
     });
@@ -358,7 +360,10 @@ test('ISSUE-259 fix 2: the ask skips a contained unit, keeps the containing one 
       assert.match(prompt, /pipeline\/output\/\*\*\/\*/u,
         'the containing listing is tabled');
       assert.match(prompt, /module_specs/u, 'the merely similar listing is tabled');
-      assert.doesNotMatch(prompt, /module_plans/u,
+      // The contained listing's paths may still be quoted by the containing
+      // row's anchors (they are lines of the container's own body); what must
+      // never appear is a row addressed to the contained unit.
+      assert.doesNotMatch(prompt, /^[1-9]\d*\. \[glob\] pipeline\/output\/module_plans\//mu,
         'the contained listing is never a table row');
       const ask = lines.of('ask')[0];
       assert.ok(ask !== undefined, 'one ask fire line was written');
@@ -765,7 +770,7 @@ test('fixE: the ask re-applies a banked removal after a newer result contains it
         // later table keeps every row (`{}` refuses each index), so this test
         // measures the banked removal's re-application, not a second removal.
         return { text: asks === 1
-          ? '{"1":{"forgetall":"old listing"}}' : '{}' };
+          ? '{"1":{"forgetall":true,"summary":"old listing"}}' : '{}' };
       },
       journal: record => lines.records.push(record),
     });

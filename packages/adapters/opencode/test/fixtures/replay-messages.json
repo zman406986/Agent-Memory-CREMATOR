@@ -3,7 +3,7 @@
     "what": "OpenCode 2.2.5-shaped request messages replayed by the adapter's snapshot test (ISSUE-192).",
     "derivedFrom": "The 1.x replay corpus of ISSUE-044, re-shaped by hand to the 2.2.5 Message[] contract; no live run.",
     "how": "Adapted, not copied: the turn/step/tool-call/result sequence follows one recorded session (one prompt, two tool calls in one assistant message, their results in one tool message, a second prompt and two closing answers), but every recorded body was replaced with a short placeholder and the ids were re-made.",
-    "homeForms": "home-relative placeholders, so any machine's home resolves.",
+    "homeForms": "C:\\Users\\TZhen\\ on one device, C:\\Users\\TZ\\ on the other.",
     "shapesFrom": "@opencode/plugin@2.2.5 dist/promise; @opencode/ai@2.2.5 dist/schema/messages.d.ts: text, reasoning, media, tool-call, tool-result, compaction, effort.",
     "counts": {
       "messages": 6,

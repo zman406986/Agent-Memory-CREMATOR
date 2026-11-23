@@ -394,7 +394,7 @@ test('the per-revision lane journals an estimate, never a host window', async ()
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     askGrammar: 'prune-two-option',
-    askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+    askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
     journal: record => lines.records.push(record as unknown as Record<string, unknown>),
   });
   try {
@@ -428,7 +428,7 @@ test('a stale idle fact clamps to a truncated rebuild and the pass is accepted',
     const mount = createOpencodeMount({
       storage: { databasePath: ':memory:' },
       askGrammar: 'prune-two-option',
-      askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+      askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
       journal: record => lines.records.push(record as unknown as Record<string, unknown>),
     });
     try {
@@ -535,7 +535,7 @@ test('the prune planning window is the configured host window, not a content est
       contextWindowTokens: 400_000,
       pruneThresholdTokens: 1,
       askGrammar: 'prune-two-option',
-      askGenerate: async () => ({ text: '{"1":{"forgetall":"stale note"}}' }),
+      askGenerate: async () => ({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' }),
       journal: record => lines.records.push(record as unknown as Record<string, unknown>),
     });
     try {
@@ -730,7 +730,7 @@ test('a restart on the shared ledger re-applies the removal and never re-asks it
     askGrammar: 'prune-two-option',
     askGenerate: async () => {
       firstAsks += 1;
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     },
   });
   try {

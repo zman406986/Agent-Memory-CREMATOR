@@ -24,8 +24,23 @@
  *     may vanish with the last call the plan removes;
  *   - `part` — one text or reasoning part;
  *   - `unit` — one tool-result unit: the `tool-call` part and the `tool-result`
- *     part, in one or two messages. Removal takes both, so no call is left
- *     dangling (ADR-0044 decision 3).
+ *     part, in one or two messages. A `forgetall` removal takes both, so no call
+ *     is left dangling (ADR-0044 decision 3).
+ *
+ * **A partial `keeplines` keeps the unit.** The verdict's archive names only the
+ * bytes it gives up (`opencodePartialKeeps`), so the derivation rewrites the
+ * unit's typed result part to carry the kept lines and leaves the call part
+ * standing. One text blob is written — a `text` value, or one `text` entry in a
+ * `content` value — because the host drops empty entries and re-joins content
+ * entries with a newline. The part keeps its `id`, `name` and `namespace`; only
+ * the text changes. The archived body is the unit's decoded result text — the
+ * exact bytes its line numbers count on; a legacy `{input,name,result}` envelope
+ * is still read, with the kept bytes taken from its escaped result value. A
+ * `json` or `error` result, or a `content` value carrying a file entry, refuses
+ * `partial-keep-non-text` and keeps the unit whole (a content join is no single
+ * fragment, so a legacy envelope carrying one refuses by the same name), and a
+ * body whose text is not this result's refuses `partial-keep-unrepresentable`
+ * rather than shipping a fragment.
  *
  * **The pair rule.** A plan that names an orphan result (a result whose call is
  * absent), a declaration/receipt node, or a unit whose call part is not in the
@@ -72,17 +87,21 @@
  * **Refusals, every one decided before any write.** `plan-sha-mismatch`,
  * `intent-conflict`, `stale-revision`, `node-missing`, `tool-pair-split`,
  * `unknown-part-shape`, `system-head`, `reasoning-loss`,
- * `recall-answer-retained`, `contained-in-live-result`, `error-result-retained`.
+ * `recall-answer-retained`, `contained-in-live-result`, `error-result-retained`,
+ * `partial-keep-non-text`, `partial-keep-unrepresentable`,
+ * `partial-keep-unusable`.
  *
- * The last three gate a **first-time offer** only. The host rebuilds every
- * request from its own store, so a unit a prior pass removed is present again
- * in the next array and the mount re-derives its removal. That derivation is a
- * re-application of a banked removal, not a new offer: the unit's bytes are
- * already archived under a recall and its receipt was written, so the claim is
- * that the removal stays in effect. The applied-plan index names the units a
- * prior pass forgot, and `opencodeIsCommittedRemoval` reads it: a later live
- * result that now contains the unit's text does not reverse the removal. A
- * visible `necromancy` restore of that recall opens a new epoch (`restoreEpochOf`);
+ * The three retention rules — `recall-answer-retained`,
+ * `contained-in-live-result` and `error-result-retained` — gate a **first-time
+ * offer** only. The host rebuilds every request from its own store, so a unit a
+ * prior pass removed is present again in the next array and the mount re-derives
+ * its removal. That derivation is a re-application of a banked removal, not a
+ * new offer: the unit's bytes are already archived under a recall and its
+ * receipt was written, so the claim is that the removal stays in effect. The
+ * applied-plan index names the units a prior pass forgot, and
+ * `opencodeIsCommittedRemoval` reads it: a later live result that now contains
+ * the unit's text does not reverse the removal. A visible `necromancy` restore
+ * of that recall opens a new epoch (`restoreEpochOf`);
  * the unit it makes visible is a first-time offer again and the rules apply.
  * Each returns `status: 'refused'` with one of the core's three reasons and
  * leaves `messages` untouched. One class carries a `cleanup` array instead of
@@ -93,12 +112,16 @@
  * without any claim that the removal happened.
  */
 
-import { revertBytes, sha256Sync } from '@cremator/core';
+import {
+  complementByteRanges, revertBytes, sha256Sync, toBytes,
+} from '@cremator/core';
 import type {
-  ApplyRequest, NodeId, RenderedRecord, ValidatedRevert,
+  ApplyRequest, ArchiveRecord, ByteRange, NodeId, RecallId, RenderedRecord, ValidatedRevert,
 } from '@cremator/core';
 import { opencodeIsErrorResult } from './host.js';
-import type { OpencodeMessage, OpencodeToolResultPart } from './host.js';
+import type {
+  OpencodeMessage, OpencodeToolResultPart, OpencodeToolResultValue,
+} from './host.js';
 import {
   deriveOpencodeSnapshot, opencodeMessageKey, opencodeMessageNodeId, opencodePartNodeId,
   opencodeToolNodeId, OPENCODE_RECORD_ID_FIELD, OPENCODE_RECORD_PREFIX,
@@ -529,7 +552,32 @@ export type OpencodeDerivationCode =
    * is still in the request, so the removal buys no context and makes the unit
    * look never-sent.
    */
-  | 'contained-in-live-result';
+  | 'contained-in-live-result'
+  /**
+   * A partial `keeplines` names a unit whose result is not text this host can
+   * carry: a `json` or `error` tag, a `content` value with a file entry or with
+   * no surviving text entry, or a legacy-envelope body carrying a content join
+   * (no single fragment holds it). Its tag drives the miss/failed
+   * classification, so the part is never rewritten; the unit keeps whole.
+   */
+  | 'partial-keep-non-text'
+  /**
+   * A partial `keeplines` names a unit whose archived body is not the result
+   * part's own text. The kept byte ranges address the archive, so the kept lines
+   * cannot be re-emitted inside the part without inventing bytes. The unit keeps
+   * whole.
+   */
+  | 'partial-keep-unrepresentable'
+  /**
+   * A verdict archive a partial keep would read is unusable: its body differs
+   * from its source, a removed range is out of bounds or differs from its hash,
+   * one archive names the same node twice, two verdict archives name one node
+   * (whole or partial), an archive names no source part, a receipt names a
+   * different recall than its archive, an archive names a node this array does
+   * not hold, or it names no dropped range at all (a whole keep is not a
+   * removal). The plan is refused rather than repaired.
+   */
+  | 'partial-keep-unusable';
 
 export interface OpencodeDerivedArray {
   readonly status: 'staged';
@@ -732,13 +780,19 @@ function buildSites(messages: readonly OpencodeMessage[]): {
 const HOST_EMPTY_TOOL_OUTPUT = '(no tool output)';
 
 /**
- * The exact text one tool result carries (ISSUE-259). The host states the
- * result value, so it is read verbatim: a string value is the text, a `content`
- * array is its text entries joined with a newline — the host's own wire
- * lowering (ISSUE-258 item 7; the bench's `archivedResultWireText`), so a file
- * entry contributes no text and an empty text entry is dropped before the join,
- * as the host's normalizer drops it — and any other value is its JSON text. The
- * host's normalizer also rewrites an empty `text` or `error` value and a
+ * The exact text one tool result carries (ISSUE-259). It is the host's own wire
+ * lowering, byte for byte (the bench's `archivedResultWireText`):
+ *
+ *   - a `text` value is the string verbatim;
+ *   - a `json` value is its JSON text, so the string `'abc'` lowers to `"abc"`,
+ *     never to the bare bytes `abc`;
+ *   - an `error` value is the string verbatim when it is a bare value, and its
+ *     JSON text when it is an object or array (the host's own split);
+ *   - a `content` array is its non-empty text entries joined with a newline, so
+ *     a file entry contributes no text and an empty text entry is dropped
+ *     before the join, as the host's normalizer drops it.
+ *
+ * The host's normalizer also rewrites an empty `text` or `error` value and a
  * `content` array with no surviving entry to `(no tool output)`, so this
  * lowering returns that same literal: the live request carries it, and a `''`
  * candidate could never be found inside it. The canonical
@@ -748,11 +802,23 @@ const HOST_EMPTY_TOOL_OUTPUT = '(no tool output)';
  */
 export function opencodeResultText(part: OpencodeToolResultPart): string {
   const value = part.result.value;
-  if (typeof value === 'string') {
-    if (value === '' && (part.result.type === 'text' || part.result.type === 'error')) {
-      return HOST_EMPTY_TOOL_OUTPUT;
+  if (part.result.type === 'text') {
+    if (typeof value === 'string') {
+      return value === '' ? HOST_EMPTY_TOOL_OUTPUT : value;
     }
-    return value;
+    return JSON.stringify(value) ?? '';
+  }
+  if (part.result.type === 'json') {
+    // A JSON value is always its JSON text: `'abc'` is `"abc"` on the wire.
+    return JSON.stringify(value) ?? '';
+  }
+  if (part.result.type === 'error') {
+    if (typeof value === 'string') {
+      return value === '' ? HOST_EMPTY_TOOL_OUTPUT : value;
+    }
+    // The host's own split (`archivedResultWireText`): a bare error value is its
+    // string form; an object or array is its JSON text.
+    return isStructuredValue(value) ? JSON.stringify(value) ?? '' : String(value);
   }
   if (part.result.type === 'content' && Array.isArray(value)) {
     // The host's own emptiness test (tool-history.js:92): every entry that is
@@ -772,6 +838,472 @@ export function opencodeResultText(part: OpencodeToolResultPart): string {
     return texts.join('\n');
   }
   return JSON.stringify(value) ?? '';
+}
+
+/** True for the object/array shapes the host serializes as JSON, never as `String(...)`. */
+function isStructuredValue(value: unknown): boolean {
+  if (Array.isArray(value)) return true;
+  if (typeof value !== 'object' || value === null) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** One text payload a result part can carry, and the tag it is carried under. */
+export interface OpencodeTextPayload {
+  readonly text: string;
+  readonly encoding: 'text' | 'content';
+}
+
+/**
+ * The text a partial `keeplines` may re-emit inside this result part, or `null`
+ * when the part cannot carry kept lines without corrupting what its tag means.
+ *
+ * The text is the host's own lowering (`opencodeResultText`): a `text` value
+ * verbatim, or a `content` value's non-empty text entries joined with a newline
+ * — the same text the unit's line numbers count on. Only two shapes qualify:
+ *   - a `text` result whose value is a non-empty string;
+ *   - a `content` result whose entries are text entries only, with at least one
+ *     non-empty (a `file` entry would be silently lost by a rebuild, so the part
+ *     refuses instead; an empty text entry is dropped by the host's normalizer
+ *     before the wire, so dropping it changes no byte the model sees).
+ *
+ * A `json` or `error` result never qualifies: its tag is what makes the snapshot
+ * read a miss or a failure, and rewriting it would change the transcript's
+ * meaning, not only its size.
+ */
+export function opencodeTextPayload(part: OpencodeToolResultPart): OpencodeTextPayload | null {
+  if (part.result.type === 'text') {
+    const value = part.result.value;
+    return typeof value === 'string' && value.length > 0
+      ? { text: value, encoding: 'text' } : null;
+  }
+  if (part.result.type !== 'content' || !Array.isArray(part.result.value)) return null;
+  const entries = part.result.value;
+  if (entries.length === 0) return null;
+  let survives = false;
+  for (const entry of entries) {
+    if (!isRecord(entry) || entry['type'] !== 'text' || typeof entry['text'] !== 'string') return null;
+    if (entry['text'] !== '') survives = true;
+  }
+  return survives ? { text: opencodeResultText(part), encoding: 'content' } : null;
+}
+
+/**
+ * The same result part with its text replaced and nothing else touched. The
+ * part's `id`, `name`, `namespace` and every host field survive by spread; only
+ * `result` is new. The payload's own `encoding` says which tag the part carries,
+ * so a kept-lines result keeps it: ONE text blob either way, because the host
+ * drops empty text entries before the wire and joins content entries with a
+ * newline, so one entry per line would not survive a second normalizer pass.
+ */
+function withResultText(
+  part: OpencodeToolResultPart, payload: OpencodeTextPayload,
+): OpencodeToolResultPart {
+  const result: OpencodeToolResultValue = payload.encoding === 'text'
+    ? { type: 'text', value: payload.text }
+    : { type: 'content', value: [{ type: 'text', text: payload.text }] };
+  return { ...part, result };
+}
+
+/**
+ * One archived partial keep: the unit's own body, the bytes its `keeplines`
+ * verdict gives up, the kept bytes between them, and the recall that restores
+ * the dropped lines.
+ *
+ * A verdict archive always holds the unit's whole body and the removal's byte
+ * ranges inside it (`guard/recall.ts` `makeRecall`). A `forgetall` gives up the
+ * whole span, so its complement is empty and it is not a partial keep. A
+ * `keeplines` gives up the complement of the lines it keeps, so the complement
+ * of the archived ranges is exactly the kept lines — re-derived here with core's
+ * own complement, never read back from model output.
+ *
+ * This adapter mints every unit as its node's whole result
+ * (`WholeResultSegmenter`), so a kept range inside an archived body can only
+ * come from a `keeplines` answer.
+ */
+export interface OpencodePartialKeep {
+  readonly nodeId: NodeId;
+  /** The recall the unit's whole body restores under; the receipt names it. */
+  readonly recallId: RecallId;
+  /** The archived body: the byte space the unit's own line numbers counted. */
+  readonly sourceBytes: Uint8Array;
+  /** The bytes the removal gives up, in order. */
+  readonly removedRanges: readonly ByteRange[];
+  /** Every other byte: the kept lines, in order. */
+  readonly keptRanges: readonly ByteRange[];
+}
+
+/** The partial keeps a validated application's archives carry, or why they cannot be read. */
+export type OpencodePartialKeepSet =
+  | {
+      readonly status: 'derived';
+      readonly keeps: ReadonlyMap<NodeId, OpencodePartialKeep>;
+      /**
+       * Every node a verdict archive in this application names, whole-unit or
+       * partial. One archive per node: a second one for the same node is a plan
+       * that archives one removal twice, whatever its ranges say.
+       */
+      readonly archived: ReadonlySet<NodeId>;
+    }
+  | {
+      readonly status: 'invalid';
+      readonly code: OpencodeDerivationCode;
+      readonly detail: string;
+    };
+
+/**
+ * Reads the partial keeps one validated application's verdict archives carry.
+ *
+ * Every entry is verified before it is trusted — the body against its source
+ * hash and length, each removed range against its own hash and bounds, and the
+ * ranges ordered and non-overlapping — because these bytes are about to be
+ * copied into the model-visible request and the model never supplies them. The
+ * adapter never repairs an archive: a malformed one is `partial-keep-unusable`
+ * and the plan refuses. Whether the kept bytes are whole lines of the unit's
+ * text is checked where the text is decoded (`partialKeepText`), because a
+ * legacy envelope body's own line layout says nothing about the result's.
+ *
+ * A `forgetall`/whole-unit removal contributes no keep (its complement is
+ * empty), but it is still recorded in `archived` so two archives naming one
+ * node are refused. A verdict archive that names no source part, or a source
+ * part naming no dropped range at all, is refused rather than read as a
+ * "keep everything" removal: core normalizes a whole-range `keeplines` to
+ * `keepall`, so a plan that still names one is malformed.
+ */
+export function opencodePartialKeeps(
+  archives: readonly ArchiveRecord[],
+): OpencodePartialKeepSet {
+  const keeps = new Map<NodeId, OpencodePartialKeep>();
+  const archived = new Set<NodeId>();
+  for (const archive of archives) {
+    if (archive.operationKind !== 'verdict') continue;
+    if (archive.recall.parts.length === 0) {
+      return { status: 'invalid', code: 'partial-keep-unusable',
+        detail: `the verdict archive of removal ${archive.removalId} names no source part` };
+    }
+    const namedByThisArchive = new Set<NodeId>();
+    for (const part of archive.recall.parts) {
+      const nodeId = part.source.nodeId;
+      if (namedByThisArchive.has(nodeId)) {
+        return { status: 'invalid', code: 'partial-keep-unusable',
+          detail: `one verdict archive names ${nodeId} more than once` };
+      }
+      namedByThisArchive.add(nodeId);
+      if (archived.has(nodeId)) {
+        return { status: 'invalid', code: 'partial-keep-unusable',
+          detail: `two verdict archives name ${nodeId}` };
+      }
+      archived.add(nodeId);
+      const bytes = new Uint8Array(part.bytes);
+      if (bytes.length !== part.source.byteLength || sha256Sync(bytes) !== part.source.sha256) {
+        return { status: 'invalid', code: 'partial-keep-unusable',
+          detail: `the archived body of ${nodeId} differs from its source` };
+      }
+      const removedRanges: ByteRange[] = [];
+      for (const span of part.removedRanges) {
+        const { startByte, endByteExclusive } = span.range;
+        if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByteExclusive)
+          || startByte < 0 || endByteExclusive <= startByte || endByteExclusive > bytes.length) {
+          return { status: 'invalid', code: 'partial-keep-unusable',
+            detail: `an archived range of ${nodeId} is out of bounds` };
+        }
+        if (sha256Sync(bytes.slice(startByte, endByteExclusive)) !== span.sha256) {
+          return { status: 'invalid', code: 'partial-keep-unusable',
+            detail: `an archived removed range of ${nodeId} differs from its hash` };
+        }
+        removedRanges.push({ startByte, endByteExclusive });
+      }
+      if (removedRanges.length === 0) {
+        return { status: 'invalid', code: 'partial-keep-unusable',
+          detail: `the verdict archive of ${nodeId} names no dropped range; a whole keep is `
+            + 'not a removal' };
+      }
+      let keptRanges: readonly ByteRange[];
+      try {
+        keptRanges = complementByteRanges(bytes.length, removedRanges);
+      } catch {
+        return { status: 'invalid', code: 'partial-keep-unusable',
+          detail: `the archived ranges of ${nodeId} are unordered, overlapping or out of bounds` };
+      }
+      // A whole-unit removal keeps nothing: the by-reference removal path owns it.
+      if (keptRanges.length === 0) continue;
+      keeps.set(nodeId, {
+        nodeId, recallId: archive.recall.id, sourceBytes: bytes, removedRanges, keptRanges,
+      });
+    }
+  }
+  return { status: 'derived', keeps, archived };
+}
+
+/** One byte range of an archived body, as an interval. */
+interface ByteInterval {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** One archived body decoded into text: the unit's own text and its byte region. */
+interface ArchivedText {
+  /** The text the unit's line numbers counted on (the host's own lowering). */
+  readonly sourceText: string;
+  /** The region of the body that holds that text, after any JSON unescaping. */
+  readonly region: ByteInterval;
+  /** How a body fragment inside the region becomes text. */
+  readonly decode: (fragment: Uint8Array) => string;
+}
+
+/** What one partial keep's archive says its kept lines are, or why it cannot say. */
+type PartialKeepText =
+  | { readonly status: 'ok'; readonly text: string; readonly sourceText: string }
+  | {
+      readonly status: 'refused';
+      readonly code: 'partial-keep-non-text' | 'partial-keep-unrepresentable';
+      readonly detail: string;
+    };
+
+/** The first offset of `needle` in `haystack` at or after `from`, or -1. */
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from = 0): number {
+  if (needle.length === 0) return -1;
+  outer: for (let start = from; start + needle.length <= haystack.length; start += 1) {
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (haystack[start + offset] !== needle[offset]) continue outer;
+    }
+    return start;
+  }
+  return -1;
+}
+
+/** True when `haystack` carries `needle` exactly at `at`. */
+function matchesAt(haystack: Uint8Array, need: Uint8Array, at: number): boolean {
+  if (at < 0 || at + need.length > haystack.length) return false;
+  for (let offset = 0; offset < need.length; offset += 1) {
+    if (haystack[at + offset] !== need[offset]) return false;
+  }
+  return true;
+}
+
+/** The legacy `{input,name,result}` envelope's `result`, when `body` is one. */
+function envelopeResultOf(body: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  /**
+   * Only a LEGACY archive body is an envelope: `snapshot.ts` `unitBytes` now
+   * writes the decoded result text, and an envelope is a body stored before that
+   * change. It carries exactly these three members, whatever their order.
+   */
+  if (!Object.hasOwn(parsed, 'input') || !Object.hasOwn(parsed, 'name')
+    || !Object.hasOwn(parsed, 'result') || typeof parsed['name'] !== 'string') {
+    return undefined;
+  }
+  return parsed['result'];
+}
+
+/** One fragment of the archived body as text, or `null` when it is not decodable. */
+function fragmentText(fragment: Uint8Array, decode: ArchivedText['decode']): string | null {
+  try {
+    return decode(fragment);
+  } catch {
+    return null;
+  }
+}
+
+/** The intersection of one range with the text region, or `null`; a straddle refuses. */
+function regionPiece(range: ByteRange, region: ByteInterval): ByteInterval | null | 'straddle' {
+  const start = Math.max(range.startByte, region.start);
+  const end = Math.min(range.endByteExclusive, region.end);
+  if (end <= start) {
+    // Entirely outside the text region (envelope bytes) — or a zero-length cut.
+    const outside = range.endByteExclusive <= region.start || range.startByte >= region.end;
+    return outside ? null : 'straddle';
+  }
+  const straddles = range.startByte < region.start || range.endByteExclusive > region.end;
+  return straddles ? 'straddle' : { start, end };
+}
+
+/**
+ * The two text pieces a partial keep's archive splits its unit text into: what
+ * stays and what leaves. Whole lines on both sides, in order, and together they
+ * are exactly the unit's text — the check that makes the rewrite exact rather
+ * than approximate.
+ */
+function wholeLinePartition(original: string, kept: string, dropped: string): boolean {
+  const lines = original.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+  let keptAt = 0;
+  let droppedAt = 0;
+  for (const line of lines) {
+    if (kept.startsWith(line, keptAt)) { keptAt += line.length; continue; }
+    if (dropped.startsWith(line, droppedAt)) { droppedAt += line.length; continue; }
+    return false;
+  }
+  return keptAt === kept.length && droppedAt === dropped.length
+    && (kept.length > 0 || dropped.length > 0);
+}
+
+/** How one archived body decodes: not an envelope, an envelope, or a named refusal. */
+type ArchivedBody =
+  | { readonly status: 'plain' }
+  | { readonly status: 'text'; readonly archived: ArchivedText }
+  | {
+      readonly status: 'refused';
+      readonly code: 'partial-keep-non-text' | 'partial-keep-unrepresentable';
+      readonly detail: string;
+    };
+
+/**
+ * The body of one partial keep decoded into the unit's own text.
+ *
+ * **The archived body is the unit's decoded result text**, so the kept byte
+ * ranges slice it verbatim: the region is the whole body and each fragment is
+ * copied as text. A body written before the snapshot fix is a legacy
+ * `{input,name,result}` envelope; it is still read, with the kept bytes taken
+ * from the escaped result value (unescaped strictly) and the envelope's own
+ * fixed members outside it ignored. Either way the line accounting is the unit's
+ * own text, never the envelope's length.
+ */
+function archivedTextOf(keep: OpencodePartialKeep): ArchivedBody {
+  let body: string;
+  try {
+    body = strictDecoder.decode(keep.sourceBytes);
+  } catch {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the archived body is not UTF-8 text' };
+  }
+  const result = envelopeResultOf(body);
+  if (result === undefined) {
+    // Not an envelope: the body is the unit's own text.
+    return { status: 'plain' };
+  }
+  if (!isRecord(result) || result['type'] !== 'text' || typeof result['value'] !== 'string') {
+    return { status: 'refused', code: 'partial-keep-non-text',
+      detail: 'the archived envelope carries a result this host cannot re-emit as text' };
+  }
+  const quoted = toBytes(JSON.stringify(result['value']));
+  const resultJson = toBytes(JSON.stringify(result));
+  /**
+   * The legacy envelope is `{"input":…,"name":…,"result":…}`, so the result is
+   * the LAST member: its bytes sit immediately before the closing brace. That
+   * anchor is what makes the lookup exact — an input key named `result` writes
+   * its own `"result":` earlier in the body and must not be mistaken for the
+   * envelope's member.
+   */
+  const resultKey = toBytes('"result":');
+  const resultAt = keep.sourceBytes.length - 1 - resultJson.length;
+  if (keep.sourceBytes[keep.sourceBytes.length - 1] !== 0x7d /* } */
+    || !matchesAt(keep.sourceBytes, resultJson, resultAt)
+    || !matchesAt(keep.sourceBytes, resultKey, resultAt - resultKey.length)) {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the archived envelope does not hold its result as its last member' };
+  }
+  // The result's own `"value":` key anchors the kept text: a text result object
+  // carries exactly one, after `type`.
+  const valueKey = toBytes('"value":');
+  const valueAt = indexOfBytes(keep.sourceBytes, valueKey, resultAt);
+  if (valueAt < 0
+    || !matchesAt(keep.sourceBytes, quoted, valueAt + valueKey.length)) {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the archived envelope does not hold its result value as the bytes it names' };
+  }
+  return {
+    status: 'text',
+    archived: {
+      sourceText: result['value'],
+      region: { start: valueAt + valueKey.length + 1,
+        end: valueAt + valueKey.length + quoted.length - 1 },
+      decode: fragment => JSON.parse(`"${strictDecoder.decode(fragment)}"`) as string,
+    },
+  };
+}
+
+/**
+ * The kept lines one partial keep's archive names, as text, or the named
+ * refusal. Every piece is checked before it is copied into the request: the
+ * kept and dropped fragments must each be whole lines of the unit's text, in
+ * order, and together they must be that text exactly.
+ */
+function partialKeepText(keep: OpencodePartialKeep): PartialKeepText {
+  const archived = archivedTextOf(keep);
+  if (archived.status === 'refused') return archived;
+  if (archived.status === 'text') return assemblePartialText(keep, archived.archived);
+  let text: string;
+  try {
+    text = strictDecoder.decode(keep.sourceBytes);
+  } catch {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the archived body is not UTF-8 text' };
+  }
+  return assemblePartialText(keep, {
+    sourceText: text,
+    region: { start: 0, end: keep.sourceBytes.length },
+    decode: bytes => strictDecoder.decode(bytes),
+  });
+}
+
+function assemblePartialText(keep: OpencodePartialKeep, archived: ArchivedText): PartialKeepText {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const range of keep.keptRanges) {
+    const piece = regionPiece(range, archived.region);
+    if (piece === 'straddle') {
+      return { status: 'refused', code: 'partial-keep-unrepresentable',
+        detail: 'a kept range straddles the archived text region' };
+    }
+    if (piece === null) continue;
+    const text = fragmentText(keep.sourceBytes.slice(piece.start, piece.end), archived.decode);
+    if (text === null) {
+      return { status: 'refused', code: 'partial-keep-unrepresentable',
+        detail: 'a kept fragment is not text this host can carry' };
+    }
+    kept.push(text);
+  }
+  for (const range of keep.removedRanges) {
+    const piece = regionPiece(range, archived.region);
+    if (piece === 'straddle') {
+      return { status: 'refused', code: 'partial-keep-unrepresentable',
+        detail: 'a dropped range straddles the archived text region' };
+    }
+    if (piece === null) continue;
+    const text = fragmentText(keep.sourceBytes.slice(piece.start, piece.end), archived.decode);
+    if (text === null) {
+      return { status: 'refused', code: 'partial-keep-unrepresentable',
+        detail: 'a dropped fragment is not text this host can carry' };
+    }
+    dropped.push(text);
+  }
+  const keptText = kept.join('');
+  const droppedText = dropped.join('');
+  if (keptText.length === 0) {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the kept ranges name no text of the unit' };
+  }
+  if (!wholeLinePartition(archived.sourceText, keptText, droppedText)) {
+    return { status: 'refused', code: 'partial-keep-unrepresentable',
+      detail: 'the kept and dropped fragments are not whole lines of the unit text' };
+  }
+  return { status: 'ok', text: keptText, sourceText: archived.sourceText };
+}
+
+/**
+ * True when the array's unit already carries exactly this partial keep's kept
+ * lines. A partial keep leaves the unit standing on purpose, so this is how the
+ * identity run tells "the rewrite is in effect" from "the host rebuilt the full
+ * result and the receipt now contradicts it".
+ */
+function carriesKeptLines(
+  messages: readonly OpencodeMessage[], location: NodeLocation | undefined,
+  keep: OpencodePartialKeep,
+): boolean {
+  const site = location?.kind === 'unit' && location.parts.length === 2
+    ? location.parts[1] : undefined;
+  if (site === undefined) return false;
+  const part = messages[site.entryIndex]?.content[site.partIndex];
+  if (!isToolResultPart(part)) return false;
+  const payload = opencodeTextPayload(part);
+  const kept = partialKeepText(keep);
+  return payload !== null && kept.status === 'ok' && payload.text === kept.text;
 }
 
 /** One live tool result as the retention rules read it. */
@@ -1329,6 +1861,15 @@ export function deriveOpencodeRevert(
   const currentIds = locations.map(location => location.nodeId);
   const locationByNode = new Map(locations.map(location => [location.nodeId, location] as const));
 
+  // A `keeplines` verdict's archive names only the bytes it gives up. Those are
+  // the unit's dropped lines; their complement inside the archived body is the
+  // kept lines, which the derivation re-emits inside the typed result part. A
+  // malformed archive refuses the plan here, before any receipt is rendered.
+  const partialKeeps = opencodePartialKeeps(application.archives);
+  if (partialKeeps.status === 'invalid') {
+    return refuse('unsupported', partialKeeps.code, partialKeeps.detail);
+  }
+
   // The receipts the plan ships, verified before anything is built.
   const records = new Map(application.appendRecords.map(record => [record.recordId, record]));
   const restorations = restorationsIn(messages, sessionId);
@@ -1410,6 +1951,14 @@ export function deriveOpencodeRevert(
   // carries one marker per append. Every receipt present and every replaced host
   // node already gone is the identity run — the array is its own result, so it is
   // returned as it stands and nothing is appended twice.
+  //
+  // **Identity first.** This block runs before the revision match and before the
+  // archive-node check below, so a replay of this intent over its own output
+  // stages even when one of its archives names a node the array no longer holds.
+  // The array is already the plan's result and nothing is applied to return it;
+  // archive bytes may still be read for the identity check itself (a partial
+  // replay decodes the archived body to see whether the kept lines are in
+  // effect). The later checks guard a fresh application, not a replay.
   {
     const expected = revert.appends.map((_append, n) => opencodeReceiptEntryId(intent.intentId, n));
     const present = expected.filter(id =>
@@ -1449,7 +1998,20 @@ export function deriveOpencodeRevert(
         }
         forgottenIds.push(forgottenId);
       }
-      const stillThere = forgottenIds.filter(id => currentIds.includes(id));
+      /**
+       * True when this forgotten node's removal no longer holds in the array:
+       * the node is readable again, and either it is a whole-unit removal (so
+       * its bytes being back contradicts the receipt) or a partial keep whose
+       * result no longer carries the kept lines. A partial keep's unit is
+       * SUPPOSED to stay: only a rebuilt full result contradicts its receipt.
+       */
+      const contradicted = (forgottenId: string): boolean => {
+        if (!currentIds.includes(forgottenId)) return false;
+        const partial = partialKeeps.keeps.get(forgottenId);
+        if (partial === undefined) return true;
+        return !carriesKeptLines(messages, locationByNode.get(forgottenId), partial);
+      };
+      const stillThere = forgottenIds.filter(contradicted);
       if (stillThere.length > 0) {
         // The array carries this intent's receipts while the content they say
         // was not retained is readable in the same request. The receipt line is
@@ -1457,10 +2019,15 @@ export function deriveOpencodeRevert(
         // every receipt whose forgotten node is back is dropped, and the rest of
         // the array keeps every byte. The port stages this cleanup and answers
         // `not-applied`, so nothing claims the removal succeeded.
+        //
+        // **A partial keep's valid receipt is never dropped.** Its unit stays by
+        // design, so the same predicate decides both lists: a mixed plan (one
+        // rebuilt whole-unit removal beside a partial keep) drops only the
+        // receipt whose content actually came back.
         const stale = new Set<string>();
         expected.forEach((id, n) => {
           const forgotten = forgottenIds[n];
-          if (forgotten !== undefined && currentIds.includes(forgotten)) stale.add(id);
+          if (forgotten !== undefined && contradicted(forgotten)) stale.add(id);
         });
         const cleaned = messages.filter((message) => {
           const recordId = recordIdOf(message);
@@ -1496,6 +2063,20 @@ export function deriveOpencodeRevert(
   if (revision !== revert.baseRevision) {
     return refuse('stale-revision', 'stale-revision',
       `the array is at ${revision}, the plan was approved against ${revert.baseRevision}`);
+  }
+  // An archive names a node this request carries. A foreign node means the
+  // application and the array disagree, so no part of it is applied. This runs
+  // after the revision match: a stale array is `stale-revision` (a retry, not a
+  // defect), while a matching revision with a foreign archive is a bad plan.
+  //
+  // It also runs after the idempotency block, which is the plan's identity-first
+  // rule: a replay of this intent over its own output stages above, before this
+  // check is reached, so a foreign archive never overrides an identity run.
+  for (const nodeId of partialKeeps.archived) {
+    if (!currentIds.includes(nodeId)) {
+      return refuse('unsupported', 'partial-keep-unusable',
+        `a verdict archive names ${nodeId}, which this array does not hold`);
+    }
   }
 
   const cut = revert.cutIndex;
@@ -1538,6 +2119,14 @@ export function deriveOpencodeRevert(
     parts.add(partIndex);
     removedParts.set(entryIndex, parts);
   };
+  /**
+   * The parts a partial `keeplines` rewrites instead of removing, keyed by the
+   * input message they sit in. Only a unit's result part ever lands here; its
+   * call part is what keeps the provider pair intact.
+   */
+  const replacedParts = new Map<number, Map<number, OpencodeToolResultPart>>();
+  /** The exact kept-lines text each partial keep renders, by node id. */
+  const keptTexts = new Map<NodeId, string>();
   // ISSUE-259: the retention rules read the request's own live results. Every
   // lane — the at-rest rules and the ask — passes through this derivation, so a
   // plan that would take the recall answer or a contained result is refused
@@ -1610,6 +2199,56 @@ export function deriveOpencodeRevert(
                 + `the live result ${String(retention.containedInNodeId)}`);
       }
     }
+    const partialKeep = partialKeeps.keeps.get(id);
+    if (partialKeep !== undefined) {
+      // A partial `keeplines`: the unit's call and result parts both stay, and
+      // the result part carries only the kept lines. The archive and receipt
+      // still name the dropped lines and the recall id that restores them.
+      //
+      // The retention rules ran just above, so on the first-offer lane an error
+      // result refuses `error-result-retained` before this text check is
+      // reached: a failure statement keeps its exact shape, not only its text.
+      const receiptRecall = recallByForgotten.get(id) ?? null;
+      if (receiptRecall !== null && receiptRecall !== partialKeep.recallId) {
+        return refuse('unsupported', 'partial-keep-unusable',
+          `the receipt for ${id} names ${receiptRecall}, not the archive's recall `
+            + `${partialKeep.recallId}`);
+      }
+      const resultSite = location.kind === 'unit' && location.parts.length === 2
+        ? location.parts[1] : undefined;
+      const resultPart = resultSite === undefined
+        ? undefined : messages[resultSite.entryIndex]?.content[resultSite.partIndex];
+      if (resultSite === undefined || !isToolResultPart(resultPart)) {
+        return refuse('unsupported', 'unknown-part-shape',
+          `${id} does not name a tool-result part a partial keep could rewrite`);
+      }
+      const payload = opencodeTextPayload(resultPart);
+      if (payload === null) {
+        return refuse('unsupported', 'partial-keep-non-text',
+          `the plan would keep lines of ${id}, whose result is not text this host can carry; `
+            + 'the unit keeps whole');
+      }
+      // The kept lines come out of the archive, never out of the model's answer:
+      // the archive's dropped ranges split the unit's own text, and the kept
+      // lines are the complement. A body that is not the result text this part
+      // carries means the archive and the live result disagree, so the plan is
+      // refused rather than shipping invented bytes.
+      const kept = partialKeepText(partialKeep);
+      if (kept.status === 'refused') {
+        return refuse('unsupported', kept.code, `${id}: ${kept.detail}; the unit keeps whole`);
+      }
+      if (kept.sourceText !== payload.text) {
+        return refuse('unsupported', 'partial-keep-unrepresentable',
+          `the archive of ${id} describes other text than its live result, so the kept lines `
+            + 'cannot be re-emitted; the unit keeps whole');
+      }
+      const parts = replacedParts.get(resultSite.entryIndex) ?? new Map<number, OpencodeToolResultPart>();
+      parts.set(resultSite.partIndex, withResultText(resultPart,
+        { text: kept.text, encoding: payload.encoding }));
+      replacedParts.set(resultSite.entryIndex, parts);
+      keptTexts.set(id, kept.text);
+      continue;
+    }
     for (const part of location.parts) removePart(part.entryIndex, part.partIndex);
   }
 
@@ -1620,12 +2259,16 @@ export function deriveOpencodeRevert(
     const message = messages[entryIndex];
     if (message === undefined) continue; // unreachable: index < messages.length
     const removed = removedParts.get(entryIndex);
-    if (removed === undefined) {
+    const replaced = replacedParts.get(entryIndex);
+    if (removed === undefined && replaced === undefined) {
       slotOfInputEntry.set(entryIndex, { index: output.length, side: 'after' });
       output.push(message);
       continue;
     }
-    const kept = message.content.filter((_part, partIndex) => !removed.has(partIndex));
+    const content = message.content.map((part, partIndex) => replaced?.get(partIndex) ?? part);
+    const kept = removed === undefined
+      ? content
+      : content.filter((_part, partIndex) => !removed.has(partIndex));
     if (kept.length === 0) {
       slotOfInputEntry.set(entryIndex, { index: output.length, side: 'before' });
       continue;
@@ -1807,9 +2450,10 @@ export function deriveOpencodeRevert(
 
   // The result must project back to exactly the claim the plan made: the host
   // messages before the cut untouched, every surviving host node kept, the
-  // forgotten nodes gone and one receipt per append. A declaration stand-in may
-  // have vanished with the last call it declared — it never owned a host byte —
-  // but a host part or unit may not.
+  // forgotten nodes gone (a partial keep's unit stays, carrying only its kept
+  // lines) and one receipt per append. A declaration stand-in may have vanished
+  // with the last call it declared — it never owned a host byte — but a host
+  // part or unit may not.
   let derivedLocations: readonly NodeLocation[];
   try {
     derivedLocations = projectEntries(derived, sessionId);
@@ -1828,7 +2472,7 @@ export function deriveOpencodeRevert(
   for (let entryIndex = 0; entryIndex < cutEntryIndex; entryIndex += 1) {
     const message = messages[entryIndex];
     if (message === undefined) continue; // unreachable: index < messages.length
-    if (removedParts.has(entryIndex)) {
+    if (removedParts.has(entryIndex) || replacedParts.has(entryIndex)) {
       return refuse('unsupported', 'system-head',
         `the plan would drop or rebuild message ${String(entryIndex)}, which lies in the prefix`);
     }
@@ -1839,8 +2483,23 @@ export function deriveOpencodeRevert(
     cursor += 1;
   }
   for (const id of forgotten) {
-    if (derivedSet.has(id)) {
-      return refuse('host-error', 'node-missing', `the derived array still holds ${id}`);
+    const keptText = keptTexts.get(id);
+    if (keptText === undefined) {
+      if (derivedSet.has(id)) {
+        return refuse('host-error', 'node-missing', `the derived array still holds ${id}`);
+      }
+      continue;
+    }
+    // A partial keep's unit must still be there, and its result part must carry
+    // exactly the lines the verdict kept — never the full body.
+    const derivedLocation = derivedLocations.find(location => location.nodeId === id);
+    const site = derivedLocation?.kind === 'unit' && derivedLocation.parts.length === 2
+      ? derivedLocation.parts[1] : undefined;
+    const part = site === undefined ? undefined : derived[site.entryIndex]?.content[site.partIndex];
+    const payload = isToolResultPart(part) ? opencodeTextPayload(part) : null;
+    if (payload === null || payload.text !== keptText) {
+      return refuse('host-error', 'node-missing',
+        `the derived array does not carry the kept lines of ${id}`);
     }
   }
   /**

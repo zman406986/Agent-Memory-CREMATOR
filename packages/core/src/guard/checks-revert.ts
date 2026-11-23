@@ -1,5 +1,5 @@
 import type { RevertAppend, RevertNodeAppend, RevertPlan } from "../revert/types.js";
-import { revertCost } from "../revert/cost.js";
+import { freedBytesOf, revertCost } from "../revert/cost.js";
 import type { TranscriptNode } from "../types/transcript.js";
 import type { UnitId } from "../types/identity.js";
 import type { Candidate } from "./candidate.js";
@@ -22,6 +22,8 @@ interface ForgottenUnit {
   readonly index: number;
   readonly unitId: UnitId;
   readonly receipt: RenderedRecord;
+  /** The bytes the removal drops; the rest of the node stays in the request. */
+  readonly freedBytes: number;
 }
 
 /**
@@ -95,10 +97,11 @@ export function checkRevertApplication(c: CheckContext, candidate: Candidate): v
 }
 
 /**
- * Maps each reverted node index to its unit and rendered receipt. The verdict
- * and proof plans are the only sources of removals on such an event;
- * `checkVerdicts` and `checkProofs` have already proven each removal is exactly
- * one unit's span.
+ * Maps each reverted node index to its unit, rendered receipt and freed bytes.
+ * The verdict and proof plans are the only sources of removals on such an
+ * event; `checkVerdicts` and `checkProofs` have already proven each removal
+ * names exactly one unit and only ranges that answer gives up — the whole span
+ * for `forgetall`, the dropped lines for a partial keep.
  *
  * The candidate renames a note id to its rendered record id, so the lookup key
  * is that derived id, never the plan's own note id.
@@ -124,7 +127,8 @@ function forgottenUnits(
         nodes[index]?.id ?? null);
       return null;
     }
-    result.set(index, { index, unitId: op.unitId, receipt });
+    result.set(index, { index, unitId: op.unitId, receipt,
+      freedBytes: freedBytesOf(source.ranges) });
   }
   return result;
 }
@@ -201,9 +205,15 @@ function checkPerNode(
 }
 
 /**
- * The §2 arithmetic, recomputed from the snapshot and the rendered receipts.
- * The plan's own numbers must match it field for field; a hand-edited cost
- * would otherwise let a host apply a cut the planner never chose.
+ * The §2 arithmetic, recomputed from the snapshot, the plans' removal ranges and
+ * the rendered receipts. The plan's own numbers must match it field for field; a
+ * hand-edited cost would otherwise let a host apply a cut the planner never
+ * chose.
+ *
+ * A forgotten unit frees only the bytes its removal drops: the plan's ranges are
+ * what the guard re-derives, so a partial keep frees its dropped ranges and the
+ * remainder of the node is priced as kept (ISSUE-509). A whole-node removal
+ * frees the whole node and the result is unchanged.
  *
  * The chooser's `freed >= minCutFreedBytes` and `net > 0` filters are **not**
  * re-applied: they select a cut for the full revisit, while a per-unit verdict
@@ -239,7 +249,11 @@ function checkCost(
     report("invalid-plan", "A revert cost must describe the plan's own cut");
   }
   const computed = revertCost({
-    nodes: nodes.map(node => ({ id: node.id, nodeId: node.id, byteLength: node.bytes.length })),
+    nodes: nodes.map((node, index) => {
+      const unit = forgotten.get(index);
+      return { id: node.id, nodeId: node.id, byteLength: node.bytes.length,
+        ...(unit === undefined ? {} : { freedByteLength: unit.freedBytes }) };
+    }),
     forgotten: new Set(forgotten.keys()),
     cutIndex: plan.cutIndex,
     receiptBytes: index => forgotten.get(index)?.receipt.bytes.length ?? 0,

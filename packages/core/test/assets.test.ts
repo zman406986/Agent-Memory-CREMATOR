@@ -629,7 +629,7 @@ test("a mixed answer is refused by name on both lanes, with the F grammar in pla
   } catch (error) {
     assert.ok(error instanceof WireVerdictError, `expected WireVerdictError, got ${String(error)}`);
     assert.equal(error.code, "mixed-keys");
-    assert.equal(error.message.includes("exactly one top-level key"), true);
+    assert.equal(error.message.includes("exactly one action key"), true);
   }
   try {
     parseEntryAnswer(JSON.stringify(mixed));
@@ -845,7 +845,7 @@ test("every jsonl-20-nokeepall example parses through the real reader, with no k
     if (lane.endsWith("prompt")) {
       assert.equal(prompt.includes(KEEP_WHOLE_RULE), true, `${lane}: the shared rule is missing`);
     }
-    assert.equal(prompt.includes('"summary":"None"'), true, `${lane}: the None spelling is missing`);
+    assert.equal(prompt.includes('"forgotten":"None"'), true, `${lane}: the None spelling is missing`);
     assert.equal(prompt.includes("[[1,120]]"), false,
       `${lane}: a fixed whole-range literal is back`);
     const examples = exampleLines(prompt);

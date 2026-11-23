@@ -41,6 +41,11 @@ export {
 export type {
   DshRecallOutput, DshRecallPart, DshToolHost, DshToolRegistration, DshToolSources,
 } from './tools.js';
+// The bulk reply's refusal map (ISSUE-508): the `jsonl-20` line reader's finer
+// codes mapped onto the closed vocabulary the pass counts. Exported so a replay
+// or rig reads a bulk reply with the product's own table instead of a copy; the
+// finer code still rides as the row's `detail`.
+export { BULK_CODE_OF } from './judge-tables.js';
 // The manual forget tool (ISSUE-045 chunk D2): argument mapping, the
 // snapshot-side decision and the answer projection. Exported so a rig can drive
 // each leg without a live mount.

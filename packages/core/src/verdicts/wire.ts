@@ -1,4 +1,5 @@
 import type { UnitId } from "../types/identity.js";
+import { normalizeActionKey } from "./action-keys.js";
 import { descriptorIssue, RECEIPT_DESCRIPTOR_WORD_LIMIT } from "./labels.js";
 import { normalizeKeptSpans } from "./plan.js";
 import type { KeptLineSpan, Verdict } from "./types.js";
@@ -50,6 +51,7 @@ export type WireVerdictErrorCode =
   | "invalid-stamp"
   | "not-an-object"
   | "mixed-keys"
+  | "both-forgotten-and-summary"
   | "unknown-action"
   | "invalid-keepall"
   | "invalid-keeplines"
@@ -81,16 +83,17 @@ export class WireVerdictError extends Error {
 const MESSAGES: Readonly<Record<WireVerdictErrorCode, string>> = {
   "invalid-stamp": "The stamp carries a non-empty unit id and a safe integer round.",
   "not-an-object": "A wire verdict is a JSON object.",
-  "mixed-keys": "A wire verdict carries exactly one top-level key: the action.",
+  "mixed-keys": "A wire verdict carries exactly one action key, and a partial one may add one forgotten value.",
+  "both-forgotten-and-summary": "A wire verdict carries forgotten or its legacy alias summary, never both.",
   "unknown-action": `The wire action is not one of ${WIRE_ACTIONS.join(", ")}.`,
   "invalid-keepall": "keepall carries the boolean true and nothing else.",
-  "invalid-keeplines": "keeplines carries an array of [start,end] pairs and a trailing summary string.",
-  "invalid-forgetlines": "forgetlines carries an array of [start,end] pairs and a trailing summary string.",
+  "invalid-keeplines": "keeplines carries an array of [start,end] pairs and a trailing forgotten string.",
+  "invalid-forgetlines": "forgetlines carries an array of [start,end] pairs and a trailing forgotten string.",
   "invalid-span": "Every span is a [start,end] pair of integers with 1 <= start <= end.",
   "empty-ranges": "keeplines names at least one [start,end] pair.",
-  "summary-missing": "The last element of a keeplines array is one summary string.",
-  "summary-too-long": `A summary stays within ${String(RECEIPT_DESCRIPTOR_WORD_LIMIT)} words.`,
-  "invalid-forgetall": "forgetall carries its summary string as the value.",
+  "summary-missing": "A partial verdict carries one forgotten value: a trailing string or a sibling forgotten key (legacy summary accepted).",
+  "summary-too-long": `A forgotten value stays within ${String(RECEIPT_DESCRIPTOR_WORD_LIMIT)} words.`,
+  "invalid-forgetall": "forgetall carries its forgotten string as the value.",
 };
 
 function refuse(code: WireVerdictErrorCode): never {
@@ -159,22 +162,36 @@ export function parseWireVerdict(value: unknown, stamp: WireStamp): WireAnswer {
   }
   const record = answer as Record<string, unknown>;
   const keys = Object.keys(record);
-  if (keys.length !== 1) refuse("mixed-keys");
-  const action = keys[0];
-  if (action === undefined) refuse("mixed-keys");
-  if (!WIRE_ACTIONS.includes(action)) refuse("unknown-action");
-  const payload = record[action];
+  if (keys.length > 3) refuse("mixed-keys");
+  const actionKeys = keys.filter(key => normalizeActionKey(key) !== null);
+  if (actionKeys.length > 1) refuse("mixed-keys");
+  // A lone key that names no action is `unknown-action`, as it always was; the
+  // descriptor keys never stand alone.
+  if (actionKeys.length === 0 && keys.length !== 1) refuse("mixed-keys");
+  const rawAction = actionKeys[0] ?? keys[0];
+  if (rawAction === undefined) refuse("mixed-keys");
+  // The key is read case- and plural-insensitively (ISSUE-515); the payload is
+  // still read from the key's own raw spelling. Everything else is unchanged.
+  const action = normalizeActionKey(rawAction);
+  if (action === null || !WIRE_ACTIONS.includes(action)) refuse("unknown-action");
+  const extras = keys.filter(key => key !== rawAction);
+  if (extras.some(key => key !== "forgotten" && key !== "summary")) refuse("mixed-keys");
+  if (extras.length > 1) refuse("both-forgotten-and-summary");
+  const partial = action === "keeplines" || action === "forgetlines";
+  if (extras.length > 0 && !partial) refuse("mixed-keys");
+  const flat = readFlatDescriptor(record);
+  const payload = record[rawAction];
   const base = { unitId: stamp.unitId, answeredInRound: stamp.answeredInRound };
   switch (action) {
     case "keepall":
       if (payload !== true) refuse("invalid-keepall");
       return { verdict: { ...base, action: "keepall" } };
     case "keeplines": {
-      const { ranges, summary } = readKeptLines(payload);
+      const { ranges, summary } = readKeptLines(payload, flat);
       return { verdict: { ...base, action: "keeplines", ranges }, keeplinesSummary: summary };
     }
     case "forgetlines": {
-      const { ranges, summary } = readForgottenLines(payload);
+      const { ranges, summary } = readForgottenLines(payload, flat);
       return { verdict: { ...base, action: "forgetlines", ranges }, forgetlinesSummary: summary };
     }
     case "forgetall":
@@ -190,17 +207,21 @@ export function parseWireVerdict(value: unknown, stamp: WireStamp): WireAnswer {
 }
 
 /**
- * The kept spans a `keeplines` payload names, normalised, plus its trailer
- * summary. The payload is one array: zero or more `[start,end]` pairs and,
- * last, the summary string.
+ * The kept spans a `keeplines` payload names, normalised, plus its descriptor.
+ * The payload is one array: zero or more `[start,end]` pairs and, last, the
+ * forgotten string. A sibling `forgotten` key (legacy `summary`) may replace
+ * the trailer; the array then holds pairs only.
  */
 function readKeptLines(
   payload: unknown,
+  flat: FlatDescriptor,
 ): { readonly ranges: readonly KeptLineSpan[]; readonly summary: string } {
   if (!Array.isArray(payload) || payload.length === 0) refuse("invalid-keeplines");
   const last = payload[payload.length - 1];
-  if (typeof last !== "string") refuse("summary-missing");
-  const pairs = payload.slice(0, -1);
+  const trailer = typeof last === "string";
+  if (trailer && flat.present) refuse("mixed-keys");
+  if (!trailer && !flat.present) refuse("summary-missing");
+  const pairs = trailer ? payload.slice(0, -1) : payload;
   if (pairs.length === 0) refuse("empty-ranges");
   const spans: KeptLineSpan[] = [];
   for (const pair of pairs) {
@@ -213,24 +234,27 @@ function readKeptLines(
   }
   const normalized = normalizeKeptSpans(spans);
   if (normalized === null || normalized.length === 0) refuse("invalid-span");
-  const summary = readSummary(last, "summary-missing");
+  const summary = readSummary(trailer ? last : flat.value, "summary-missing");
   return { ranges: normalized, summary };
 }
 
 /**
  * The spans a `forgetlines` payload names — the lines that LEAVE the unit —
- * normalised, plus its trailer summary. Same array shape and same rules as
+ * normalised, plus its descriptor. Same array shape and same rules as
  * `readKeptLines`, with the action's own refusal name and the opposite polar
  * meaning (ADR-0026 §2). The guard decides whether the spans land inside the
  * unit; this reader never sees the unit.
  */
 function readForgottenLines(
   payload: unknown,
+  flat: FlatDescriptor,
 ): { readonly ranges: readonly KeptLineSpan[]; readonly summary: string } {
   if (!Array.isArray(payload) || payload.length === 0) refuse("invalid-forgetlines");
   const last = payload[payload.length - 1];
-  if (typeof last !== "string") refuse("summary-missing");
-  const pairs = payload.slice(0, -1);
+  const trailer = typeof last === "string";
+  if (trailer && flat.present) refuse("mixed-keys");
+  if (!trailer && !flat.present) refuse("summary-missing");
+  const pairs = trailer ? payload.slice(0, -1) : payload;
   if (pairs.length === 0) refuse("empty-ranges");
   const spans: KeptLineSpan[] = [];
   for (const pair of pairs) {
@@ -243,8 +267,27 @@ function readForgottenLines(
   }
   const normalized = normalizeKeptSpans(spans);
   if (normalized === null || normalized.length === 0) refuse("invalid-span");
-  const summary = readSummary(last, "summary-missing");
+  const summary = readSummary(trailer ? last : flat.value, "summary-missing");
   return { ranges: normalized, summary };
+}
+
+/** A partial verdict's sibling descriptor: whether it exists, and what it holds. */
+interface FlatDescriptor {
+  readonly present: boolean;
+  readonly value: unknown;
+}
+
+/**
+ * The sibling descriptor's value: `forgotten` is canonical and `summary` the
+ * legacy alias. A record carrying both is refused before this is read.
+ */
+function readFlatDescriptor(record: Record<string, unknown>): FlatDescriptor {
+  const canonical = Object.hasOwn(record, "forgotten");
+  const legacy = Object.hasOwn(record, "summary");
+  return {
+    present: canonical || legacy,
+    value: canonical ? record.forgotten : record.summary,
+  };
 }
 
 /** One summary string under the 25-word cap; returned so the caller decides its home. */

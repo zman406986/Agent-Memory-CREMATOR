@@ -143,7 +143,12 @@ test('ISSUE-445 / ISSUE-465: an in-mount eviction and reopen keeps the install b
   const mount = createOpencodeMount({
     storage: { crematorStorageRoot: join(dir, 'store') },
     askGrammar: 'prune-two-option',
-    askGenerate: async input => { asks += 1; askPrompts.push(input.prompt); return { text: '{}' }; },
+    askGenerate: async input => {
+      asks += 1;
+      askPrompts.push(input.prompt);
+      // A whole-range keep: the ask fires and removes nothing.
+      return { text: '{"1":{"keeplines":[[1,1]],"summary":"None"}}' };
+    },
     journal: record => { lines.records.push(record as unknown as Record<string, unknown>); },
   });
   try {

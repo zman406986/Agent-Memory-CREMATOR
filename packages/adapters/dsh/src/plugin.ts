@@ -63,9 +63,9 @@ import type { RecordOnlyPruneOutcome } from './prune.js';
 import { createCremateCommand } from './cremate-command.js';
 import type { DshCommandRegistry } from './cremate-command.js';
 import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
-  readPruneRound, readPruneTriggerState,
+  readPruneRound, readPruneTriggerState, readTableAskFired,
   writeEntryAskFired, writePendingAppends,
-  writePruneRound } from './prune-round-store.js';
+  writePruneRound, writeTableAskFired } from './prune-round-store.js';
 import type { DurableAppendRecord } from './prune-round-store.js';
 import { MOUNT_STATE_FILE, readDurableReceipts, readInstall, readPendingForgets,
   removeDurableReceipt, writeDurableReceipt, writeInstall,
@@ -711,6 +711,16 @@ export interface RacoonsSessionEntry {
    * it does for the batch carry.
    */
   entryAskFired: boolean;
+  /**
+   * Whether this session's depth table has already left a table ask
+   * (ISSUE-508). The session's first table ask states the 70 percent keep
+   * share; every later one states 40 percent. The flag moves only when a table
+   * request actually left the seam and came back answered or refused after the
+   * send — never on a refused append, a refused-before-send or a throw. It is
+   * persisted beside the round and the entry flag, so a restart's first table
+   * ask states the later share.
+   */
+  tableAskFired: boolean;
   /**
    * The held results a later batch fire must Ask about, keyed by the capture's
    * event id: the capture, its landing node and the unit minted then
@@ -2181,6 +2191,7 @@ export function createRacoonsMount(options: {
         readonly round: number;
         readonly trigger: PruneWindowTriggerState | null;
         readonly entryAskFired: boolean;
+        readonly tableAskFired: boolean;
       }
       let forkFacts: ForkFactsSnapshot | null = null;
       const captureForkFacts = (): ForkFactsSnapshot => ({
@@ -2189,16 +2200,17 @@ export function createRacoonsMount(options: {
         round: readPruneRound(durable, journal, sessionId),
         trigger: readPruneTriggerState(durable, journal, sessionId),
         entryAskFired: readEntryAskFired(durable, journal, sessionId),
+        tableAskFired: readTableAskFired(durable, journal, sessionId),
       });
       // The header facts are value-shaped, so "the parent's" cannot be told from
       // "the child's" by reading the file after the child has written. The
       // owed state is therefore carried across calls: a fact the mount-time
       // clear already reconciled is never attempted again (ISSUE-475).
-      let owedHeader: { round: boolean; askFired: boolean } | null = null;
+      let owedHeader: { round: boolean; askFired: boolean; tableAskFired: boolean } | null = null;
       const clearForkFacts = (): boolean => {
         const facts = forkFacts ??= captureForkFacts();
         owedHeader ??= { round: facts.round > 0 || facts.trigger !== null,
-          askFired: facts.entryAskFired };
+          askFired: facts.entryAskFired, tableAskFired: facts.tableAskFired };
         // Forgets: remove only the records the mount-time snapshot holds.
         const currentForgets = readPendingForgets(durable, journal, sessionId);
         const parentForgetIds = new Set(facts.forgets.map(record => record.eventId));
@@ -2261,11 +2273,28 @@ export function createRacoonsMount(options: {
             askLeft = true;
           }
         }
-        if (droppedForgets > 0 || droppedAppends > 0 || droppedRound || droppedAsk) {
+        // ISSUE-508: the depth table's first-ask flag is the parent's history
+        // too, cleared by the same rule as the entry flag.
+        let droppedTableAsk = false;
+        let tableAskLeft = false;
+        if (owedHeader.tableAskFired) {
+          const currentTableAskFired = readTableAskFired(durable, journal, sessionId);
+          if (!currentTableAskFired) {
+            owedHeader.tableAskFired = false;
+          } else if (writeTableAskFired(durable, false, journal, sessionId)) {
+            droppedTableAsk = true;
+            owedHeader.tableAskFired = false;
+          } else {
+            tableAskLeft = true;
+          }
+        }
+        if (droppedForgets > 0 || droppedAppends > 0 || droppedRound || droppedAsk
+          || droppedTableAsk) {
           journal('fork-state-dropped', { sessionId, parentSessionId: forkFrom,
             forgets: droppedForgets, appends: droppedAppends,
             ...(droppedRound ? { round: facts.round, latch: facts.trigger !== null } : {}),
-            ...(droppedAsk ? { entryAskFired: true } : {}) });
+            ...(droppedAsk ? { entryAskFired: true } : {}),
+            ...(droppedTableAsk ? { tableAskFired: true } : {}) });
         }
         if (forgetsLeft > 0) {
           journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
@@ -2283,8 +2312,12 @@ export function createRacoonsMount(options: {
           journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
             file: PRUNE_ROUND_FILE, fact: 'entryAskFired', count: 1 });
         }
+        if (tableAskLeft) {
+          journal('fork-clear-failed', { sessionId, parentSessionId: forkFrom,
+            file: PRUNE_ROUND_FILE, fact: 'tableAskFired', count: 1 });
+        }
         return forgetsLeft === 0 && appendsLeft === 0
-          && roundLeft === 0 && !askLeft;
+          && roundLeft === 0 && !askLeft && !tableAskLeft;
       };
       const surfaceToolIds = host === undefined ? []
         : surfaceTranscript(host, { sessionId }).items
@@ -2463,6 +2496,10 @@ export function createRacoonsMount(options: {
       entryBatch: { pending: [] }, entryLandedBytes: 0,
       entryAskFired: durable === null || forked
         ? false : readEntryAskFired(durable, journal, sessionId),
+      // ISSUE-508: the depth table's first-ask flag rides the same file. A
+      // restart keeps the later 40 percent share; a fork starts false.
+      tableAskFired: durable === null || forked
+        ? false : readTableAskFired(durable, journal, sessionId),
       entryBatchUnit: new Map(),
       resumeRecovery: durable === null
         || (forked
@@ -3886,6 +3923,19 @@ export function createRacoonsMount(options: {
           // ISSUE-221: the bulk ask's grammar, resolved from the row; absent is
           // `3option`, the shipped contract byte for byte.
           grammar: config.pruneAskGrammar,
+          // ISSUE-508: the session's first depth table states the 70 percent
+          // share line; every later one 40. The flag moves only when a table ask
+          // actually left the seam, and is persisted beside the round so a
+          // restart's first table ask states the later share.
+          firstTrigger: !entry.tableAskFired,
+          onTableAskLeft: () => {
+            if (entry.tableAskFired) return;
+            entry.tableAskFired = true;
+            const askTarget = targets.get(entry.sessionId);
+            if (askTarget !== undefined) {
+              writeTableAskFired(askTarget, true, journal, entry.sessionId);
+            }
+          },
           ...(options.llm === undefined ? {} : { llm: options.llm }),
           route: () => resolveRoute(entry.host ?? session),
           // The capture main's last sent request (ISSUE-027, ADR-0010): a prune
@@ -5303,10 +5353,10 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         }
       }
 
-      // The host command menu's `/cremate` (ADR-0068). The registered handler
-      // runs the pass directly and awaits it; the typed message keeps the
-      // queued pre-step path. A host without a command registry mounts
-      // unchanged.
+      // The host command menu's `/cremate` (ADR-0068). The handler records the
+      // same request the typed message records, then opens a `/cremate` user
+      // turn so the next pre-step runs the pass. A host without a command
+      // registry mounts unchanged; the typed-message path still works.
       const commands = ctx.commands;
       if (commands !== undefined && typeof commands.register === 'function') {
         const command = createCremateCommand({

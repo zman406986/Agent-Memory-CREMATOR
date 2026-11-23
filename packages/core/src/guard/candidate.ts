@@ -1,6 +1,6 @@
 import { negativeFact, receiptLine } from "../rules/assets.js";
 import type { Note } from "../rules/types.js";
-import { revertCost } from "../revert/cost.js";
+import { freedBytesOf, revertCost } from "../revert/cost.js";
 import type { RevertAppend, RevertNodeAppend, RevertPlan } from "../revert/types.js";
 import type { NodeId, NoteId, UnitId } from "../types/identity.js";
 import type { CheckContext } from "./context.js";
@@ -20,6 +20,8 @@ interface ForgottenReceipt {
   readonly unitId: UnitId;
   readonly nodeId: NodeId;
   readonly record: RenderedRecord;
+  /** The bytes the removal drops; the rest of the node stays in the request. */
+  readonly freedBytes: number;
 }
 
 export interface Candidate {
@@ -125,7 +127,12 @@ export async function buildCandidate(c: CheckContext): Promise<Candidate> {
       // copied from the render: the output check compares two independent
       // derivations, mirroring the seal-append lane (ISSUE-314).
       expectedRecords.set(rendered.recordId, expected);
-      forgotten.set(node.id, { unitId: op.unitId, nodeId: node.id, record: rendered });
+      // A partial keep drops only the ranges its answer gives up; those bytes are
+      // what the unit frees, and the rest of the node stays in the request
+      // (ISSUE-509). A whole-node removal names the whole span, so the sum is the
+      // unit's own length and the cost is exactly what it was before.
+      forgotten.set(node.id, { unitId: op.unitId, nodeId: node.id, record: rendered,
+        freedBytes: freedBytesOf(source.ranges) });
     } else throw new Error("Unsupported operation reached the renderer");
   }
   return { replacements, appendRecords, archives, sealedEpisodeIds, expectedGenerated, expectedRecords,
@@ -178,6 +185,10 @@ function renderProofReceipt(note: Note, recall: RecallRecord): { record: Rendere
  * Each receipt anchors to the survivor before it, and the first one anchors to
  * the prefix tail `nodes[cutIndex - 1]` so no receipt lands before the salvage;
  * only a cut at the transcript head anchors at `null`.
+ *
+ * A forgotten unit frees only the bytes its removal drops, the plan's own
+ * ranges: a `forgetall` names the whole span, while a partial `keeplines` names
+ * the dropped lines and leaves the kept ones in the request (ISSUE-509).
  */
 function planRevert(c: CheckContext, forgotten: ReadonlyMap<NoteId, ForgottenReceipt>): RevertApplication | null {
   if (forgotten.size === 0) return null;
@@ -192,6 +203,7 @@ function planRevert(c: CheckContext, forgotten: ReadonlyMap<NoteId, ForgottenRec
   const forgottenIndices = new Set(ordered.map(item => item.index));
   const cutIndex = ordered[0]?.index ?? 0;
   const byNode = new Map(ordered.map(item => [nodes[item.index]?.id ?? "", item.entry]));
+  const freedByIndex = new Map(ordered.map(item => [item.index, item.entry.freedBytes]));
   const survivors: NodeId[] = [], appends: RevertAppend[] = [], perNode: RevertNodeAppend[] = [];
   let anchor: NodeId | null = cutIndex > 0 ? (nodes[cutIndex - 1]?.id ?? null) : null;
   for (let index = cutIndex; index < nodes.length; index++) {
@@ -203,7 +215,11 @@ function planRevert(c: CheckContext, forgotten: ReadonlyMap<NoteId, ForgottenRec
     perNode.push({ nodeId: node.id, noteId: receipt.record.recordId });
   }
   const cost = revertCost({
-    nodes: nodes.map(node => ({ id: node.id, nodeId: node.id, byteLength: node.bytes.length })),
+    nodes: nodes.map((node, index) => {
+      const freed = freedByIndex.get(index);
+      return { id: node.id, nodeId: node.id, byteLength: node.bytes.length,
+        ...(freed === undefined ? {} : { freedByteLength: freed }) };
+    }),
     forgotten: forgottenIndices,
     cutIndex,
     receiptBytes: index => {

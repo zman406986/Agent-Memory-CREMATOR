@@ -28,7 +28,8 @@ import type { PruneWindowTriggerState } from '@cremator/core';
 
 const ROUTE = { provider: 'p', model: 'm' };
 const KEEPALL = '{"keepall":true}';
-const FORGET_ONE = '{"1":{"forgetall":"an old read"}}';
+// The depth table's reply, in the jsonl-20 line-per-row shape its ask teaches.
+const FORGET_ONE = '{"1":{"forgetall":true,"summary":"an old read"}}';
 const HOST_MAIN = {
   system: 'MAIN SYSTEM BYTES',
   tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }],

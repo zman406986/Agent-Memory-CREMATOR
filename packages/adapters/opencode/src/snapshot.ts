@@ -17,20 +17,20 @@
  *   - assistant `text` / `reasoning` part → one `MessageNode` each, verbatim;
  *   - a `tool-call` part with exactly one matching `tool-result` part → one
  *     `ToolResultNode` positioned at the **call** part, `callId = call.id`, bytes
- *     = the envelope fields `{name, input, result}` serialized
- *     `{"input":…,"name":…,"result":…}` with the call's name and arguments
- *     canonical and the result part left in the host's own JSON key order
- *     (`unitBytes`; FIX 1 of the 1f diagnosis). The field order is pinned by a
- *     test: the bytes every archive and hash reads are `input`, `name`,
- *     `result`. The call id names the node, not the bytes, so identical reads
- *     hash identically. The call and result are one unit even though 2.2.5 puts
- *     them in two content parts (usually two messages);
+ *     = **the result's decoded text** (`unitBytes` → `opencodeUnitText`): the
+ *     exact text the host sends for that result, and the byte space its line
+ *     numbers, its ask anchors and every verdict range address. A unit used to
+ *     carry the `{input,name,result}` envelope, whose JSON-escaped newlines made
+ *     every unit one line and made a partial `keeplines` unaddressable
+ *     (ISSUE-509). The call id names the node, not the bytes, so identical
+ *     result texts hash identically. The call and result are one unit even
+ *     though 2.2.5 puts them in two content parts (usually two messages);
  *   - a `tool-call` part with no result → no node; attached as evidence on the
  *     nearest node. 2.2.5 has no `pending`/`running` state, so "no result yet"
  *     is the only not-finished fact;
  *   - a `tool-result` part whose call is absent → one `ToolResultNode` at its own
- *     position, bytes = `{name, result}` (no call id and no input: no call part
- *     states them). It is projected but a plan naming it is refused
+ *     position, bytes = the same decoded result text (no call id and no input: no
+ *     call part states them). It is projected but a plan naming it is refused
  *     `tool-pair-split`, because its pairing cannot be stated;
  *   - `media`, `effort`, `compaction`, an unknown part type, and a repeated call
  *     id → no node; evidence attached to the nearest node (the repeated call id
@@ -62,13 +62,19 @@
  *     `max(suppliedFact, currentTurn - 1)`, so a stale fact never lowers the
  *     default and a fresh idle raises it.
  *
- * `revision` is `oc:<messageCount>:<digest>`. The digest covers every node id and
- * node hash plus every attached part digest, in emission order, so a body-only
- * update at the same id moves it and the port's stale-revision refusal sees it.
+ * `revision` is `oc:<messageCount>:<digest>`. The digest covers, in emission
+ * order, every node id and node hash and every emitted evidence digest — a part
+ * attached to a node or left unanchored — then, also in emission order, every
+ * unit's declaration digest (the two blocks are concatenated; a declaration is
+ * not interleaved with the node it belongs to). A body-only update at the same
+ * id moves it and the port's stale-revision refusal sees it. A unit's body is
+ * the result text (ISSUE-509), so the declaration is its own digest entry: the
+ * name, namespace, arguments, result tag or a dropped content entry can change
+ * while the body does not.
  */
 
 import {
-  sha256Sync, toBytes,
+  sha256Sync, splitLineOffsets, toBytes,
 } from '@cremator/core';
 import type {
   CacheState, MessageNode, NodeId, PathEvidence, RacoonsRecordNode,
@@ -280,51 +286,155 @@ function buildUnits(messages: readonly OpencodeMessage[]): {
   return { calls, results, units };
 }
 
+/**
+ * The text the host's normalizer substitutes for an empty tool result: its
+ * `EMPTY_TOOL_OUTPUT` constant in `@opencode/ai`'s `dist/tool-history.js`
+ * (line 2, applied at lines 86-94). An empty `text` value, an empty `error`
+ * value, and a `content` array with no surviving entry all become this literal
+ * before the request reaches the wire.
+ */
+const HOST_EMPTY_TOOL_OUTPUT = '(no tool output)';
+
+/**
+ * The exact text one tool result carries, and therefore the bytes of its unit
+ * (ISSUE-509). It mirrors `opencodeResultText` in `apply.ts` tag for tag — the
+ * function the containment rules and the partial-keep lowering already read:
+ *
+ *   - `text`: a string `value` verbatim (an empty one is the host's
+ *     `(no tool output)` rewrite); a non-string is its JSON text;
+ *   - `json`: always its JSON text. **A `json` result is JSON text whatever its
+ *     value's type**: a string value is `"abc"`, not `abc`, because the host
+ *     lowers the `json` tag with `JSON.stringify` (audit F1). Only `text`/`error`
+ *     read a string verbatim;
+ *   - `error`: a string verbatim (empty is the rewrite); a structured value (an
+ *     object or array) is its JSON text; any other value is `String(value)`, the
+ *     host's own split;
+ *   - `content`: its non-empty `text` entries joined with `'\n'`, with the host's
+ *     own emptiness test (no survivor is the same rewrite, and a file-only array
+ *     joins to `''`);
+ *   - anything else: its JSON text.
+ *
+ * This lives here rather than being imported from `apply.ts` because `apply.ts`
+ * already imports this module: the two must not form a cycle. A snapshot test
+ * pins the two decoders equal for every tag, so they cannot drift apart silently.
+ *
+ * **The unit body is this text, not a JSON envelope.** Line counting, the ask
+ * table's `[L line(s)]`, the row anchors and every `keeplines` range are byte
+ * arithmetic over the unit body (`packages/core/src/units/segmenter.ts`,
+ * `packages/core/src/prune/anchor-positions.ts`). An envelope's escaped
+ * newlines made every unit one line and put the anchored byte shares inside
+ * `{"input":…}` (ISSUE-509). The call's name and arguments are not lost: the
+ * call part states them, `toolEvidence` reads them, and the prune's `callFacts`
+ * names the tool and target.
+ */
+export function opencodeUnitText(part: OpencodeToolResultPart): string {
+  const value = part.result.value;
+  if (part.result.type === 'text') {
+    if (typeof value === 'string') {
+      return value === '' ? HOST_EMPTY_TOOL_OUTPUT : value;
+    }
+    return JSON.stringify(value) ?? '';
+  }
+  if (part.result.type === 'json') {
+    // A JSON value is always its JSON text: `'abc'` is `"abc"` on the wire.
+    return JSON.stringify(value) ?? '';
+  }
+  if (part.result.type === 'error') {
+    if (typeof value === 'string') {
+      return value === '' ? HOST_EMPTY_TOOL_OUTPUT : value;
+    }
+    // The host's own split (`archivedResultWireText`): a bare error value is its
+    // string form; an object or array is its JSON text.
+    return isStructuredValue(value) ? JSON.stringify(value) ?? '' : String(value);
+  }
+  if (part.result.type === 'content' && Array.isArray(value)) {
+    // The host's own emptiness test (tool-history.js:92): every entry that is
+    // not a text entry with empty text survives, and no survivor means the
+    // result is rewritten. A file entry survives, so a file-only array is not
+    // this case and keeps the join's empty text.
+    const survives = value.some(entry =>
+      !(isRecord(entry) && entry['type'] === 'text' && entry['text'] === ''));
+    if (!survives) return HOST_EMPTY_TOOL_OUTPUT;
+    const texts: string[] = [];
+    for (const entry of value) {
+      if (isRecord(entry) && entry['type'] === 'text'
+        && typeof entry['text'] === 'string' && entry['text'] !== '') {
+        texts.push(entry['text']);
+      }
+    }
+    return texts.join('\n');
+  }
+  return JSON.stringify(value) ?? '';
+}
+
+/** True for the object/array shapes the host serializes as JSON, never as `String(...)`. */
+function isStructuredValue(value: unknown): boolean {
+  if (Array.isArray(value)) return true;
+  if (typeof value !== 'object' || value === null) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
 function unitBytes(unit: OpencodeUnit): Uint8Array {
-  // The call id names the node, not the bytes: two identical reads under two
-  // call ids must hash identically, or the byte-equality rules never see them as
-  // the same content. The name and the arguments are the call's content.
-  //
-  // **The envelope's key order is `input`, `name`, `result`, and is pinned by a
-  // test.** ADR-0044 names the field set `{name, input, result}`; this writer
-  // serializes the same three fields in the order the archives have carried
-  // since the first pass, so every recorded hash stays readable. `name` and
-  // `input` are canonical text; the result keeps the host's own key order.
-  //
-  // **The result part keeps the host's own key order (1f diagnosis FIX 1).** The
-  // archive must hold the exact wire text the host sends for a structured result:
-  // a cancelled `question` archives `{"error":…,"content":[]}`, and sorting its
-  // keys to `{"content":…,"error":…}` made byte equality with the captured body
-  // impossible. `canonicalText` is therefore applied to the call's name and
-  // arguments only; `hostResultText` re-serializes the result the way the host
-  // lowers its tag (`JSON.stringify`, in the host's insertion order).
-  return toBytes(`{"input":${canonicalText(unit.call.part.input ?? null)},`
-    + `"name":${JSON.stringify(unit.call.part.name)},`
-    + `"result":${hostResultText(unit.result.part.result)}}`);
+  // The unit's body IS the result text the host sends (ISSUE-509): the byte space
+  // its lines, its anchors and its `keeplines` ranges address. The call id names
+  // the node, not the bytes, so two identical result texts hash identically.
+  return toBytes(opencodeUnitText(unit.result.part));
 }
 
 function orphanResultBytes(part: OpencodeToolResultPart): Uint8Array {
-  return toBytes(`{"name":${JSON.stringify(part.name)},`
-    + `"result":${hostResultText(part.result)}}`);
+  return toBytes(opencodeUnitText(part));
 }
 
 /**
- * The host's exact JSON text for one tagged tool result (1f diagnosis FIX 1).
- *
- * The host stores `{type, value}` and lowers it to the provider wire (`text` as
- * the string, `error`/`json` as `JSON.stringify(value)`, `content` as its text
- * parts joined by the harness). The archive keeps the tagged value, and this
- * function serializes it with the host's own key order: `JSON.stringify` with
- * no sorting replacer. Key order is part of the bytes a structured result
- * carries, so it is preserved rather than normalized — a result the bench
- * compares with the captured body then matches byte for byte.
- *
- * `undefined` (a value JSON cannot express) keeps `canonicalText`'s `''`
- * fallback, so the envelope stays valid JSON text for a part this build only
- * files as evidence.
+ * The content entries the unit's text does not carry: a non-text entry (a file)
+ * and an empty or malformed text entry are dropped from the decoded join. The
+ * body cannot see them, so the revision digest does. The digest is deliberately
+ * conservative here: `opencodeTextPayload` still accepts a mixed array when one
+ * non-empty text entry survives, but an empty entry is treated as residue
+ * anyway so the revision moves.
  */
-function hostResultText(result: unknown): string {
-  return JSON.stringify(result) ?? '';
+function contentResidueText(result: OpencodeToolResultValue): string {
+  if (result.type !== 'content' || !Array.isArray(result.value)) return '';
+  const residue = result.value.filter(entry =>
+    !(isRecord(entry) && entry['type'] === 'text'
+      && typeof entry['text'] === 'string' && entry['text'] !== ''));
+  return residue.length === 0 ? '' : canonicalText(residue);
+}
+
+/**
+ * The declaration facts a unit's revision entry carries — the fields the result
+ * text alone cannot see: the tool name and namespace on both parts, the
+ * arguments, the result tag and the content entries the text drops.
+ *
+ * The arguments encode an ABSENT `input` differently from a present `null` or
+ * `undefined`, because those are three different host requests (audit F8). The
+ * tag matters because `text`→`error` with the same value turns a hit into a
+ * miss, and a dropped file or empty content entry is residue the body cannot
+ * see; neither moves a body byte. A result is non-carryable for a partial keep
+ * only when no text entry survives, not merely because one entry is empty.
+ */
+function unitCallDigest(unit: OpencodeUnit): string {
+  const call = unit.call.part;
+  const result = unit.result.part.result;
+  return sha256Sync(toBytes(JSON.stringify([
+    'call',
+    call.name,
+    nonempty(call['namespace']),
+    Object.hasOwn(call, 'input') ? canonicalText(call.input) : 'no-input-key',
+    unit.result.part.name,
+    nonempty(unit.result.part['namespace']),
+    result.type,
+    contentResidueText(result),
+  ])));
+}
+
+/** The result part's own name, namespace, tag and dropped content entries. */
+function orphanCallDigest(part: OpencodeToolResultPart): string {
+  return sha256Sync(toBytes(JSON.stringify([
+    'orphan', part.name, nonempty(part['namespace']), part.result.type,
+    contentResidueText(part.result),
+  ])));
 }
 
 /**
@@ -405,15 +515,25 @@ function toolEvidence(
    * host's truncation notice. Every other kind keeps `unknown` and no coverage:
    * this host exposes no match count or completeness flag for a search or a
    * listing.
+   *
+   * A hit read's `lineCount`/`byteLength` are the text the host sent — the same
+   * bytes the unit body is (ISSUE-509). They were `null` while the body was a
+   * one-line JSON envelope, so a measured line count would have been a lie about
+   * the file. A miss measures nothing, and a search listing's output lines are
+   * not a file's lines, so both keep `null`.
    */
+  const readText = kind === 'read' ? toBytes(opencodeUnitText(result)) : null;
   const paths: PathEvidence[] = [...names].map(path => {
     const outcome: PathEvidence['outcome'] = kind === 'read'
       ? (opencodeIsErrorResult(result) ? 'miss' : 'hit')
       : 'unknown';
     const coverage = outcome === 'hit' ? readCoverageOf(input, result) : undefined;
+    const measured = outcome === 'hit' && readText !== null
+      ? { lineCount: splitLineOffsets(readText).length, byteLength: readText.byteLength }
+      : { lineCount: null, byteLength: null };
     return {
       pathKey: path, displayPath: path, title: null,
-      lineCount: null, byteLength: null, outcome,
+      ...measured, outcome,
       ...(coverage === undefined ? {} : { coverage }),
     };
   });
@@ -445,8 +565,9 @@ function displayPathOf(part: OpencodeContentPart): string | null {
  * `JSON.stringify` would, instead of throwing on a part this build only files
  * as evidence.
  *
- * Not used for a tool result's value: a structured result's key order is part
- * of its wire text and is preserved (`hostResultText`).
+ * Only whole parts digest through this: it is the fallback evidence digest, not
+ * a unit body. A unit's bytes are the result's own text (`opencodeUnitText`), so
+ * no result value is ever key-sorted on its way into an archive.
  */
 function canonicalText(value: unknown): string {
   return JSON.stringify(value, (_key: string, item: unknown) => {
@@ -570,6 +691,16 @@ export function deriveOpencodeSnapshot(
   const addEvidence = (part: OpencodeContentPart, partIndex: number): void => {
     emitted.push({ kind: 'evidence', evidence: evidenceOf(part, partIndex) });
   };
+  /**
+   * The declaration facts a unit's node bytes do not hold. The body is the
+   * result text (ISSUE-509), so a change to the tool name, the namespace, the
+   * arguments, an absent-versus-null `input`, the result tag, or a content
+   * entry the text drops would leave the revision still. The host rebuilds the
+   * request from the store and the port refuses a stale revision, so such a
+   * change must move the digest even though no node id, body byte or emitted
+   * evidence part moved (audit F8, and the tag/non-text residue audit).
+   */
+  const callDigests = new Map<NodeId, string>();
   const resultKey = (site: OpencodeResultSite): string =>
     `${String(site.messageIndex)}:${String(site.partIndex)}`;
 
@@ -623,6 +754,7 @@ export function deriveOpencodeSnapshot(
           }
           addNode(orphanResultNode(opencodeToolNodeId(sessionId, part.id), part, classify,
             turn, step));
+          callDigests.set(opencodeToolNodeId(sessionId, part.id), orphanCallDigest(part));
           consumedResults.add(`${String(messageIndex)}:${String(partIndex)}`);
           return;
         }
@@ -659,6 +791,7 @@ export function deriveOpencodeSnapshot(
         if (unit !== undefined) {
           addNode(unitNode(opencodeToolNodeId(sessionId, part.id), unit, classify,
             turn, step));
+          callDigests.set(opencodeToolNodeId(sessionId, part.id), unitCallDigest(unit));
           consumedResults.add(resultKey(unit.result));
           return;
         }
@@ -676,6 +809,7 @@ export function deriveOpencodeSnapshot(
         }
         addNode(orphanResultNode(opencodeToolNodeId(sessionId, part.id), part, classify,
           turn, step));
+        callDigests.set(opencodeToolNodeId(sessionId, part.id), orphanCallDigest(part));
         consumedResults.add(`${String(messageIndex)}:${String(partIndex)}`);
         return;
       }
@@ -685,9 +819,24 @@ export function deriveOpencodeSnapshot(
 
   const { attached, unanchored } = attach(emitted);
   const nodes = emitted.flatMap(item => item.kind === 'node' ? [item.node] : []);
-  const digest = JSON.stringify(emitted.map(item => item.kind === 'node'
-    ? ['node', item.node.id, item.node.sha256]
-    : ['part', item.evidence.partKey, item.evidence.sha256]));
+  /**
+   * The digest material, in two concatenated blocks: every node id, node hash
+   * and emitted evidence digest — an evidence part attached to a node or left
+   * unanchored — in emission order, then every unit's declaration digest in
+   * emission order (declarations are appended after the emitted entries, never
+   * interleaved). The declaration digest keeps a name/namespace/arguments/tag/
+   * dropped-content change visible now that the node body is the result text
+   * alone (ISSUE-509, audit F8): without it, changing the arguments or the tag
+   * of a result whose text is unchanged would leave the revision still, and the
+   * port's stale-revision refusal would accept a plan built for the older
+   * request.
+   */
+  const digest = JSON.stringify([
+    ...emitted.map(item => item.kind === 'node'
+      ? ['node', item.node.id, item.node.sha256]
+      : ['part', item.evidence.partKey, item.evidence.sha256]),
+    ...[...callDigests].map(([id, digestOfCall]) => ['call', id, digestOfCall]),
+  ]);
   const revision: Revision = `oc:${String(messages.length)}:${sha256Sync(toBytes(digest))}`;
 
   const currentTurnOrdinal = turn;

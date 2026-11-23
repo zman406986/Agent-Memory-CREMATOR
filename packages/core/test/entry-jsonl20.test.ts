@@ -32,6 +32,7 @@ import {
   JSONL_20_REFUSAL_CODES, JSONL_20_SUMMARY_WORDS, jsonl20RejectionsOf, readJsonl20Answer,
   readJsonl20NoKeepallAnswer,
 } from "../src/entry/jsonl-20-answer.js";
+import type { Jsonl20RowResult } from "../src/entry/jsonl-20-answer.js";
 
 /**
  * The first trigger's share line, verbatim; it appears once before the table and
@@ -66,26 +67,28 @@ const PINNED_PRE_TABLE = [
   "Rules:",
   "1. One object per line. One row per object. Nothing else on the line.",
   "2. Exactly one action key per row: keepall, forgetall, or keeplines.",
-  "3. keepall carries nothing else. forgetall and keeplines must also carry summary.",
+  "3. keepall carries nothing else. forgetall and keeplines must also carry forgotten: what is "
+    + "being dropped and why.",
   "4. forgetall forgets the whole row. keeplines keeps the listed lines and forgets every line "
     + "not listed.",
   "5. keeplines is an ascending array of non-overlapping [start,end] pairs, integers, inside 1..L, "
     + "where L is that row's line count shown in the table.",
-  "6. summary is one line of plain text, less than 20 words. It names what the forgotten content "
-    + "was about so it can be recalled. Use no raw newline. Escape a double quote as \\\".",
+  "6. forgotten is one line of plain text, less than 20 words. It names what is being dropped and "
+    + "why, so it can be recalled. It never describes the lines you keep. Use no raw newline. "
+    + "Escape a double quote as \\\".",
   "7. Every row in the table appears exactly once. Add no other rows, keys, or text.",
-  "8. Before sending, check each line: one object, one action key, summary present when "
+  "8. Before sending, check each line: one object, one action key, forgotten present when "
     + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own.",
   "",
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   FIRST_TARGET,
   "",
@@ -96,13 +99,13 @@ const PINNED_PRE_TABLE = [
 const PINNED_REPEAT = [
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   FIRST_TARGET,
   "",
@@ -388,12 +391,12 @@ test("jsonl-20 answers the prompt's own four-row worked example", () => {
   assert.deepEqual(rows[2]?.status === "answered" ? rows[2].answer : null, {
     action: "keeplines",
     ranges: [{ from: 1, to: 3 }, { from: 11, to: 18 }, { from: 37, to: 40 }],
-    summary: "the config keys and the two error strings",
+    summary: "the stale build log and the old host block",
   });
   assert.deepEqual(rows[3]?.status === "answered" ? rows[3].answer : null, {
     action: "keeplines",
     ranges: [{ from: 5, to: 12 }],
-    summary: "the retry block only",
+    summary: "the imports and the stale fixture setup",
   });
 });
 
@@ -609,7 +612,8 @@ test("jsonl-20's per-row reading is scoped to jsonl-20", () => {
 test("jsonl-20's vocabulary is named once; 30 words answer and 31 refuse", () => {
   assert.deepEqual([...JSONL_20_REFUSAL_CODES], [
     "answer-unreadable", "unknown-index", "duplicate-index", "missing-index",
-    "action-not-in-grammar", "malformed-row", "mixed-keys", "summary-missing",
+    "action-not-in-grammar", "malformed-row", "mixed-keys",
+    "both-forgotten-and-summary", "summary-missing",
     "summary-too-long", "bad-range", "ranges-unordered", "spans-outside-result",
   ]);
   assert.equal(JSONL_20_SUMMARY_WORDS, 30);
@@ -691,6 +695,103 @@ test("jsonl-20-nokeepall refuses keepall and reads a whole range as keepall", ()
   "a keeplines row still needs its own L");
 });
 
+/**
+ * The action-key acceptance matrix (ISSUE-515): one row per spelling a model
+ * may write, naming the canonical action it means. Both shipped reader grammars
+ * run every row, so case and one trailing `s` are checked where the key is
+ * actually parsed. This table replaces the separate "wrong case" assertions the
+ * older parser tests carried.
+ */
+const ACTION_KEY_ROWS = [
+  ["keeplines", "keeplines"],
+  ["KEEPLINES", "keeplines"],
+  ["keepline", "keeplines"],
+  ["KEEPline", "keeplines"],
+  ["keepLines", "keeplines"],
+  ["forgetall", "forgetall"],
+  ["FORGETALL", "forgetall"],
+  ["forgetAll", "forgetall"],
+  ["FORGETLINE", "forgetlines"],
+  ["forgetline", "forgetlines"],
+  ["KEEPALL", "keepall"],
+  ["keepall", "keepall"],
+  ["keepAll", "keepall"],
+  ["Keepall", "keepall"],
+  ["keepalls", "keepall"],
+] as const;
+
+/** The one verdict line a matrix row writes under its own key spelling. */
+function verdictOfKey(key: string, action: string): Record<string, unknown> {
+  if (action === "keepall") return { [key]: true };
+  if (action === "forgetall") return { [key]: true, summary: "s" };
+  return { [key]: [[1, 2]], summary: "s" };
+}
+
+/** One matrix row read by the named grammar, against a ten-line row. */
+function readActionKeyRow(
+  text: string,
+  grammar: "jsonl-20" | "jsonl-20-nokeepall",
+): Jsonl20RowResult | undefined {
+  const counts = new Map([[1, 10]]);
+  return grammar === "jsonl-20"
+    ? readJsonl20Answer(text, [1], counts).rows[0]
+    : readJsonl20NoKeepallAnswer(text, [1], counts).rows[0];
+}
+
+test("jsonl-20 reads an action key in any case or number; a misspelling stays out", () => {
+  for (const [key, action] of ACTION_KEY_ROWS) {
+    const row = readActionKeyRow(JSON.stringify({ 1: verdictOfKey(key, action) }), "jsonl-20");
+    // `forgetlines` is outside this grammar's three actions, whatever its key.
+    if (action === "forgetlines") {
+      assert.equal(row?.status === "refused" ? row.code : null, "action-not-in-grammar", key);
+      continue;
+    }
+    assert.equal(row?.status, "answered", key);
+    assert.equal(row?.status === "answered" ? row.answer.action : null, action, key);
+  }
+  for (const key of ["kleplines", "keep", "keeplinesx"]) {
+    const row = readActionKeyRow(JSON.stringify({ 1: { [key]: true } }), "jsonl-20");
+    assert.equal(row?.status === "refused" ? row.code : null, "action-not-in-grammar", key);
+  }
+  // `summary` is the only sibling key, and it is never normalized into an action.
+  const summaryOnly = readActionKeyRow(JSON.stringify({ 1: { summary: "s" } }), "jsonl-20");
+  assert.equal(summaryOnly?.status === "refused" ? summaryOnly.code : null,
+    "action-not-in-grammar", "a summary alone names no action");
+});
+
+test("jsonl-20-nokeepall reads the same spellings and still refuses every keepall", () => {
+  for (const [key, action] of ACTION_KEY_ROWS) {
+    const row = readActionKeyRow(JSON.stringify({ 1: verdictOfKey(key, action) }),
+      "jsonl-20-nokeepall");
+    if (action === "keepall" || action === "forgetlines") {
+      assert.equal(row?.status === "refused" ? row.code : null, "action-not-in-grammar", key);
+      continue;
+    }
+    assert.equal(row?.status, "answered", key);
+    assert.equal(row?.status === "answered" ? row.answer.action : null, action, key);
+  }
+  // A whole-range keep reads the same in any spelling: a clean whole keep.
+  const whole = readActionKeyRow(
+    JSON.stringify({ 1: { KEEPLINES: [[1, 10]], summary: "not the taught note" } }),
+    "jsonl-20-nokeepall");
+  assert.deepEqual(whole?.status === "answered" ? whole.answer : null, { action: "keepall" });
+});
+
+test("two action keys that normalize to one action stay two keys", () => {
+  for (const grammar of ["jsonl-20", "jsonl-20-nokeepall"] as const) {
+    for (const value of [
+      { 1: { keeplines: [[1, 2]], KEEPLINES: [[1, 2]], summary: "s" } },
+      { 1: { keeplines: [[1, 2]], forgetall: true, summary: "s" } },
+      // `Summary` is not `summary`, so it is a stranger beside the action.
+      { 1: { KEEPLINES: [[1, 2]], Summary: "s" } },
+    ]) {
+      const row = readActionKeyRow(JSON.stringify(value), grammar);
+      assert.equal(row?.status === "refused" ? row.code : null, "mixed-keys",
+        `${grammar}: ${JSON.stringify(value)}`);
+    }
+  }
+});
+
 /** `3option` and `two-option` keep their bytes and their reading, now selected by name. */
 test("the older grammars are unchanged by jsonl-20 becoming the default", () => {
   // 3option: named explicitly, the shipped contract opens it and a one-row batch
@@ -717,4 +818,32 @@ test("the older grammars are unchanged by jsonl-20 becoming the default", () => 
   const defaultRead = parseEntryBatchAnswer(
     '{"1":{"keepall":true}}\n{"2":{"forgetall":true,"summary":"stale log"}}', [1, 2]);
   assert.deepEqual(defaultRead.map(entry => entry.status), ["answered", "answered"]);
+});
+
+test("both jsonl-20 grammars read forgotten canonically and summary as its alias (ISSUE-525)", () => {
+  const counts = new Map([[1, 4]]);
+  const shipped = readJsonl20Answer(
+    '{"1":{"keeplines":[[1,2]],"forgotten":"the stale log lines"}}', [1], counts).rows[0];
+  assert.deepEqual(shipped?.status === "answered" ? shipped.answer : null, {
+    action: "keeplines", ranges: [{ from: 1, to: 2 }], summary: "the stale log lines",
+  });
+  assert.deepEqual(readJsonl20Answer(
+    '{"1":{"keeplines":[[1,2]],"summary":"the stale log lines"}}', [1], counts).rows[0],
+  shipped, "the legacy key reads as the same answer");
+  const both = readJsonl20Answer(
+    '{"1":{"keeplines":[[1,2]],"forgotten":"a","summary":"b"}}', [1], counts).rows[0];
+  assert.equal(both?.status === "refused" ? both.code : null, "both-forgotten-and-summary");
+  const noKeepall = readJsonl20NoKeepallAnswer(
+    '{"1":{"keeplines":[[1,4]],"forgotten":"None"}}', [1], counts).rows[0];
+  assert.deepEqual(noKeepall?.status === "answered" ? noKeepall.answer : null,
+    { action: "keepall" }, "a whole keep with forgotten None still normalizes");
+  const partial = readJsonl20NoKeepallAnswer(
+    '{"1":{"keeplines":[[2,3]],"forgotten":"the stale log lines"}}', [1], counts).rows[0];
+  assert.deepEqual(partial?.status === "answered" ? partial.answer : null, {
+    action: "keeplines", ranges: [{ from: 2, to: 3 }], summary: "the stale log lines",
+  });
+  const aliasBoth = readJsonl20NoKeepallAnswer(
+    '{"1":{"keeplines":[[2,3]],"forgotten":"a","summary":"b"}}', [1], counts).rows[0];
+  assert.equal(aliasBoth?.status === "refused" ? aliasBoth.code : null,
+    "both-forgotten-and-summary");
 });

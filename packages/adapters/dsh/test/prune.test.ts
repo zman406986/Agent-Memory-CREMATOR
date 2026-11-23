@@ -21,8 +21,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  PRUNE_ASK_FINAL_LINE, PRUNE_ASK_NOKEEPALL_FINAL_LINE,
-  PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT, PRUNE_ASK_SYSTEM_PROMPT, wireRequestHash,
+  ENTRY_ASK_END_ANCHOR, PRUNE_ASK_FINAL_LINE, PRUNE_ASK_JSONL_20_NOKEEPALL_REPEAT,
+  PRUNE_ASK_JSONL_20_NOKEEPALL_SYSTEM_PROMPT, PRUNE_ASK_JSONL_20_SLOT,
+  PRUNE_ASK_SYSTEM_PROMPT, wireRequestHash,
 } from '@cremator/core';
 import type { PruneAskGrammar, WireRequest } from '@cremator/core';
 import type { MountJournal } from '../src/journal-kinds.js';
@@ -458,7 +459,7 @@ const ASK_SCENARIOS: readonly AskScenario[] = [
       assert.ok(correction.length > 0, at('the third send is the correction turn'));
       const rowLines = correction.filter(line => /^\d+\. \[/u.test(line));
       assert.equal(rowLines.length, 1, at('exactly one refused row'));
-      assert.match(rowLines[0] ?? '', /^2\. \[read\] small\.txt \(u?call #1\)/u,
+      assert.match(rowLines[0] ?? '', /^2\. \[read\] small\.txt \(call #1\)/u,
         at('the correction names the refused row by its anchor'));
       assert.equal(correction.some(line => /^1\. \[/u.test(line)), false,
         at('the accepted row is not re-asked'));
@@ -983,9 +984,10 @@ test('a pass that cannot ask still records L1 and names its reason', async () =>
 test('pruneAskGrammar: nokeepall reaches the ask, its rows and the merge', async () => {
   // Both rows answer the keep-whole form: a `keeplines` over the row's own
   // `1..L`. The plan, the ask and the merge must all state `nokeepall`; a
-  // whole-range keep removes nothing, so no L2 removal is counted.
-  const answer = '{"1":{"keeplines":[[1,40],"the whole build log stays"]},'
-    + '"2":{"keeplines":[[1,6],"None"]}}';
+  // whole-range keep removes nothing, so no L2 removal is counted. The reply is
+  // one JSON object per line, the shape the jsonl-20-nokeepall ask teaches.
+  const answer = '{"1":{"keeplines":[[1,40]],"summary":"the whole build log stays"}}\n'
+    + '{"2":{"keeplines":[[1,6]],"summary":"None"}}';
   const llm = fakeLlm(answer);
   const setupResult = await setup('s-nokeepall', { llm });
   try {
@@ -993,18 +995,22 @@ test('pruneAskGrammar: nokeepall reaches the ask, its rows and the merge', async
       grammar: 'nokeepall' });
     assert.equal(outcome.plan.grammar, 'nokeepall', 'the plan carries the grammar');
     assert.equal(outcome.asks, 1, 'one table answered');
-    // The ask carries the two-verdict contract, each row's own [L], and the
-    // grammar's closing line instead of the 3option one.
+    // The ask IS the entry jsonl-20-nokeepall message: its pre-table contract,
+    // each row's own [L], and its post-table repeat closed by the end anchor.
     const sent = llm.calls[0];
     assert.ok(sent !== undefined, 'one request left the seam');
     const messages = sent.messages as readonly { content: { text: string }[] }[];
     const askText = messages[messages.length - 1]?.content[0]?.text ?? '';
-    assert.ok(askText.includes(PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT),
-      'the nokeepall contract is in the ask');
+    // The contract's own bytes up to its table slot, which the table replaced.
+    const contract = PRUNE_ASK_JSONL_20_NOKEEPALL_SYSTEM_PROMPT.slice(0,
+      PRUNE_ASK_JSONL_20_NOKEEPALL_SYSTEM_PROMPT.indexOf(PRUNE_ASK_JSONL_20_SLOT));
+    assert.ok(askText.startsWith(contract), 'the nokeepall contract opens the ask');
     assert.equal(askText.includes(PRUNE_ASK_SYSTEM_PROMPT), false,
       'the 3option contract is not');
-    assert.ok(askText.endsWith(PRUNE_ASK_NOKEEPALL_FINAL_LINE));
-    assert.equal(askText.endsWith(PRUNE_ASK_FINAL_LINE), false);
+    assert.ok(askText.includes(PRUNE_ASK_JSONL_20_NOKEEPALL_REPEAT),
+      'the post-table repeat closes the ask');
+    assert.ok(askText.endsWith(ENTRY_ASK_END_ANCHOR), 'the end anchor is last');
+    assert.equal(askText.includes(PRUNE_ASK_FINAL_LINE), false);
     assert.match(askText, /1\. \[read\] big\.txt \(call #1\) — .* \[40 lines\]$/mu);
     assert.match(askText, /2\. \[read\] small\.txt \(call #1\) — .* \[6 lines\]$/mu);
     assert.equal(askText.includes('"keepall"'), false, 'the grammar never teaches keepall');
@@ -1036,6 +1042,28 @@ test('pruneAskGrammar: nokeepall reaches the ask, its rows and the merge', async
       .askTableTokens;
     assert.ok(twoVerdictTokens > shippedTokens,
       'the nokeepall table is priced with its [L] suffixes, the 3option one without');
+  } finally {
+    await setupResult.mount.close();
+  }
+});
+
+test('nokeepall: a partial keeplines reaches the apply path as its own removal', async () => {
+  // Both rows keep only part of their lines, so each answer removes the rest.
+  // The reader hands the partial ranges through unchanged and the merge counts
+  // them as `keeplines` removals.
+  const llm = fakeLlm('{"1":{"keeplines":[[1,20]],"summary":"keep half the log"}}\n'
+    + '{"2":{"keeplines":[[1,3]],"summary":"the first lines only"}}');
+  const setupResult = await setup('s-nokeepall-partial', { llm });
+  try {
+    const outcome = await passOver(setupResult, { llm, records: setupResult.records,
+      grammar: 'nokeepall' });
+    assert.equal(outcome.asks, 1, 'one table answered');
+    assert.equal(outcome.application?.refused.length, 0, 'no row was refused');
+    const removals = outcome.application?.removals.filter(removal => removal.origin === 'l2')
+      ?? [];
+    assert.equal(removals.length, 2, 'both partial keeps removed their complement');
+    assert.deepEqual(recordOf(setupResult.records)?.['l2RemovalCount'],
+      { keeplines: 2, forgetall: 0, forgetlines: 0 });
   } finally {
     await setupResult.mount.close();
   }
@@ -1289,8 +1317,11 @@ test('the /prune trigger fires on the whole message only, and runs on the fork',
       // A seeded row mounts a model seam, so the pre-step runs a real pass over
       // main's captured request; the others mount none, so the pass can only
       // name the missing seam.
-      const llm = fakeLlm(['{"1":{"keepall":true},"2":{"keepall":true},'
-        + '"3":{"forgetall":"an old copy"}}']);
+      // The reply is the jsonl-20 shape: one object per row per line. A literal
+      // `keepall` is a terminal `action-not-in-grammar` refusal under the
+      // shipped `nokeepall` grammar, so it keeps the unit without a verdict.
+      const llm = fakeLlm(['{"1":{"keepall":true}}\n{"2":{"keepall":true}}\n'
+        + '{"3":{"forgetall":true,"summary":"an old copy"}}']);
       const records = collector();
       const mount = createRacoonsMount({
         config: resolvePluginConfig({ barBytes: 64, capBytes: 1 << 20 }),
@@ -1339,7 +1370,7 @@ test('the /prune trigger fires on the whole message only, and runs on the fork',
           { keeplines: 0, forgetall: 1, forgetlines: 0 }, at('the one forgetall was counted'));
         const pruneCall = llm.calls.find(call =>
           textOfMessage((call.messages as readonly unknown[]).at(-1))
-            .includes('Units still in memory'));
+            .endsWith(ENTRY_ASK_END_ANCHOR));
         assert.ok(pruneCall !== undefined, at('the prune ask left the seam'));
         assert.equal(pruneCall.system, MAIN_SYSTEM,
           at('no system-slot replacement on the live path'));

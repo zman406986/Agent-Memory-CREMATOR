@@ -5,6 +5,13 @@ export interface RevertItem {
   readonly id: NodeId;
   readonly nodeId: NodeId;
   readonly byteLength: number;
+  /**
+   * The bytes this node frees when forgotten: the dropped ranges of its removal
+   * (ISSUE-509). Absent means the whole node — a `forgetall` or any whole-node
+   * removal. A partial keep drops only part of the node; the remainder stays in
+   * the request and is priced as kept bytes, never as freed ones.
+   */
+  readonly freedByteLength?: number;
 }
 
 /** A receipt anchored to the survivor before it; null means the transcript head. */

@@ -278,7 +278,7 @@ test('ISSUE-404: an entry ask whose route is off posts no success card', async (
 
 test('ISSUE-404: a prune pass with zero ask rows says no ask was sent', async () => {
   const session = fakeSession('session-card-prune-empty');
-  const llm = fakeLlm(answerChunks('{"1":{"forgetall":"an old copy"}}'));
+  const llm = fakeLlm(answerChunks('{"1":{"forgetall":true,"summary":"an old copy"}}'));
   const mount = createRacoonsMount({
     // The bar sits above the fixture body, so the plan has no eligible unit.
     config: resolvePluginConfig({ barBytes: 1 << 20, capBytes: 1 << 20,
@@ -371,7 +371,7 @@ test('ISSUE-461: a surface throw after the ask still closes one error card', asy
 test('the bulk prune pass rides the same card, and closes it on a dead stream', async () => {
   const scenarios = [
     { name: 'answered pass', id: 'session-card-prune',
-      llm: fakeLlm(answerChunks('{"1":{"forgetall":"an old copy"}}')), kind: 'success' },
+      llm: fakeLlm(answerChunks('{"1":{"forgetall":true,"summary":"an old copy"}}')), kind: 'success' },
     { name: 'dead stream', id: 'session-card-prune-dead',
       llm: deadStreamLlm(), kind: 'error' },
   ];

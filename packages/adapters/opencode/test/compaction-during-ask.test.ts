@@ -95,7 +95,7 @@ test('ISSUE-423: a compaction during the ask refuses the reply and defers the la
         'the open window is the ask');
       assert.equal(lines.of('compacted').at(-1)?.['rearmed'], false,
         'the latch was not re-armed mid-ask');
-      release({ text: '{"1":{"forgetall":"stale note"}}' });
+      release({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' });
       await firing;
 
       assert.equal(calls, 1, 'one ask left the seam and no second was armed');
@@ -121,7 +121,7 @@ test('ISSUE-423: stored verdicts are dropped by name when a compaction precedes 
     let calls = 0;
     const mount = createOpencodeMount(options(async () => {
       calls += 1;
-      return { text: '{"1":{"forgetall":"stale note"}}' };
+      return { text: '{"1":{"forgetall":true,"summary":"stale note"}}' };
     }, lines.records));
     try {
       await mount.transform(sessionId, largeHostMessages());

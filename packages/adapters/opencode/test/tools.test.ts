@@ -187,7 +187,7 @@ const ROWS: readonly Row[] = [
       cleanup(root);
     }
   } },
-  { name: 'a-unit-part-restores-its-archived-envelope-exactly', async run(at) {
+  { name: 'a-unit-part-restores-its-archived-bytes-exactly', async run(at) {
     const root = scratch();
     const value = '# Note\n\nbody\n';
     const envelope = `{"input":{"filePath":"NOTES.md"},"name":"read","result":`
@@ -201,7 +201,7 @@ const ROWS: readonly Row[] = [
       const answer = await tool.execute({ id: record.id }, { sessionID: 'session-1' });
       const text = contentText(answer);
       assert.equal(text, envelope,
-        at('a unit part comes back as its archived envelope, never a re-rendered result value'));
+        at('a unit part comes back as its archived bytes, never a re-rendered result value'));
       assert.equal(sha256Sync(encoder.encode(text as string)), record.parts[0]?.source.sha256,
         at('the returned bytes hash to the archived part'));
     } finally {
@@ -209,13 +209,13 @@ const ROWS: readonly Row[] = [
       cleanup(root);
     }
   } },
-  { name: 'the-tool-description-names-the-unit-envelope', run(at) {
+  { name: 'the-tool-description-names-the-unit-text', run(at) {
     const spec = OPENCODE_TOOL_SPECS.find(candidate => candidate.name === 'necromancy');
     assert.ok(spec !== undefined, at('recall is in the declared inventory'));
-    assert.match(spec.description, /canonical JSON envelope/u,
-      at('the model-facing description names the envelope'));
-    assert.match(spec.description, /\{"name":\.\.\.,"input":\.\.\.,"result":\.\.\.\}/u,
-      at('the description shows the envelope shape'));
+    assert.match(spec.description, /decoded tool-result text/u,
+      at('the model-facing description names the decoded result text'));
+    assert.doesNotMatch(spec.description, /canonical JSON envelope/u,
+      at('the description no longer names the retired envelope'));
   } },
   { name: 'a-host-cache-path-is-never-a-recall-id', async run(at) {
     /**

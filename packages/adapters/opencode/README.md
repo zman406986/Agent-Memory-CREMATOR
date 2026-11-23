@@ -7,23 +7,24 @@ recall id. CREMATOR never summarizes.
 
 **Status: functional tests; live 2.2.5 runs exist but their evidence is withdrawn. The 36-record test runs 1i, 2a and 3b are withdrawn pending a clean rerun for key isolation, real-data safety, restore proof and lower-bound gaps (2026-11-11); the 1c vanilla control and the original 1c test arm are also not citable.** Every test
 in this package drives a duck-typed fake host: no OpenCode binary, no API key, no live call. Live
-2.2.5 runs are recorded in two audit records. No citable claim rests on them; a clean rerun is
+2.2.5 runs are recorded in ISSUE-255 and ISSUE-256. No citable claim rests on them; a clean rerun is
 queued after the fixes. The package targets the installed
 `@opencode/cli` 2.2.5 family; the type-only devDependencies are `@opencode/plugin@2.2.5`,
 `@opencode/ai@2.2.5` and `@opencode/schema@2.2.5`. A version change is a new verification, not a
-drop-in test.
+drop-in test (ADR-0017 §4; ISSUE-192).
 
 ## Live-run warning
 
-A live route writes to real host state. One pilot run changed the host's own
-`~/.local/share/opencode/opencode.db` and its `-wal`; the cause was not established. Treat a live run
-as a write to the host: back up real data first, keep evidence in a disposable directory, never commit
-it. The live route needs the host's provider key; keep the key value out of argv, a config file, a log
-and evidence. Set a token cap before you start and stop at it.
+A live route writes to real host state. On 2026-11-11 pilot `1d` changed the real
+`~/.local/share/opencode/opencode.db` and its `-wal` (ISSUE-260); the cause was not established. Read
+`docs/guides/ref-live-testing.md` before any live run. Keep evidence under
+`scratchpad/launch/<yyyy-mm-dd>-<slug>/` — never a new Desktop folder, never committed. The live route
+needs the host's provider key; keep the key value out of argv, a config file, a log and evidence. The
+run uses a 200M-token soft cap; a run that exceeds it needs a recorded reason.
 
 ## Install
 
-The packages are not published to npm . Build from this repo:
+The packages are not published to npm (owner decision, ISSUE-069). Build from this repo:
 
 ```sh
 npm install
@@ -42,13 +43,13 @@ Add the package directory to the `plugins` list in `opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    { "package": "file:///path/to/Agent-Memory-CREMATOR/packages/adapters/opencode",
-      "options": { "crematorStorageRoot": "~/.cremator/opencode" } }
+    { "package": "file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/opencode",
+      "options": { "crematorStorageRoot": "C:/Users/TZhen/.cremator/opencode" } }
   ]
 }
 ```
 
-Other device: `file:///path/to/Agent-Memory-CREMATOR/packages/adapters/opencode`. A bare
+Other device: `file:///C:/Users/TZ/Desktop/racoons/packages/adapters/opencode`. A bare
 `"cremator-opencode"` entry works only when the package is installed into the host; it is not
 published. The host loads the directory's `./server` export, whose default is
 `{ id: "cremator-opencode", setup(context) }` (`dist/server.js`). `setup` registers one `context`
@@ -60,8 +61,8 @@ The options object carries the durable root and the test-only tool exclusion:
 ```json
 {
   "plugins": [
-    { "package": "file:///path/to/Agent-Memory-CREMATOR/packages/adapters/opencode",
-      "options": { "crematorStorageRoot": "~/.cremator/opencode" } }
+    { "package": "file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/opencode",
+      "options": { "crematorStorageRoot": "C:/Users/TZhen/.cremator/opencode" } }
   ]
 }
 ```
@@ -73,9 +74,9 @@ exclusion described below.
 
 ### The `/cremate` command
 
-On a host that exposes `context.command.transform`, `setup` registers the manual `cremate`
-command; the host lists it as `/cremate`. It runs the same table pass on demand. A host without
-that seam mounts without the command; the automatic pass still runs.
+On a host that exposes `context.command.transform`, `setup` registers the manual `cremate` command;
+the host lists it as `/cremate`. It runs the same table pass on demand, not gated by the depth
+latch. A host without that seam mounts without the command; the automatic pass still runs.
 
 ## What the mount does
 
@@ -84,7 +85,7 @@ messages to the provider request (the host's compaction request uses its own `co
 which this adapter does not register):
 
 1. **observe** — re-derive the snapshot from the messages the host handed in (host message ids,
-   call ids for tool units, content position otherwise);
+   call ids for tool units, content position otherwise; ADR-0044);
 2. **at-rest** — one engine pass (`reason: 'step'`), which plans, validates and stages;
 3. **staged commit** — `commit()` splices the staged derivation onto the caller's own array,
    exactly once. Nothing staged means the array is byte-identical and no write happens.
@@ -99,7 +100,7 @@ compaction is never read as a forced loss.
 ### No result cap
 
 On `tool.hook("execute.after")` the mount journals the tool and call id only. The product never
-caps, shortens or rewrites a tool result: a 200 KB result is left exactly as the tool
+caps, shortens or rewrites a tool result (ADR-0048): a 200 KB result is left exactly as the tool
 produced it, with no marker, no recall id and no `metadata.truncated` from this adapter. The host's
 own `ToolOutput.truncate` then runs as it ships — head only, 2,000 lines or 50 KiB, whichever comes
 first, with the full text saved to a file — and whatever it stores is what later requests carry. A
@@ -113,7 +114,7 @@ idempotency by intent id; `rehydrateOnResume` is `false` and says so.
 
 The pass reads and rewrites `messages` only. The one other write is the optional
 `excludeTools` deletion from `context.tools`; the mount never touches `context.options`, and this
-package writes no config. `compaction.auto` stays at its default `true`.
+package writes no config. `compaction.auto` stays at its default `true` (ADR-0043).
 
 ### Subagent tool off for a test harness
 
@@ -124,7 +125,7 @@ leave it out of the request, add the name to `excludeTools`:
 ```json
 {
   "plugins": [
-    { "package": "file:///path/to/Agent-Memory-CREMATOR/packages/adapters/opencode",
+    { "package": "file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/opencode",
       "options": { "excludeTools": ["subagent"] } }
   ]
 }
@@ -150,11 +151,12 @@ the code-mode catalog behind its `execute` tool.
 
 ## Capability flags
 
-Each flag is true only where a code path honours it, and false only where the refusal is named. The mount journals its declaration once per session.
+Each flag is true only where a code path honours it, and false only where the refusal is named
+(ISSUE-010). The mount journals its declaration once per session.
 
 | Flag | Value | Backed by / refused because |
 | --- | --- | --- |
-| `mutateResult` | `false` | `execute.after` observes the tool and call id only; the product never caps or rewrites a result body, so the host's own truncation runs as it ships. |
+| `mutateResult` | `false` | `execute.after` observes the tool and call id only; the product never caps or rewrites a result body (ADR-0048), so the host's own truncation runs as it ships. |
 | `rewriteHistory` | `false` | Nothing persisted is rewritten; a context hook mutation lives for one request. |
 | `revertHistory` | `true` in the mount, `false` from `createOpencodeCapabilities()` | Earned by `test/wire-revert.test.ts`: messages before the cut byte-identical, the named unit gone with its call, receipts present once after their anchor, a second run idempotent, every refusal class leaving the array untouched. The flag exists only beside the derivation that performs it. |
 | `atRest` | `true` | The step pass (`reason: 'step'`) plans at rest with no model call; `session.idle` only observes the turn end. |
@@ -165,11 +167,12 @@ Each flag is true only where a code path honours it, and false only where the re
 
 ## Storage
 
-One durable ledger per session: `<crematorStorageRoot>/sessions/<sessionId>/ledger.sqlite`
+One durable ledger per session (ADR-0013): `<crematorStorageRoot>/sessions/<sessionId>/ledger.sqlite`
 with its blob tree in the sibling `blobs/` directory. A recall id keeps working after a restart of
 the same session. `':memory:'` is for tests only; no configuration value selects it.
 
-The default root is `~/.cremator/opencode`. The host's own data directory is never guessed and
+The default root is `~/.cremator/opencode` (`C:\Users\TZhen\.cremator\opencode` on one owner
+device, `C:\Users\TZ\.cremator\opencode` on the other). The host's own data directory is never guessed and
 never written. A relative root and a per-session `{databasePath, blobRoot}` pair are typed
 refusals. A session whose id cannot be a directory name is refused the same way. If the ledger
 cannot open, the request proceeds with the messages untouched and journals

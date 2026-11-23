@@ -1,20 +1,23 @@
 // The opencode prune ask's row builder and answer reader (ADR-0050; ADR-0053;
-// ADR-0054; ADR-0060). The pass is core's `planPrunePass`, so this file tests
-// exactly the two pure halves the mount drives: the plan and table it builds
-// from an observed array, and the reading of one reply under the host-honest
-// two-option prompt. No model call, no ledger, no host.
+// ADR-0054; ADR-0060; ISSUE-509). The pass is core's `planPrunePass`, so this
+// file tests exactly the two pure halves the mount drives: the plan and table it
+// builds from an observed array, and the reading of one reply under core's
+// `jsonl-20-nokeepall` grammar (the same message and reader dsh's depth table
+// uses). No model call, no ledger, no host.
 //
 // Every claim is a row, so a failure names the claim it broke.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  PRUNE_ASK_FINAL_LINE, PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT,
+  ENTRY_ASK_END_ANCHOR, entryBatchAskMessage, isRefusedPruneAnchor,
 } from '@cremator/core';
+import type { EntryBatchRow, PruneAnchorRefusal, PruneAskRow } from '@cremator/core';
 import {
-  OPENCODE_ASK_FLOOR_BYTES, OPENCODE_ASK_GRAMMAR,
-  buildOpencodeAskBatch, readOpencodeAskAnswer,
+  OPENCODE_ASK_FLOOR_BYTES, OPENCODE_ASK_GRAMMAR, OPENCODE_ASK_PROMPT_GRAMMAR,
+  askPromptOf, buildOpencodeAskBatch, readOpencodeAskAnswer,
 } from '../src/ask.js';
+import type { OpencodeAskBatch } from '../src/ask.js';
 import { createOpencodePort } from '../src/port.js';
 import {
   assistantMessage, errorResult, sessionId, text, toolCall, toolMessage, toolResult,
@@ -51,6 +54,105 @@ function conversation(): OpencodeMessage[] {
   ];
 }
 
+/**
+ * A batch whose one row states `lines` lines. A real mount derives the row's L
+ * from the unit's span over the result's decoded text (ISSUE-511); this stub is
+ * the reader's contract at a chosen count, including counts a small fixture
+ * does not reach on its own.
+ */
+function syntheticBatch(lines: number): OpencodeAskBatch {
+  return {
+    rows: [{
+      index: 1,
+      unit: {
+        id: 'unit:synthetic',
+        nodeId: 'node:synthetic',
+        source: { nodeId: 'node:synthetic', sha256: '', byteLength: 0 },
+        path: null,
+        span: {
+          byteRange: { startByte: 0, endByteExclusive: 1 },
+          // `0` is a zero-line unit: no range at all.
+          lineRange: lines === 0 ? null : { startLine: 1, endLineInclusive: lines },
+        },
+        byteLength: 1,
+      },
+      anchor: { kind: 'read', path: 'NOTES.md', callOrdinal: 1, anchors: ['line one'] },
+    }],
+    indices: [1],
+    stamps: new Map([[1, { unitId: 'unit:synthetic', answeredInRound: ROUND }]]),
+  } as unknown as OpencodeAskBatch;
+}
+
+/** The line count a row's own range proves, as `entryBatchAskMessage` needs it. */
+function lineCountOf(row: PruneAskRow): number {
+  const range = row.unit.span.lineRange;
+  if (range === null) return 0;
+  const count = range.endLineInclusive - range.startLine + 1;
+  return Number.isSafeInteger(count) && count > 0 ? count : 0;
+}
+
+/**
+ * The entry message's row shape, built independently of `ask.ts`, so the parity
+ * test compares two derivations and would catch a drift in either.
+ */
+function parityRows(rows: readonly PruneAskRow[]): readonly EntryBatchRow[] {
+  return rows.map(row => {
+    const anchor = row.anchor;
+    return {
+      index: row.index,
+      call: anchor.kind,
+      ...(anchor.path === undefined ? {} : { path: anchor.path }),
+      callOrdinal: anchor.callOrdinal,
+      ...(isRefusedPruneAnchor(anchor)
+        ? { anchorLines: [], anchorRefusal: anchor.refusal }
+        : { anchorLines: anchor.anchors }),
+      lineCount: lineCountOf(row),
+    };
+  });
+}
+
+/**
+ * One synthetic row for the byte tests: a zero-line unit and a refused anchor
+ * are not producible from a real context array here, but both shapes must
+ * render the core message's own bytes.
+ */
+function syntheticRow(
+  shape: { readonly lineRange: { readonly startLine: number;
+    readonly endLineInclusive: number } | null; readonly refusal?: PruneAnchorRefusal },
+): PruneAskRow {
+  return {
+    index: 1,
+    unit: {
+      id: 'unit:synthetic',
+      nodeId: 'node:synthetic',
+      source: { nodeId: 'node:synthetic', sha256: '', byteLength: 1 },
+      path: null,
+      span: {
+        byteRange: { startByte: 0, endByteExclusive: 1 },
+        lineRange: shape.lineRange,
+      },
+      byteLength: 1,
+    },
+    anchor: shape.refusal === undefined
+      ? { kind: 'read', path: 'NOTES.md', callOrdinal: 1, anchors: ['line one'] }
+      : { kind: 'read', path: 'NOTES.md', callOrdinal: 1, refusal: shape.refusal },
+  };
+}
+
+/** A conversation with two identical `read NOTES.md` calls and different bodies. */
+function twoIdenticalCallConversation(): OpencodeMessage[] {
+  return [
+    userMessage('msg_u1', [text('Read the note twice.')]),
+    assistantMessage('msg_a1', [toolCall('call_1', 'read', { filePath: 'NOTES.md' })]),
+    toolMessage('msg_t1', [toolResult('call_1', 'read',
+      textResult(`# One\n\n${'alpha-'.repeat(120)}\n`))]),
+    assistantMessage('msg_a2', [toolCall('call_2', 'read', { filePath: 'NOTES.md' })]),
+    toolMessage('msg_t2', [toolResult('call_2', 'read',
+      textResult(`# Two\n\n${'bravo-'.repeat(120)}\n`))]),
+    assistantMessage('msg_a3', [text('Both read.')]),
+  ];
+}
+
 const ROWS: readonly Row[] = [
   { name: 'the-pass-tables-the-observed-array-and-keeps-l1', run(at) {
     const messages = conversation();
@@ -77,14 +179,25 @@ const ROWS: readonly Row[] = [
     }, at('the one eligible unit reached the table'));
     const prompt = batch.prompt ?? '';
     assert.ok(batch.prompt !== null, at('a table exists, so a prompt exists'));
-    assert.ok(prompt.includes(PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT),
-      at('the prompt is core two-option contract'));
-    assert.ok(prompt.endsWith(PRUNE_ASK_FINAL_LINE),
-      at('the prompt closes on the contract own final line'));
-    assert.doesNotMatch(prompt, /70 percent|40 percent|keep at most/u,
-      at('the 70/40 share lines are not in the product prompt'));
+    assert.equal(prompt,
+      entryBatchAskMessage(parityRows(batch.rows), 'jsonl-20-nokeepall', true),
+      at('the prompt is core\'s jsonl-20-nokeepall entry message, byte for byte'));
+    assert.match(prompt, /keep at most 70 percent of the total lines/u,
+      at('the session\'s first table ask states the 70 percent share'));
+    assert.doesNotMatch(prompt, /keep at most 40 percent/u,
+      at('the first ask never mixes in the later share'));
     assert.match(prompt, /^1\. \[read\] NOTES\.md \(call #1\)/mu,
       at('the table carries the row address'));
+    const lines = lineCountOf(batch.rows[0] as PruneAskRow);
+    assert.ok(lines > 0, at('the row proves a positive line count'));
+    const label = `[${String(lines)} line${lines === 1 ? '' : 's'}]`;
+    assert.match(prompt,
+      new RegExp(`^1\\. \\[read\\] NOTES\\.md \\(call #1\\).* ${label.replace('[', '\\[').replace(']', '\\]')}$`, 'mu'),
+      at('every row ends with its [L line(s)] count'));
+    assert.ok(prompt.trimEnd().endsWith(ENTRY_ASK_END_ANCHOR),
+      at('the post-table repeat closes on the end anchor'));
+    assert.equal(prompt.split('Answer format:').length - 1, 2,
+      at('the contract, the table and the repeat are the three pieces'));
     assert.deepEqual(messages, untouched, at('building the ask mutates nothing'));
   } },
   { name: 'asked-units-are-never-tabled-again', run(at) {
@@ -114,66 +227,83 @@ const ROWS: readonly Row[] = [
       sessionId, messages, port: portFor(messages), round: ROUND,
     });
     assert.ok(batch !== null, at('the batch is built'));
-    const parsed = readOpencodeAskAnswer(batch, '{"1":{"forgetall":"stale note"}}');
+    const parsed = readOpencodeAskAnswer(batch,
+      '{"1":{"forgetall":true,"summary":"stale note"}}');
     assert.deepEqual(parsed, [{ index: 1, unitId: batch.unitIds[0], status: 'answered',
       answer: { verdict: { unitId: batch.unitIds[0], answeredInRound: ROUND,
         action: 'forgetall', summary: 'stale note' } } }],
-    at('the answer is read under the two-option contract'));
+    at('the answer is read under core\'s jsonl-20-nokeepall reader'));
   } },
-  { name: 'a-forgetall-summary-past-the-guard-cap-is-refused-at-the-wire', run(at) {
+  { name: 'a-forgetall-summary-past-the-reader-tolerance-is-refused', run(at) {
     const messages = conversation();
     const batch = buildOpencodeAskBatch({
       sessionId, messages, port: portFor(messages), round: ROUND,
     });
     assert.ok(batch !== null, at('the batch is built'));
-    const fit = summaryWords(25);
     const accepted = readOpencodeAskAnswer(batch,
-      JSON.stringify({ 1: { forgetall: fit } }));
+      JSON.stringify({ 1: { forgetall: true, summary: summaryWords(30) } }));
     assert.equal(accepted[0]?.status, 'answered',
-      at('a 25-word summary is read as the guard accepts it'));
+      at('a 30-word summary is inside the reader\'s tolerance'));
     const over = readOpencodeAskAnswer(batch,
-      JSON.stringify({ 1: { forgetall: summaryWords(26) } }));
+      JSON.stringify({ 1: { forgetall: true, summary: summaryWords(31) } }));
     assert.deepEqual(over.map(row => [row.index, row.status,
-      row.status === 'refused' ? row.code : null,
-      row.status === 'refused' ? row.wireCode : null]),
-    [[1, 'refused', 'malformed-row', 'summary-too-long']],
-    at('a 26-word summary is refused by the wire before the mount can store it'));
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'malformed-row']],
+    at('a 31-word summary is refused, and the row keeps'));
   } },
-  { name: 'keepall-is-the-offered-keep', run(at) {
+  { name: 'a-literal-keepall-is-the-terminal-not-in-grammar-refusal', run(at) {
     const messages = conversation();
     const batch = buildOpencodeAskBatch({
       sessionId, messages, port: portFor(messages), round: ROUND,
     });
     assert.ok(batch !== null, at('the batch is built'));
     const parsed = readOpencodeAskAnswer(batch, '{"1":{"keepall":true}}');
-    assert.equal(parsed[0]?.status, 'answered', at('keepall is an offered verdict'));
-    assert.equal(parsed[0]?.status === 'answered' ? parsed[0].answer.verdict.action : null,
-      'keepall', at('the action is the keep the prompt teaches'));
+    assert.deepEqual(parsed.map(row => [row.index, row.status,
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'action-not-in-grammar']],
+    at('keepall is not offered; the row is refused and the unit keeps'));
   } },
-  { name: 'keeplines-and-forgetlines-are-terminal-not-in-grammar', run(at) {
+  { name: 'a-partial-keeplines-is-answered-and-passed-through', run(at) {
+    const batch = syntheticBatch(5);
+    const parsed = readOpencodeAskAnswer(batch,
+      '{"1":{"keeplines":[[1,3]],"summary":"keep the head"}}');
+    assert.deepEqual(parsed, [{ index: 1, unitId: 'unit:synthetic', status: 'answered',
+      answer: {
+        verdict: { unitId: 'unit:synthetic', answeredInRound: ROUND,
+          action: 'keeplines', ranges: [{ from: 1, to: 3 }] },
+        keeplinesSummary: 'keep the head',
+      } }],
+    at('a partial keeplines is answered, never refused, so the apply path can remove its lines'));
+  } },
+  { name: 'a-whole-range-keeplines-normalizes-to-a-clean-keep', run(at) {
+    const batch = syntheticBatch(5);
+    const parsed = readOpencodeAskAnswer(batch,
+      '{"1":{"keeplines":[[1,5]],"summary":"None"}}');
+    assert.equal(parsed[0]?.status === 'answered'
+      ? parsed[0].answer.verdict.action : null, 'keepall',
+    at('the whole row keeps whole, whatever the summary says'));
+  } },
+  { name: 'a-keeplines-past-the-row-line-count-is-refused', run(at) {
+    const batch = syntheticBatch(5);
+    const parsed = readOpencodeAskAnswer(batch,
+      '{"1":{"keeplines":[[1,6]],"summary":"None"}}');
+    assert.deepEqual(parsed.map(row => [row.index, row.status,
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'spans-outside-result']],
+    at('a span past the row\'s own L keeps the row'));
+  } },
+  { name: 'forgetlines-is-refused-not-in-grammar', run(at) {
     const messages = conversation();
     const batch = buildOpencodeAskBatch({
       sessionId, messages, port: portFor(messages), round: ROUND,
     });
     assert.ok(batch !== null, at('the batch is built'));
-    for (const textRow of [
-      '{"1":{"keeplines":[[1,2],"None"]}}',
-      '{"1":{"forgetlines":[[1,1],"drop one"]}}',
-    ]) {
-      const parsed = readOpencodeAskAnswer(batch, textRow);
-      assert.deepEqual(parsed.map(row => [row.index, row.status,
-        row.status === 'refused' ? row.code : null]),
-      [[1, 'refused', 'action-not-in-grammar']],
-      at('an action the prompt does not offer is refused, and the unit keeps'));
-      const refusal = parsed[0];
-      assert.equal(refusal?.status === 'refused' ? refusal.message : null,
-        'The answer used an action this grammar does not offer; it takes keepall or '
-        + 'forgetall, so the unit is kept.',
-        at('the terminal message names keepall and forgetall'));
-      assert.doesNotMatch(refusal?.status === 'refused' ? refusal.message : '',
-        /takes keeplines/u,
-        at('the message does not claim this host offers keeplines'));
-    }
+    const parsed = readOpencodeAskAnswer(batch,
+      '{"1":{"forgetlines":[[1,1]],"summary":"drop one"}}');
+    assert.deepEqual(parsed.map(row => [row.index, row.status,
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'action-not-in-grammar']],
+    at('forgetlines is not an action this grammar reads'));
   } },
   { name: 'a-missing-row-keeps-its-unit', run(at) {
     const messages = conversation();
@@ -185,9 +315,87 @@ const ROWS: readonly Row[] = [
     assert.deepEqual(parsed.map(row => [row.index, row.status]), [[1, 'refused']],
       at('an answer with no verdict refuses the row and keeps it'));
   } },
+  { name: 'the-first-ask-states-70-percent-and-every-later-one-40', run(at) {
+    const messages = conversation();
+    const first = buildOpencodeAskBatch({
+      sessionId, messages, port: portFor(messages), round: 1, firstTrigger: true,
+    });
+    const later = buildOpencodeAskBatch({
+      sessionId, messages, port: portFor(messages), round: 2, firstTrigger: false,
+    });
+    assert.match(first?.prompt ?? '', /keep at most 70 percent of the total lines/u,
+      at('the first table ask states 70 percent'));
+    assert.doesNotMatch(first?.prompt ?? '', /keep at most 40 percent/u,
+      at('one message never states both shares'));
+    assert.match(later?.prompt ?? '', /keep at most 40 percent of the total lines/u,
+      at('a later table ask states 40 percent'));
+    assert.doesNotMatch(later?.prompt ?? '', /keep at most 70 percent/u,
+      at('a later ask never restates the first share'));
+    assert.equal((later?.prompt ?? '').split('keep at most 40 percent').length - 1, 2,
+      at('the pre-table contract and the post-table repeat state the same share'));
+  } },
+  { name: 'a-zero-line-row-states-zero-lines-and-the-same-bytes', run(at) {
+    const rows = [syntheticRow({ lineRange: null })];
+    const prompt = askPromptOf(rows, true);
+    assert.match(prompt, /^1\. \[read\] NOTES\.md \(call #1\).* \[0 lines\]$/mu,
+      at('a zero-line unit states its own count, never a blank suffix'));
+    assert.equal(prompt,
+      entryBatchAskMessage(parityRows(rows), 'jsonl-20-nokeepall', true),
+      at('the zero-line row renders the core message\'s bytes'));
+  } },
+  { name: 'a-refused-anchor-renders-its-note-and-the-same-bytes', run(at) {
+    const rows = [syntheticRow({
+      lineRange: { startLine: 1, endLineInclusive: 1 }, refusal: 'missing-node',
+    })];
+    const prompt = askPromptOf(rows, true);
+    assert.match(prompt, /anchor unavailable: missing-node/u,
+      at('a refused anchor renders its note instead of an empty list'));
+    assert.equal(prompt,
+      entryBatchAskMessage(parityRows(rows), 'jsonl-20-nokeepall', true),
+      at('the refused-anchor row renders the core message\'s bytes'));
+  } },
+  { name: 'a-whole-range-keeplines-on-a-zero-line-row-is-refused', run(at) {
+    const batch = syntheticBatch(0);
+    const whole = readOpencodeAskAnswer(batch,
+      '{"1":{"keeplines":[[1,1]],"summary":"None"}}');
+    assert.deepEqual(whole.map(row => [row.index, row.status,
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'spans-outside-result']],
+    at('the sentinel normalization of a whole-range keeplines on a zero-line row keeps it'));
+    const literal = readOpencodeAskAnswer(batch, '{"1":{"keepall":true}}');
+    assert.deepEqual(literal.map(row => [row.index, row.status,
+      row.status === 'refused' ? row.code : null]),
+    [[1, 'refused', 'action-not-in-grammar']],
+    at('a literal keepall is still the grammar refusal, never a keep'));
+  } },
+  { name: 'the-row-call-ordinal-is-the-pass-ordinal-not-a-recount', run(at) {
+    const messages = twoIdenticalCallConversation();
+    const first = buildOpencodeAskBatch({
+      sessionId, messages, port: portFor(messages), round: ROUND,
+    });
+    assert.ok(first !== null, at('the probe pass is built'));
+    assert.deepEqual(first.rows.map(row => [row.index, row.anchor.callOrdinal]),
+      [[1, 1], [2, 2]], at('the pass numbers both identical calls in row order'));
+    const second = buildOpencodeAskBatch({
+      sessionId, messages, port: portFor(messages), round: ROUND + 1,
+      askedUnitIds: new Set(first.unitIds.slice(0, 1)),
+    });
+    assert.ok(second !== null, at('the filtered pass is built'));
+    assert.equal(second.rows.length, 1, at('the first identical call is already asked'));
+    assert.equal(second.rows[0]?.anchor.callOrdinal, 2,
+      at('the tabled row keeps the pass ordinal'));
+    assert.match(second.prompt ?? '',
+      /^2\. \[read\] NOTES\.md \(call #2\)/mu,
+      at('the table prints the pass ordinal, never a recount of the tabled subset'));
+    assert.equal(second.prompt,
+      entryBatchAskMessage(parityRows(second.rows), 'jsonl-20-nokeepall', true),
+      at('the filtered table still renders the core message bytes'));
+  } },
   { name: 'the-grammar-id-is-the-one-the-mount-sends', run(at) {
     assert.equal(OPENCODE_ASK_GRAMMAR, 'prune-two-option',
-      at('the exported grammar names the prompt family this host can apply'));
+      at('the mount-option id stays stable; its message and reader are jsonl-20-nokeepall'));
+    assert.equal(OPENCODE_ASK_PROMPT_GRAMMAR, 'jsonl-20-nokeepall',
+      at('the wire grammar the journal names is the message that actually ran'));
   } },
 ];
 

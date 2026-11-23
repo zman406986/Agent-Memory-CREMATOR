@@ -120,7 +120,7 @@ test("a verbatim echo of the correction example never answers a refused row (ISS
     "the static example ships when no refused row carries its indices");
 });
 
-test("the nokeepall correction re-renders its rows with L and closes on its own line", () => {
+test("the nokeepall correction speaks the table's line-per-row grammar (ISSUE-508 F3)", () => {
   const message = pruneCorrectionMessage({
     refused: [ROW_3, ROW_5], totalRows: 5,
     reasons: [{ index: 3, code: "missing-index" }, { index: 5, code: "duplicate-index" }],
@@ -129,10 +129,32 @@ test("the nokeepall correction re-renders its rows with L and closes on its own 
   const rowLines = message.split("\n").filter(line => /^\d+\. /u.test(line));
   assert.deepEqual(rowLines.map(line => / \[2 lines\]$/u.test(line)),
     [true, true], "each re-rendered row carries its own L");
-  assert.equal(message.includes(PRUNE_ASK_NOKEEPALL_FINAL_LINE), true,
-    "the nokeepall correction closes on the two-verdict final line");
-  assert.equal(message.endsWith(PRUNE_ASK_FINAL_LINE), false,
-    "the shipped keepall final line is not sent");
+  // One grammar per pass: the answer shapes are the jsonl-20 ones, not the
+  // shipped index-keyed composite.
+  assert.equal(message.includes('{"N":{"forgetall":true,"summary":"<summary>"}}'), true,
+    "the one-object-per-line forgetall shape is stated");
+  assert.equal(message.includes('{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}'), true,
+    "the one-object-per-line keeplines shape is stated");
+  assert.equal(message.includes(PRUNE_CORRECTION_COMPOSITE), false,
+    "the index-keyed composite example is not sent under this grammar");
+  // No share line: a correction re-asks rows already refused.
+  assert.equal(message.includes("keep at most"), false, "no keep-share target is restated");
+  // And no 3option bytes anywhere.
+  assert.equal(message.includes(PRUNE_ASK_FINAL_LINE), false);
+  assert.equal(message.includes(PRUNE_ASK_NOKEEPALL_FINAL_LINE), false);
+});
+
+test("the finer line codes reach the correction's reason clause (ISSUE-508 F4)", () => {
+  const message = pruneCorrectionMessage({
+    refused: [ROW_3], totalRows: 5,
+    reasons: [{ index: 3, code: "malformed-row", detail: "summary-too-long" }],
+    grammar: "nokeepall",
+  });
+  const first = message.split("\n")[0] ?? "";
+  assert.equal(first.includes("index 3 carried a summary past 30 words"), true,
+    `the finer defect is named, got ${first}`);
+  assert.equal(first.includes("is not a readable verdict"), false,
+    "the collapsed code's generic clause is not used when the detail is known");
 });
 
 test("the approved text — one row per reason code, plus the whole-message pin", () => {

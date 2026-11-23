@@ -188,6 +188,12 @@ export {
 } from './verdicts/plan.js';
 export type { WireAnswer, WireStamp, WireVerdictErrorCode } from './verdicts/wire.js';
 export { parseWireVerdict, WireVerdictError } from './verdicts/wire.js';
+// One normalizer for a model-written action key (ISSUE-515). Every reader of the
+// four actions calls it, so case and one trailing `s` name the same action while
+// a true misspelling stays unknown. Exported for adapters and rigs that read a
+// key themselves instead of delegating to a core reader.
+export type { CanonicalActionKey } from './verdicts/action-keys.js';
+export { CANONICAL_ACTION_KEYS, normalizeActionKey } from './verdicts/action-keys.js';
 // The entry checkpoint's answer grammar (ISSUE-056 C1; ADR-0022 §9; the fourth
 // action added by ISSUE-061 chunk F-1a, ADR-0026). A separate reader from
 // `parseWireVerdict` on purpose — it reads TEXT, so it owns the two refusals

@@ -10,21 +10,24 @@
  * that dsh's prune pass hands (`planPrunePass` -> `applyPruneAnswers` ->
  * `{kind: 'prune'}`); the opencode lane is no longer a table without a pass.
  *
- * **The prompt is the host-honest two-option one.** The dsh bulk table offers
- * `forgetall` and `keeplines`; a partial `keeplines` needs a host that can
- * re-emit a result's kept lines inside its typed tool-result part. This host
- * cannot: `OpencodeToolResultPart.result` is one tagged value
- * (`host.ts:108-114`) and the wire derivation removes a unit's call and result
- * parts whole (`apply.ts:1505-1513`, `location.kind === 'unit'`). The prompt
- * therefore offers the two verdicts the host CAN apply — `keepall` and
- * `forgetall` — from core's `PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT`, whose own
- * words state "no line-level option". The reader accepts exactly those two
- * actions; `keeplines` and `forgetlines` are `action-not-in-grammar` refusals
- * that keep the unit. ADR-0053 §Amendment 2026-11-19 and ADR-0054 §Amendment
- * 2026-11-19 authorize this named difference.
+ * **The prompt is the product's `jsonl-20-nokeepall` message.** It is core's
+ * `entryBatchAskMessage(rows, "jsonl-20-nokeepall", firstTrigger)`, the same
+ * three-piece bytes the dsh depth table sends (ISSUE-508; ADR-0050 §Amendment
+ * 2026-11-23): the pre-table contract, the rendered table with each row's
+ * ` [L line(s)]`, then the post-table repeat that closes on the end anchor. The
+ * two actions are `forgetall` and `keeplines`; a whole unit is a full-range
+ * `keeplines` with summary `None`. A literal `keepall` is the terminal
+ * `action-not-in-grammar` refusal that keeps the unit. The 70 percent share line
+ * is on the session's first table ask, the 40 percent line on every later one
+ * (ADR-0050 decision 5).
  *
- * The 70/40 share lines are gone: PRD §6.5 scopes them to the deprecated
- * `3option` entry-ask compatibility path, never the product table.
+ * A partial `keeplines` is not refused here: it reaches the apply path as
+ * itself (`OpencodeToolResultPart.result` can carry a re-emitted kept-line
+ * result; whole-part removal is this adapter's policy, not a host limit —
+ * ADR-0054 §Amendment 2026-11-19, corrected 2026-11-23). A whole-range
+ * `keeplines` is normalized by the reader to a clean keep, so the apply path
+ * never sees a both-ends shape; the unit is released and re-tabled at a later
+ * crossing (ADR-0050 decision 3).
  *
  * Eligibility is the product's, not a subset:
  *   - a unit is tabled only after an already-sent request carried its node
@@ -48,13 +51,13 @@
  */
 
 import {
-  DEFAULT_CONFIG, EpisodeTracker, UnitTracker, parsePruneAnswer,
-  planPrunePass, PRUNE_ASK_FINAL_LINE, PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT,
-  renderPruneAskTable, TWO_VERDICT_GATE_CODE,
+  DEFAULT_CONFIG, EpisodeTracker, UnitTracker, entryBatchAskMessage,
+  isRefusedPruneAnchor, planPrunePass, readJsonl20NoKeepallAnswer,
 } from '@cremator/core';
 import type {
-  DedupeClasses, Episode, NodeId, PruneAnswerRow, PruneAskRow, PruneCallFacts,
-  PrunePassPlan, SessionSnapshot, ToolResultNode, UnitId, WireStamp,
+  DedupeClasses, EntryAnswer, EntryBatchRow, Episode, Jsonl20RowRefusalCode, NodeId,
+  PruneAnswerRefusalCode, PruneAnswerRow, PruneAskRow, PruneCallFacts, PrunePassPlan,
+  ProcessingUnit, SessionSnapshot, ToolResultNode, UnitId, WireAnswer, WireStamp,
 } from '@cremator/core';
 import {
   opencodeBankedRemovalOf, opencodeLiveResults, opencodeRetentionOf,
@@ -64,15 +67,23 @@ import type { OpencodeMessage } from './host.js';
 import { opencodeToolNodeId } from './snapshot.js';
 
 /**
- * The one ask grammar this mount renders: core's two-option bulk table with
- * `keepall` as the keep. The id is this adapter's own, because it is not the
- * dsh `nokeepall` family (which offers partial `keeplines`) and not the entry
- * `jsonl-20-nokeepall` wire: the prompt, the row shape and the reader are the
- * ones below, and no host config may name another.
+ * The one ask grammar this mount offers through its `crematorAskGrammar`
+ * option. The id is this adapter's own mount-option name; the PROMPT and the
+ * READER are core's `jsonl-20-nokeepall` family (ISSUE-509), so the table and
+ * the answer shape are byte-for-byte dsh's. No host config may name another.
  */
 export const OPENCODE_ASK_GRAMMAR = 'prune-two-option';
 
 export type OpencodeAskGrammar = typeof OPENCODE_ASK_GRAMMAR;
+
+/**
+ * The WIRE grammar this mount's ask actually is: core's `jsonl-20-nokeepall`
+ * prompt and reader (ISSUE-508; ISSUE-509). `OPENCODE_ASK_GRAMMAR` above is
+ * only the mount-option id a host config names; the journal and the capability
+ * line carry this value as `promptGrammar` so a run record names the message
+ * that was sent, not an adapter label.
+ */
+export const OPENCODE_ASK_PROMPT_GRAMMAR = 'jsonl-20-nokeepall';
 
 /** The slice of the mount's port the ask needs: the snapshot projection. */
 export interface OpencodeAskPort {
@@ -83,9 +94,11 @@ export interface OpencodeAskPort {
 export const OPENCODE_ASK_FLOOR_BYTES = DEFAULT_CONFIG.protocol.barBytes;
 
 /**
- * The frame the appended user turn opens with. The transient generate request
- * carries the session's own conversation, so the table arrives after real
- * history; this line states that the turn is instruction, not content.
+ * The retired adapter frame. It is NOT part of the message this mount sends:
+ * ISSUE-509 makes the ask core's own `jsonl-20-nokeepall` bytes, which open on
+ * the pre-table contract. No in-repo consumer imports it any more (the bench
+ * mock lane keys on the jsonl-20 markers); it stays exported for source
+ * compatibility with earlier releases, and a breaking release can remove it.
  */
 export const OPENCODE_ASK_FRAME =
   'The messages above are the production conversation. This message is one table of units still '
@@ -188,6 +201,14 @@ export interface OpencodeAskInput {
    * banked row or a seen mark would otherwise reach them.
    */
   readonly excludeNodeIds?: ReadonlySet<NodeId>;
+  /**
+   * Whether this fire is the session's FIRST table ask (ISSUE-194; ADR-0050
+   * decision 5). `true` states the 70 percent keep target, `false` the 40
+   * percent one for every later ask. Defaults to `true` for a pure table build;
+   * the mount passes `askFires === 0`, its durable count of asks that left and
+   * were answered or refused with rows.
+   */
+  readonly firstTrigger?: boolean;
 }
 
 /**
@@ -351,7 +372,7 @@ export function buildOpencodeAskBatch(input: OpencodeAskInput): OpencodeAskBatch
     }
     rows.push(row);
   }
-  const prompt = rows.length === 0 ? null : askPromptOf(rows);
+  const prompt = rows.length === 0 ? null : askPromptOf(rows, input.firstTrigger ?? true);
   return {
     revision: snapshot.revision,
     round,
@@ -413,60 +434,161 @@ export function buildOpencodePassPlan(input: {
     callFacts: callFactsOf(input.messages, input.sessionId),
     round: input.round,
     classes: input.classes ?? {},
-    // The plan's grammar selects the merge gate only. This adapter's prompt is
-    // the two-option family and its reader gates `keeplines`/`forgetlines`
-    // before anything is stored, so `3option` is the core grammar that accepts
-    // every answer this mount stores (`keepall`, `forgetall`) unchanged.
+    // The plan's grammar selects the merge gate only. This adapter's reader is
+    // core's `jsonl-20-nokeepall` one, which refuses a literal `keepall` and
+    // normalizes a whole-range `keeplines` to a clean `keepall` before anything
+    // is stored, so `3option` is the core grammar that accepts every answer this
+    // mount stores (`keepall`, `forgetall`, a partial `keeplines`) unchanged.
     grammar: '3option',
   });
 }
 
 /**
- * The exact user turn this host sends: the frame, core's two-option contract,
- * the table and core's closing line. No percentage line: the 70/40 shares are
- * the deprecated `3option` entry path, never the product table (PRD §6.5).
+ * The exact user turn this host sends. It is core's `jsonl-20-nokeepall` message
+ * byte for byte (ISSUE-508; ADR-0050 §Amendment 2026-11-23): the pre-table
+ * contract with its table slot replaced by the rendered rows, then the
+ * post-table repeat that closes on `[[entry-ask-end:`. `firstTrigger` selects
+ * the 70 percent share line for the session's first table ask and the 40
+ * percent one for every later ask; both halves of the message state the same
+ * variant.
  */
-export function askPromptOf(rows: readonly PruneAskRow[]): string {
-  return `${OPENCODE_ASK_FRAME}\n\n${PRUNE_ASK_TWO_OPTION_SYSTEM_PROMPT}\n\n`
-    + `${renderPruneAskTable(rows)}\n\n${PRUNE_ASK_FINAL_LINE}`;
+export function askPromptOf(
+  rows: readonly PruneAskRow[], firstTrigger = true,
+): string {
+  return entryBatchAskMessage(entryRowsOf(rows), OPENCODE_ASK_PROMPT_GRAMMAR, firstTrigger);
 }
 
 /**
- * Reads one reply under this ask's grammar. Every assigned index yields exactly
- * one result; a row the reader refuses means KEEP. The accepted actions are
- * exactly the two the prompt offers:
- *
- *   - `keepall` — the row keeps; the mount releases it for a later crossing;
- *   - `forgetall` — the row removes; the wire parser enforces the guard's own
- *     `RECEIPT_DESCRIPTOR_WORD_LIMIT` (25) before this point, so a longer
- *     summary is already `malformed-row` with wire code `summary-too-long`;
- *
- * every other action (`keeplines`, `forgetlines`) is
- * `action-not-in-grammar`, which is terminal: the mount keeps the unit and
- * never spends a re-ask on it (ADR-0053, as amended for this host).
+ * The table rows in the entry message's row shape, so the one core builder
+ * renders them: the call and its target ride the row's bracket slot, the pass's
+ * own `callOrdinal` fixes `(call #k)` (so a row reads the same ordinal on every
+ * harness and after a filtered subset), a refused anchor renders its own note,
+ * and the line count is the unit's own `L` (`0` for a zero-line unit, which the
+ * shared label writes as `[0 lines]`, exactly as the prune renderer does).
  */
+function entryRowsOf(rows: readonly PruneAskRow[]): readonly EntryBatchRow[] {
+  return rows.map(row => {
+    const anchor = row.anchor;
+    const count = lineCountOf(row.unit);
+    return {
+      index: row.index,
+      call: anchor.kind,
+      ...(anchor.path === undefined ? {} : { path: anchor.path }),
+      callOrdinal: anchor.callOrdinal,
+      ...(isRefusedPruneAnchor(anchor)
+        ? { anchorLines: [], anchorRefusal: anchor.refusal }
+        : { anchorLines: anchor.anchors }),
+      lineCount: count ?? 0,
+    };
+  });
+}
+
+/** A unit's own positive line count, or null for a zero-line or unreadable range. */
+function lineCountOf(unit: ProcessingUnit | undefined): number | null {
+  const range = unit?.span.lineRange;
+  if (range === null || range === undefined) return null;
+  const count = range.endLineInclusive - range.startLine + 1;
+  return Number.isSafeInteger(count) && count > 0 ? count : null;
+}
+
+/** Why one row produced no verdict, in the bulk table's own refusal vocabulary. */
+const OPENCODE_ROW_REFUSAL_CODE: Readonly<Record<Jsonl20RowRefusalCode, PruneAnswerRefusalCode>> = {
+  'answer-unreadable': 'answer-unreadable',
+  'missing-index': 'missing-index',
+  'duplicate-index': 'duplicate-index',
+  'action-not-in-grammar': 'action-not-in-grammar',
+  'malformed-row': 'malformed-row',
+  'mixed-keys': 'malformed-row',
+  'both-forgotten-and-summary': 'malformed-row',
+  'summary-missing': 'malformed-row',
+  'summary-too-long': 'malformed-row',
+  'bad-range': 'malformed-row',
+  'ranges-unordered': 'malformed-row',
+  'spans-outside-result': 'spans-outside-result',
+};
 
 /**
- * The terminal refusal this host's two-option grammar gives an action it does
- * not offer. Core's `TWO_VERDICT_GATE_MESSAGE` names `keeplines`, the dsh
- * family's partial action; this host's prompt offers `keepall`/`forgetall`
- * only, so the message names the two actions this host actually reads
- * (ADR-0053, as amended for this host).
+ * Reads one reply under this ask's grammar: core's
+ * `readJsonl20NoKeepallAnswer`, one object per line, one result per assigned
+ * index. A row the reader refuses means KEEP.
+ *
+ *   - `forgetall` — the row removes; the summary is read here and the guard's
+ *     25-word limit is the apply path's own check;
+ *   - `keeplines` — a partial keep names the lines that STAY; it is answered
+ *     here and passed to the apply path as itself (that path re-emits the kept
+ *     lines inside the result part, or refuses a non-text result by name). A
+ *     whole-range `keeplines` is normalized by the reader to a clean `keepall`,
+ *     so it keeps and re-tables at a later crossing;
+ *   - `keepall` — not offered by the prompt, so it is the terminal
+ *     `action-not-in-grammar` refusal that keeps the unit and spends no re-ask;
+ *   - `forgetlines` and every other shape are refused by the line reader and
+ *     keep their row.
+ *
+ * A zero-line unit (the row showed `[0 lines]`) is read with a sentinel count so
+ * a `keeplines` answer on it cannot throw, then refused `spans-outside-result`:
+ * no span lies inside `1..0`. The check runs on the ANSWER before any keep-all
+ * reading is believed: a literal `keepall` is already refused
+ * `action-not-in-grammar`, so an ANSWERED `keepall` on such a row can only be
+ * the sentinel's normalization of a whole-range `keeplines`, and it must not
+ * keep. That is the one place where the bulk table's code differs from the
+ * entry reader's, and it matches dsh's `parseTableReply`.
  */
-const OPENCODE_ACTION_NOT_IN_GRAMMAR_MESSAGE =
-  'The answer used an action this grammar does not offer; it takes keepall or '
-  + 'forgetall, so the unit is kept.';
-
 export function readOpencodeAskAnswer(
   batch: OpencodeAskBatch, text: string,
 ): readonly PruneAnswerRow[] {
-  const parsed = parsePruneAnswer(text, { indices: batch.indices, stamps: batch.stamps });
-  return parsed.rows.map(row => {
-    if (row.status !== 'answered') return row;
-    const action = row.answer.verdict.action;
-    if (action === 'keepall' || action === 'forgetall') return row;
-    return { index: row.index, unitId: row.unitId, status: 'refused',
-      code: TWO_VERDICT_GATE_CODE, message: OPENCODE_ACTION_NOT_IN_GRAMMAR_MESSAGE,
-      wireCode: null };
+  const counts = new Map<number, number>();
+  const zeroLine = new Set<number>();
+  for (const row of batch.rows) {
+    const count = lineCountOf(row.unit);
+    if (count === null) {
+      zeroLine.add(row.index);
+      counts.set(row.index, 1);
+    } else {
+      counts.set(row.index, count);
+    }
+  }
+  const reading = readJsonl20NoKeepallAnswer(text, batch.indices, counts);
+  return reading.rows.map((row): PruneAnswerRow => {
+    const stamp = batch.stamps.get(row.index);
+    if (stamp === undefined) {
+      throw new RangeError(`No stamp for index ${String(row.index)}.`);
+    }
+    if (row.status === 'refused') {
+      return { index: row.index, unitId: stamp.unitId, status: 'refused',
+        code: OPENCODE_ROW_REFUSAL_CODE[row.code], message: row.message, wireCode: null };
+    }
+    if (zeroLine.has(row.index)
+      && (row.answer.action === 'keeplines' || row.answer.action === 'keepall')) {
+      return { index: row.index, unitId: stamp.unitId, status: 'refused',
+        code: 'spans-outside-result',
+        message: "The keeplines answer named a line outside that row's own 1..L; the row is "
+          + 'kept.',
+        wireCode: null };
+    }
+    return { index: row.index, unitId: stamp.unitId, status: 'answered',
+      answer: wireAnswerOf(row.answer, stamp) };
   });
+}
+
+/**
+ * One parsed entry answer back in the wire notation the apply path reads. The
+ * stamp is the pass's own: identity and round never come from the answer.
+ */
+function wireAnswerOf(answer: EntryAnswer, stamp: WireStamp): WireAnswer {
+  if (answer.action === 'keepall') {
+    return { verdict: { unitId: stamp.unitId, answeredInRound: stamp.answeredInRound,
+      action: 'keepall' } };
+  }
+  if (answer.action === 'forgetall') {
+    return { verdict: { unitId: stamp.unitId, answeredInRound: stamp.answeredInRound,
+      action: 'forgetall', summary: answer.summary } };
+  }
+  // `forgetlines` cannot leave the `jsonl-20` reader: its action list does not
+  // carry it, so it is refused there. The arm keeps the type total.
+  if (answer.action === 'forgetlines') {
+    return { verdict: { unitId: stamp.unitId, answeredInRound: stamp.answeredInRound,
+      action: 'forgetlines', ranges: answer.ranges }, forgetlinesSummary: answer.summary };
+  }
+  return { verdict: { unitId: stamp.unitId, answeredInRound: stamp.answeredInRound,
+    action: 'keeplines', ranges: answer.ranges }, keeplinesSummary: answer.summary };
 }

@@ -1,4 +1,4 @@
-import type { NodeId } from "../types/identity.js";
+import type { ByteRange, NodeId } from "../types/identity.js";
 import type { RevertChoice, RevertCost, RevertInput, RevertItem } from "./types.js";
 
 /** Inputs to one cost evaluation; indices are transcript positions. */
@@ -15,10 +15,17 @@ export interface RevertCostInput {
 /**
  * Salvage arithmetic for one cut (design-protocol §2), transcribed:
  *
- *   freed(c)   = Σ byteLength(i)   for i ≥ c and i ∈ forgotten
- *   kept(c)    = Σ byteLength(i)   for i ≥ c and i ∉ forgotten
+ *   freed(c)   = Σ freedOf(i)     for i ≥ c and i ∈ forgotten
+ *   kept(c)    = Σ byteLength(i) − freedOf(i)  for i ≥ c and i ∈ forgotten
+ *              + Σ byteLength(i)  for i ≥ c and i ∉ forgotten
  *   receipt(c) = Σ receiptBytes(i) for i ≥ c and i ∈ forgotten
  *   net(c)     = freed(c) − kept(c) − receipt(c)
+ *
+ * `freedOf(i)` is the item's own `freedByteLength`, defaulting to its
+ * `byteLength`: a `forgetall` or any whole-node removal frees the node, while a
+ * partial keep frees only the ranges its answer gives up and re-sends the
+ * remainder (ISSUE-509). Counting a partial keep as wholly freed overprices
+ * the saving and under-prices the request that still carries the kept lines.
  *
  * Pure: no snapshot, clock, archive or ledger. Nodes before the cut are never
  * in a sum — they survive untouched. Both the kept suffix and the receipts
@@ -110,12 +117,46 @@ function suffixSums(
     const item = nodes[index];
     if (item === undefined) continue; // unreachable: index < length
     const isForgotten = forgotten.has(index);
-    freed[index] = (freed[index + 1] ?? 0) + (isForgotten ? item.byteLength : 0);
-    kept[index] = (kept[index + 1] ?? 0) + (isForgotten ? 0 : item.byteLength);
+    // A forgotten node frees only the bytes its removal drops; the rest of it
+    // stays in the request, so it is priced with the kept suffix (ISSUE-509).
+    const freedHere = isForgotten ? freedBytesOfItem(item) : 0;
+    freed[index] = (freed[index + 1] ?? 0) + freedHere;
+    kept[index] = (kept[index + 1] ?? 0) + (item.byteLength - freedHere);
     receipts[index] = (receipts[index + 1] ?? 0)
       + (isForgotten ? receiptFor(receiptBytes, index) : 0);
   }
   return { freed, kept, receipts };
+}
+
+/**
+ * The freed bytes of one removal: the sum of its dropped byte ranges. A partial
+ * keep drops only the ranges its answer gives up; a whole-node removal names
+ * the whole span, so the sum is the node's length. The two guard call sites
+ * derive the same number through this one function, so the plan's cost and the
+ * guard's re-derivation cannot drift (ISSUE-509).
+ */
+export function freedBytesOf(ranges: readonly ByteRange[]): number {
+  let total = 0;
+  for (const range of ranges) {
+    if (!Number.isSafeInteger(range.startByte) || !Number.isSafeInteger(range.endByteExclusive)
+      || range.endByteExclusive < range.startByte) {
+      throw new Error("A removal range must be integral and must not run backwards");
+    }
+    total += range.endByteExclusive - range.startByte;
+  }
+  if (!Number.isSafeInteger(total)) {
+    throw new Error("A removal's freed bytes must be a safe integer");
+  }
+  return total;
+}
+
+/** The bytes one forgotten item frees; a malformed value would corrupt every sum. */
+function freedBytesOfItem(item: RevertItem): number {
+  const freed = item.freedByteLength ?? item.byteLength;
+  if (!Number.isSafeInteger(freed) || freed < 0 || freed > item.byteLength) {
+    throw new Error(`Revert item ${item.nodeId} frees ${freed} of its ${item.byteLength} bytes`);
+  }
+  return freed;
 }
 
 /** Reads one receipt cost; a malformed value would corrupt every sum silently. */

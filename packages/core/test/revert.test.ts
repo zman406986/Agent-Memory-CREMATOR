@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chooseRevertCut, revertCost } from "../src/revert/cost.js";
+import { chooseRevertCut, freedBytesOf, revertCost } from "../src/revert/cost.js";
 import { chooseRevert, planRevertApplication } from "../src/revert/plan.js";
 import type {
   RevertChoice, RevertCost, RevertInput, RevertItem, RevertPlan,
@@ -12,6 +12,14 @@ import type {
  */
 function item(index: number, byteLength: number): RevertItem {
   return { id: `entry-${index}`, nodeId: `node-${index}`, byteLength };
+}
+
+/**
+ * A partially kept entry: it frees only the bytes its removal drops
+ * (`freedByteLength`) and the rest stays in the request (ISSUE-509).
+ */
+function partialItem(index: number, byteLength: number, freedByteLength: number): RevertItem {
+  return { ...item(index, byteLength), freedByteLength };
 }
 
 /** Every receipt costs the same in these fixtures, so hand arithmetic stays exact. */
@@ -147,6 +155,57 @@ test("the §2 cost table — one row per cut, hand arithmetic", () => {
   for (const row of COST_ROWS) {
     assert.deepEqual(costOf(row.nodes, row.forgotten, row.cutIndex), row.expect, `row: ${row.name}`);
   }
+});
+
+// --- a partial keep (ISSUE-509) ----------------------------------------------
+
+test("a partial keep frees only its dropped ranges and keeps the remainder in the request", () => {
+  // A 1 000-byte unit answered `keeplines` over all but one line: 250 bytes are
+  // dropped, 750 stay in the request beside the 3 000-byte survivor.
+  const nodes = [item(0, 500), partialItem(1, 1_000, 250), item(2, 3_000)];
+  assert.deepEqual(costOf(nodes, new Set([1]), 1), {
+    cutIndex: 1, freedBytes: 250, keptBytes: 750 + 3_000, receiptBytes: RECEIPT,
+    netFreedBytes: 250 - 3_750 - RECEIPT,
+  }, "row: partial keep — the kept lines are not a saving and they are paid again");
+});
+
+test("a whole-node removal prices exactly as it did before the partial-keep fix", () => {
+  // `freedByteLength` absent (every pre-existing caller) and set to the node's
+  // own length must be one cost, field for field.
+  const whole = [item(0, 500), item(1, 1_000), item(2, 3_000)];
+  const explicit = [item(0, 500), partialItem(1, 1_000, 1_000), item(2, 3_000)];
+  assert.deepEqual(costOf(explicit, new Set([1]), 1), costOf(whole, new Set([1]), 1),
+    "row: an explicit whole-node free is the default");
+  assert.deepEqual(costOf(whole, new Set([1]), 1), {
+    cutIndex: 1, freedBytes: 1_000, keptBytes: 3_000, receiptBytes: RECEIPT,
+    netFreedBytes: 1_000 - 3_000 - RECEIPT,
+  }, "row: the whole node is freed and nothing of it is kept");
+});
+
+test("a removal that drops no bytes frees nothing and the chooser refuses its cut", () => {
+  const nodes = [item(0, 500), partialItem(1, 1_000, 0), item(2, 3_000)];
+  assert.deepEqual(costOf(nodes, new Set([1]), 1), {
+    cutIndex: 1, freedBytes: 0, keptBytes: 1_000 + 3_000, receiptBytes: RECEIPT,
+    netFreedBytes: -4_000 - RECEIPT,
+  }, "row: an empty drop frees zero and keeps the whole node");
+  assert.equal(chooseRevertCut(inputOf(nodes, new Set([1]), { minCutFreedBytes: 0 })), null,
+    "row: a cut that frees nothing never wins, even with the floor removed");
+});
+
+test("the freed bytes of one removal are the sum of its dropped ranges", () => {
+  // The dropped span of the guard's four-line fixture (lines 2–3), then two
+  // disjoint spans.
+  assert.equal(freedBytesOf([{ startByte: 7, endByteExclusive: 24 }]), 17);
+  assert.equal(freedBytesOf([
+    { startByte: 0, endByteExclusive: 3 }, { startByte: 10, endByteExclusive: 15 },
+  ]), 8);
+  assert.equal(freedBytesOf([]), 0, "no ranges drop no bytes");
+  assert.throws(() => freedBytesOf([{ startByte: 5, endByteExclusive: 4 }]),
+    /must not run backwards/, "an inverted range must be named, not summed");
+  assert.throws(() => revertCost({
+    nodes: [partialItem(0, 100, 101)], forgotten: new Set([0]), cutIndex: 0,
+    receiptBytes: () => 0,
+  }), /frees 101 of its 100 bytes/, "a free larger than the node must be named");
 });
 
 // --- selection: which prefix node is cut -------------------------------------

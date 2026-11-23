@@ -11,6 +11,11 @@
  * no re-ask spends a second reply on it. A span refusal is re-askable wherever
  * the lane re-asks other unreadable rows; the gate only names the defect.
  *
+ * The action is read case- and plural-insensitively before that gate decides
+ * (ISSUE-515): `KEEPLINES` and `keepline` are the one action `keeplines`, and
+ * only the canonical spelling leaves the gate. A `keepall` in any spelling is
+ * still an action this grammar does not offer.
+ *
  * The one shape the gate normalizes is a `keeplines` whose merged spans cover
  * the row's whole `1..L`: it removes nothing, so it becomes a clean `keepall`.
  * Left as a `keeplines` it would reach the apply path as a both-ends plan that
@@ -32,9 +37,10 @@
  * path is not touched here, and nothing is mutated.
  */
 
+import { normalizeActionKey } from "../verdicts/action-keys.js";
 import type { EntryAnswer } from "../verdicts/entry-wire.js";
 import { normalizeKeptSpans } from "../verdicts/plan.js";
-import type { KeptLineSpan } from "../verdicts/types.js";
+import type { KeptLineSpan, Verdict } from "../verdicts/types.js";
 import type { WireAnswer } from "../verdicts/wire.js";
 
 /**
@@ -99,16 +105,17 @@ export function normalizeTwoVerdictAnswer(
   lineCount: number,
 ): TwoVerdictAnswer {
   checkedLineCount(lineCount);
-  if (answer.action !== "forgetall" && answer.action !== "keeplines") {
+  const canonical = canonicalEntryAnswer(answer);
+  if (canonical.action !== "forgetall" && canonical.action !== "keeplines") {
     return refusal(TWO_VERDICT_GATE_CODE, TWO_VERDICT_GATE_MESSAGE);
   }
-  if (answer.action === "keeplines" && spansOutsideResult(answer.ranges, lineCount)) {
+  if (canonical.action === "keeplines" && spansOutsideResult(canonical.ranges, lineCount)) {
     return refusal(SPANS_OUTSIDE_RESULT_CODE, SPANS_OUTSIDE_RESULT_MESSAGE);
   }
-  if (answer.action === "keeplines" && coversWholeResult(answer.ranges, lineCount)) {
+  if (canonical.action === "keeplines" && coversWholeResult(canonical.ranges, lineCount)) {
     return { status: "answered", answer: { action: "keepall" } };
   }
-  return { status: "answered", answer };
+  return { status: "answered", answer: canonical };
 }
 
 /**
@@ -126,7 +133,8 @@ export function normalizeWireTwoVerdictAnswer(
   lineCount: number | null,
 ): WireTwoVerdictAnswer {
   if (lineCount !== null) checkedLineCount(lineCount);
-  const verdict = answer.verdict;
+  const canonical = canonicalWireAnswer(answer);
+  const verdict = canonical.verdict;
   if (verdict.action !== "forgetall" && verdict.action !== "keeplines") {
     return refusal(TWO_VERDICT_GATE_CODE, TWO_VERDICT_GATE_MESSAGE);
   }
@@ -146,7 +154,25 @@ export function normalizeWireTwoVerdictAnswer(
       },
     };
   }
-  return { status: "answered", answer };
+  return { status: "answered", answer: canonical };
+}
+
+/**
+ * The same answer with its action key in canonical spelling (ISSUE-515). The
+ * gate reads the action case- and plural-insensitively; the shape it returns is
+ * the canonical one, so nothing downstream sees `KEEPLINES` as an action.
+ */
+function canonicalEntryAnswer(answer: EntryAnswer): EntryAnswer {
+  const action = normalizeActionKey(answer.action);
+  if (action === null || action === answer.action) return answer;
+  return { ...answer, action } as EntryAnswer;
+}
+
+/** The wire reading of `canonicalEntryAnswer`: the same leniency, same output shape. */
+function canonicalWireAnswer(answer: WireAnswer): WireAnswer {
+  const action = normalizeActionKey(answer.verdict.action);
+  if (action === null || action === answer.verdict.action) return answer;
+  return { ...answer, verdict: { ...answer.verdict, action } as Verdict };
 }
 
 /** The one refusal shape, so both normalizers answer with the same sentence per code. */

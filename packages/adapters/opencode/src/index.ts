@@ -13,6 +13,7 @@ export type {
 } from './apply.js';
 export {
   OPENCODE_ASK_FLOOR_BYTES, OPENCODE_ASK_FRAME, OPENCODE_ASK_GRAMMAR,
+  OPENCODE_ASK_PROMPT_GRAMMAR,
   askPromptOf, buildOpencodeAskBatch, buildOpencodePassPlan, isSeenUnit, readOpencodeAskAnswer,
 } from './ask.js';
 export type {

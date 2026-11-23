@@ -15,6 +15,12 @@
  * answers here moves from `refused` to `kept`; a row that refuses again keeps
  * the correction's own code and its unit stays kept, the fail-safe unchanged.
  *
+ * ISSUE-508 (F3): the correction speaks the pass's ONE grammar. Under
+ * `nokeepall` its message is the line-per-row shape (`[L line(s)]` rows, one
+ * object per row per line with a sibling summary, no share line) and its reply
+ * is read by the same `readJsonl20NoKeepallAnswer` reader the table used; under
+ * `3option` the bytes and the index-keyed reading are unchanged.
+ *
  * Nothing here runs when the loop halted: a pass with no readable answer has
  * nothing to correct, and a "your previous answer" turn after a dead socket
  * would be a false claim about what the model said. A pass whose first answer
@@ -25,14 +31,13 @@
  * never throws.
  */
 import {
-  ForkError, appendAsk, appendVerdict, parsePruneAnswer, pruneCorrectionMessage,
-  summarizeTableAttempt,
+  ForkError, appendAsk, appendVerdict, pruneCorrectionMessage, summarizeTableAttempt,
 } from '@cremator/core';
 import type {
   PruneAnswerRejection, PruneAskGrammar, PruneAskRow, PruneCorrectionReason, PruneTableAttempt,
   WireFork,
 } from '@cremator/core';
-import { grammarRowsOf } from './judge-tables.js';
+import { parseTableReply } from './judge-tables.js';
 import type { AnsweredRow, RowRefusal, TableLoopOutcome } from './judge-tables.js';
 import type { MountJournal } from './journal-kinds.js';
 import { askWire } from './llm-ask.js';
@@ -55,8 +60,10 @@ export interface CorrectionTurnOptions {
    * The pass's bulk ask grammar (ISSUE-221). The mount always passes its
    * resolved value (the shipped default is `nokeepall`, ADR-0056); a direct
    * caller that omits it gets `3option`, the original contract byte for byte.
-   * `nokeepall` renders the correction's rows and closing line that way, and a
-   * row refused `action-not-in-grammar` is never re-asked.
+   * `nokeepall` renders the correction in that grammar's line-per-row shape
+   * (rows with their `[L line(s)]`, then the one-object-per-row answer shapes,
+   * no closing line), and a row refused `action-not-in-grammar` is never
+   * re-asked.
    */
   readonly grammar?: PruneAskGrammar;
   readonly timeoutMs?: number;
@@ -85,12 +92,18 @@ export async function retryRefusedRows(options: CorrectionTurnOptions): Promise<
     return refusal !== undefined && refusal.code !== 'action-not-in-grammar';
   });
   if (rows.length === 0) return loop;
-  const reasons: PruneCorrectionReason[] = rows.map(row => ({
-    index: row.index,
+  const reasons: PruneCorrectionReason[] = rows.map(row => {
     // The map's key set is `rows`' own, so the fallback never fires; it is the
     // refusal rule itself rather than a silent `keepall` if that ever changes.
-    code: loop.refused.get(row.index)?.code ?? 'missing-index',
-  }));
+    const refusal = loop.refused.get(row.index);
+    return {
+      index: row.index,
+      code: refusal?.code ?? 'missing-index',
+      // The line reader's finer code rides beside its collapsed `malformed-row`,
+      // so the re-ask names the defect the model actually made (F4).
+      ...(refusal?.detail === undefined ? {} : { detail: refusal.detail }),
+    };
+  });
   let correction: string;
   try {
     correction = pruneCorrectionMessage({
@@ -149,11 +162,12 @@ export async function retryRefusedRows(options: CorrectionTurnOptions): Promise<
   }
 
   const correctionFork = appendVerdict(fork, reply.text);
-  const parsed = parsePruneAnswer(reply.text, { indices, stamps: options.stamps });
-  // ISSUE-221: the correction's reply crosses the same two-verdict gate as a
-  // table's, so a full-range `keeplines` is a clean keep and a literal
-  // `keepall` is the terminal refusal, never a kept verdict.
-  const correctedRows = grammarRowsOf(parsed.rows, rows, grammar);
+  // ISSUE-508 (F3): the correction reply is read in the SAME grammar the turn
+  // asked in. `nokeepall` is the one-object-per-line reader; `3option` is the
+  // shipped batch parser. No second normalization is applied: the line reader's
+  // own gate already decides the two-verdict set.
+  const correctionReading = parseTableReply(reply.text, indices, options.stamps, rows, grammar);
+  const correctedRows = correctionReading.rows;
   const kept = new Map<number, AnsweredRow>(loop.kept);
   const refused = new Map<number, RowRefusal>(loop.refused);
   for (const row of correctedRows) {
@@ -168,12 +182,13 @@ export async function retryRefusedRows(options: CorrectionTurnOptions): Promise<
     // record names what FINALLY happened rather than the earlier attempt.
     const row = correctedRows.find(entry => entry.index === index);
     refused.set(index, row?.status === 'refused'
-      ? { code: row.code, message: row.message, wireCode: row.wireCode, table }
+      ? { code: row.code, message: row.message, wireCode: row.wireCode, table,
+        ...(row.detail === undefined ? {} : { detail: row.detail }) }
       : { code: 'missing-index', wireCode: null, table,
         message: `Index ${String(index)} was not answered; that unit is kept.` });
   }
   const rejected: (PruneAnswerRejection & { readonly table: number })[] = [
-    ...loop.rejected, ...parsed.rejected.map(entry => ({ ...entry, table })),
+    ...loop.rejected, ...correctionReading.rejected.map(entry => ({ ...entry, table })),
   ];
   const attempt = correctionAttemptOf(loop);
   const reading = summarizeTableAttempt(rows, correctedRows, attempt);
@@ -183,7 +198,8 @@ export async function retryRefusedRows(options: CorrectionTurnOptions): Promise<
   journal('prune-correction', { sessionId, round, tables: table, attempt,
     refusedRows: rows.length, ofRows: options.rows.length,
     corrected, stillRefused: indices.length - corrected,
-    reasons: reasons.map(reason => `${String(reason.index)}:${reason.code}`) });
+    reasons: reasons.map(reason =>
+      `${String(reason.index)}:${reason.detail ?? reason.code}`) });
   return {
     fork: correctionFork,
     // A correction is not a halt: whatever it answered stands, and whatever it

@@ -15,6 +15,9 @@
  * after a restart is the pass's baseline, not a wasted re-ask. The durable
  * pending-append intent rides it too (ISSUE-374): the records a committed
  * append owes the host, so a death before the flush replays them on remount.
+ * The two first-ask flags ride it as well (ISSUE-406, ISSUE-508): the entry
+ * ask's, and the depth table's, so a restart states the later 40 percent share
+ * line instead of repeating the 70 percent one.
  *
  * Concurrency ruling (2026-10-24, ISSUE-035 item 9): two mounts of the SAME
  * session in one process may both read round n and both write n+1. Accepted and
@@ -208,6 +211,8 @@ export function writePruneRound(target: ResolvedRacoonsStorage, round: number,
     ...(trigger === undefined ? {} : { trigger }),
     ...(typeof prior['entryAskFired'] === 'boolean'
       ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(typeof prior['tableAskFired'] === 'boolean'
+      ? { tableAskFired: prior['tableAskFired'] } : {}),
     ...(Array.isArray(appends) ? { appends } : {}) },
   journal, sessionId, 'prune-round-error', fields);
 }
@@ -260,7 +265,64 @@ export function writeEntryAskFired(target: ResolvedRacoonsStorage, fired: boolea
     ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
       ? { trigger: prior['trigger'] } : {}),
     ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
+    ...(typeof prior['tableAskFired'] === 'boolean'
+      ? { tableAskFired: prior['tableAskFired'] } : {}),
     entryAskFired: fired,
+  }, journal, sessionId, 'prune-round-error', fields);
+}
+
+/**
+ * Whether this session's depth table has already left its first ask
+ * (ISSUE-508), read from the same per-session file as the round, the latch and
+ * the entry flag. An absent, corrupt or non-boolean value reads `false`: the
+ * safe failure is to state the first-ask share once more, never to claim a
+ * history the file cannot prove. A fork starts false — the parent's table
+ * history is not the child's.
+ */
+export function readTableAskFired(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): boolean {
+  const dir = sessionDirOf(target);
+  if (dir === null) return false;
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    nameReadRefusal(journal, sessionId, 'tableAskFired', read.reason);
+    return false;
+  }
+  const fired = read.doc['tableAskFired'];
+  if (fired === undefined) return false;
+  if (typeof fired === 'boolean') return fired;
+  nameReadRefusal(journal, sessionId, 'tableAskFired',
+    'the tableAskFired record is structurally invalid; reading it as absent');
+  return false;
+}
+
+/**
+ * Record that this session's depth table has asked at least once (ISSUE-508),
+ * preserving the round, the latch, the entry flag and the pending appends the
+ * same file carries. One boolean on the existing per-session store — no new
+ * store and no cap. Fail-open: a failed write journals `prune-round-error` and
+ * the in-memory flag still serves this process; only the restart durability is
+ * lost.
+ */
+export function writeTableAskFired(target: ResolvedRacoonsStorage, fired: boolean,
+  journal: MountJournal, sessionId: string): boolean {
+  const dir = sessionDirOf(target);
+  if (dir === null) return true;
+  const read = readDoc(dir);
+  const fields = { tableAskFired: fired };
+  if (read.transient) {
+    return refusePublish(dir, read.reason ?? 'unreadable', journal, sessionId,
+      'prune-round-error', fields);
+  }
+  const prior = read.doc;
+  return publishDoc(dir, {
+    ...(typeof prior['round'] === 'number' ? { round: prior['round'] } : {}),
+    ...(typeof prior['trigger'] === 'object' && prior['trigger'] !== null
+      ? { trigger: prior['trigger'] } : {}),
+    ...(typeof prior['entryAskFired'] === 'boolean'
+      ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(Array.isArray(prior['appends']) ? { appends: prior['appends'] } : {}),
+    tableAskFired: fired,
   }, journal, sessionId, 'prune-round-error', fields);
 }
 
@@ -386,6 +448,8 @@ export function writePendingAppends(target: ResolvedRacoonsStorage,
       ? { trigger: prior['trigger'] } : {}),
     ...(typeof prior['entryAskFired'] === 'boolean'
       ? { entryAskFired: prior['entryAskFired'] } : {}),
+    ...(typeof prior['tableAskFired'] === 'boolean'
+      ? { tableAskFired: prior['tableAskFired'] } : {}),
     ...(records.length > 0 ? { appends: records } : {}),
   }, journal, sessionId, 'append-persist-error', fields);
 }

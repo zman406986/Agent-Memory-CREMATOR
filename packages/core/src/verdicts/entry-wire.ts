@@ -20,6 +20,13 @@
  * (ADR-0026). Keeping that shape single-variable is what makes the K-versus-F
  * comparison one difference (ADR-0027).
  *
+ * The action KEY is matched case- and plural-insensitively (ISSUE-515):
+ * `KEEPLINES`, `keepline`, `KEEPline` and `keepLines` are one action, through
+ * `normalizeActionKey`. The prompt still teaches the canonical spelling, and a
+ * true misspelling (`kleplines`) stays `unknown-action`. Two action keys that
+ * normalize to one action are still two keys and still refused `mixed-keys`;
+ * `summary` is never normalized.
+ *
  * There is no keep-first-N form and no byte offset (ADR-0022 §9). A `keephead`
  * answer is therefore not an action: the action list does not name it, so it
  * falls through to the ordinary `unknown-action` refusal, exactly as it does on
@@ -40,6 +47,7 @@
  * whole (ADR-0022 §14: fail-open, breaker-free).
  */
 
+import { normalizeActionKey } from "./action-keys.js";
 import { descriptorIssue, RECEIPT_DESCRIPTOR_WORD_LIMIT } from "./labels.js";
 import { normalizeKeptSpans } from "./plan.js";
 import type { KeptLineSpan } from "./types.js";
@@ -84,6 +92,7 @@ export type EntryAnswerErrorCode =
   | "malformed-json"
   | "not-an-object"
   | "mixed-keys"
+  | "both-forgotten-and-summary"
   | "unknown-action"
   | "invalid-keepall"
   | "invalid-keeplines"
@@ -114,16 +123,17 @@ const MESSAGES: Readonly<Record<EntryAnswerErrorCode, string>> = {
   "empty-text": "The answer carries no text.",
   "malformed-json": "The answer is not readable JSON.",
   "not-an-object": "An answer is one JSON object.",
-  "mixed-keys": "An answer carries exactly one action key: a partial answer may add one summary.",
+  "mixed-keys": "An answer carries exactly one action key: a partial answer may add one forgotten value.",
+  "both-forgotten-and-summary": "An answer carries forgotten or its legacy alias summary, never both.",
   "unknown-action": `The entry action is not one of ${ENTRY_ANSWER_ACTIONS.join(", ")}.`,
   "invalid-keepall": "keepall carries the boolean true and nothing else.",
-  "invalid-keeplines": "keeplines carries an array of [start,end] pairs and a trailing summary string.",
-  "invalid-forgetlines": "forgetlines carries an array of [start,end] pairs and a trailing summary string.",
+  "invalid-keeplines": "keeplines carries an array of [start,end] pairs and a trailing forgotten string.",
+  "invalid-forgetlines": "forgetlines carries an array of [start,end] pairs and a trailing forgotten string.",
   "invalid-span": "Every span is a [start,end] pair of integers with 1 <= start <= end.",
   "empty-ranges": "keeplines names at least one [start,end] pair.",
-  "summary-missing": "The last element of a keeplines array is one summary string.",
-  "summary-too-long": `A summary stays within ${String(RECEIPT_DESCRIPTOR_WORD_LIMIT)} words.`,
-  "invalid-forgetall": "forgetall carries its summary string as the value.",
+  "summary-missing": "A partial answer carries one forgotten value: last in the array or in a sibling forgotten key (legacy summary accepted).",
+  "summary-too-long": `A forgotten value stays within ${String(RECEIPT_DESCRIPTOR_WORD_LIMIT)} words.`,
+  "invalid-forgetall": "forgetall carries its forgotten string as the value.",
 };
 
 function refuse(code: EntryAnswerErrorCode): never {
@@ -152,8 +162,8 @@ export function parseEntryAnswer(text: string): EntryAnswer {
     refuse("not-an-object");
   }
   const record = parsed as Record<string, unknown>;
-  const action = readActionKey(record);
-  const payload = record[action];
+  const { action, key } = readActionKey(record);
+  const payload = record[key];
   const flat = readFlatSummary(record);
   switch (action) {
     case "keepall":
@@ -214,35 +224,69 @@ function isPartialAction(action: string): action is "keeplines" | "forgetlines" 
 }
 
 /**
- * The action the record's top-level keys name. One action key is the rule; a
- * partial action may sit beside the literal key `summary` (ADR-0033). Any other
- * key set — no action, two actions, or a stranger beside one — is mixed.
+ * The action the record's top-level keys name, with the key's raw spelling so
+ * the payload is read from the exact key the model wrote. The key is matched
+ * through `normalizeActionKey` (ISSUE-515), so case and one trailing `s` do not
+ * change the action, while two action keys stay two keys. One action key is the
+ * rule; a partial action may sit beside the literal key `forgotten` (legacy
+ * alias `summary`, ADR-0033). Any other key set — no action, two actions, or a
+ * stranger beside one — is mixed.
  */
-function readActionKey(record: Record<string, unknown>): EntryAnswerAction {
+function readActionKey(record: Record<string, unknown>): {
+  readonly action: EntryAnswerAction;
+  readonly key: string;
+} {
   const keys = Object.keys(record);
   if (keys.length === 1) {
     const only = keys[0];
     if (only === undefined) refuse("mixed-keys");
-    if (!isEntryAction(only)) refuse("unknown-action");
-    return only;
+    const action = entryActionOf(only);
+    if (action === null) refuse("unknown-action");
+    return { action, key: only };
   }
-  if (keys.length !== 2) refuse("mixed-keys");
-  const action = keys.find(isEntryAction);
-  if (action === undefined || !isPartialAction(action)) refuse("mixed-keys");
-  if (!keys.includes("summary")) refuse("mixed-keys");
-  return action;
+  if (keys.length > 3) refuse("mixed-keys");
+  const actionKeys = keys.filter(key => entryActionOf(key) !== null);
+  // Two spellings of one action are still two action keys, never one picked.
+  if (actionKeys.length !== 1) refuse("mixed-keys");
+  const raw = actionKeys[0];
+  if (raw === undefined) refuse("mixed-keys");
+  const action = entryActionOf(raw);
+  if (action === null || !isPartialAction(action)) refuse("mixed-keys");
+  const extras = keys.filter(key => key !== raw);
+  if (extras.some(key => !isDescriptorKey(key))) refuse("mixed-keys");
+  if (extras.length === 2) refuse("both-forgotten-and-summary");
+  return { action, key: raw };
 }
 
-/** The record's sibling `summary` slot: whether it exists, and what it holds. */
+/** Whether a key carries a partial answer's forgotten value. */
+function isDescriptorKey(key: string): boolean {
+  return key === "forgotten" || key === "summary";
+}
+
+/** The canonical action one key names, or null; case and plurality are folded. */
+function entryActionOf(key: string): EntryAnswerAction | null {
+  const normalized = normalizeActionKey(key);
+  return normalized !== null && isEntryAction(normalized) ? normalized : null;
+}
+
+/** The record's sibling forgotten slot: whether it exists, and what it holds. */
 interface FlatSummary {
   readonly present: boolean;
   readonly value: unknown;
 }
 
-/** The sibling `summary` key's value; absent is not the same as a wrong type. */
+/**
+ * The sibling descriptor's value: `forgotten` is canonical and `summary` the
+ * legacy alias. A record carrying both is refused by `readActionKey` before
+ * this is read, so the canonical key wins here and nothing is merged.
+ */
 function readFlatSummary(record: Record<string, unknown>): FlatSummary {
-  const present = Object.hasOwn(record, "summary");
-  return { present, value: present ? record.summary : undefined };
+  const canonical = Object.hasOwn(record, "forgotten");
+  const legacy = Object.hasOwn(record, "summary");
+  return {
+    present: canonical || legacy,
+    value: canonical ? record.forgotten : record.summary,
+  };
 }
 
 /**

@@ -237,7 +237,7 @@ test('an unknown cache applies a prune pass once: one revert, one epoch break', 
   // The pass forgets ONE unit, so the checkpoint-revert shadows one host node
   // (dsh accepts a tool/result replacement as a single content-only node).
   const env = await mounted({ id: 's-apply-unknown', window: 1_000_000,
-    answer: '{"2":{"forgetall":"an old read"}}' });
+    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
   try {
     // The shipped mount states no cache at all: this is the real state.
     const before = await env.entry.port.snapshot();
@@ -628,7 +628,7 @@ test('a warm watermark at the removal\'s node applies; one node deeper refuses',
   // the watermark: a removal whose node sits exactly AT the watermark applies,
   // the same removal one node deeper into the cached prefix is refused.
   const atFence = await mounted({ id: 's-watermark-at', window: 1_000_000,
-    answer: '{"2":{"forgetall":"an old read"}}' });
+    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
   try {
     const items = atFence.entry.port.transcript();
     const at = items.findIndex(item => item.id === `dsh:${atFence.session.id}:result:c2`);
@@ -650,7 +650,7 @@ test('a warm watermark at the removal\'s node applies; one node deeper refuses',
   // The same pass with the fence one node deeper: the removal's node is now
   // below it, and the cut is refused before any candidate is built.
   const deeper = await mounted({ id: 's-watermark-deeper', window: 1_000_000,
-    answer: '{"2":{"forgetall":"an old read"}}' });
+    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
   try {
     const items = deeper.entry.port.transcript();
     const at = items.findIndex(item => item.id === `dsh:${deeper.session.id}:result:c2`);
@@ -678,7 +678,7 @@ test('a warm watermark at the removal\'s node applies; one node deeper refuses',
 
 test('ISSUE-470: a stale main-wire capture refuses the prune seed by name', async () => {
   const env = await mounted({ id: 's-prune-seed-stale', window: 1_000_000,
-    answer: '{"1":{"forgetall":"an old read"}}' });
+    answer: '{"1":{"forgetall":true,"summary":"an old read"}}' });
   try {
     // Captured under the opening route; the pass now runs under another model.
     env.session.setRoute({ provider: 'a6', model: 'gpt-6-astra' });
@@ -800,7 +800,7 @@ test('a manual pass with a removal and no window records, and names no-window', 
   // the rollout's first stage, so nothing is sent to the engine and the skip
   // says why.
   const env = await mounted({ id: 's-no-window-removal',
-    answer: '{"2":{"forgetall":"an old read"}}' });
+    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
   try {
     const outcome = await env.mount.runPrune(env.session);
     assert.equal(outcome?.application?.removals.length, 1, 'the pass did produce a removal');

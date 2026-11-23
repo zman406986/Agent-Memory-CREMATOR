@@ -310,26 +310,28 @@ const JSONL_20_PROMPT_LINES = target => Object.freeze([
   "Rules:",
   "1. One object per line. One row per object. Nothing else on the line.",
   "2. Exactly one action key per row: keepall, forgetall, or keeplines.",
-  "3. keepall carries nothing else. forgetall and keeplines must also carry summary.",
+  "3. keepall carries nothing else. forgetall and keeplines must also carry forgotten: what is "
+    + "being dropped and why.",
   "4. forgetall forgets the whole row. keeplines keeps the listed lines and forgets every line "
     + "not listed.",
   "5. keeplines is an ascending array of non-overlapping [start,end] pairs, integers, inside 1..L, "
     + "where L is that row's line count shown in the table.",
-  "6. summary is one line of plain text, less than 20 words. It names what the forgotten content "
-    + "was about so it can be recalled. Use no raw newline. Escape a double quote as \\\".",
+  "6. forgotten is one line of plain text, less than 20 words. It names what is being dropped and "
+    + "why, so it can be recalled. It never describes the lines you keep. Use no raw newline. "
+    + "Escape a double quote as \\\".",
   "7. Every row in the table appears exactly once. Add no other rows, keys, or text.",
-  "8. Before sending, check each line: one object, one action key, summary present when "
+  "8. Before sending, check each line: one object, one action key, forgotten present when "
     + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own.",
   "",
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",
@@ -345,13 +347,13 @@ const JSONL_20_PROMPT_LINES = target => Object.freeze([
 const JSONL_20_REPEAT_LINES = target => Object.freeze([
   "Answer format:",
   '{"N":{"keepall":true}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
   '{"1":{"keepall":true}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",
@@ -389,9 +391,9 @@ export const JSONL_20_NOKEEPALL_LATER_TARGET =
 /**
  * `jsonl-20-nokeepall`'s pre-table prompt: `jsonl-20`'s bytes with `keepall`
  * removed from the rule list, from the answer format and from the example. The
- * keep-everything shape is `{"N":{"keeplines":[[1,120]],"summary":"all kept"}}`
+ * keep-everything shape is `{"N":{"keeplines":[[1,120]],"forgotten":"None"}}`
  * — a `keeplines` over the whole range, which the reader accepts as keep-whole.
- * Every other rule, example, the summary cap, the slot and the anchors are
+ * Every other rule, example, the forgotten cap, the slot and the anchors are
  * `jsonl-20`'s.
  */
 const JSONL_20_NOKEEPALL_PROMPT_LINES = target => Object.freeze([
@@ -407,26 +409,27 @@ const JSONL_20_NOKEEPALL_PROMPT_LINES = target => Object.freeze([
   "Rules:",
   "1. One object per line. One row per object. Nothing else on the line.",
   "2. Exactly one action key per row: forgetall, or keeplines.",
-  "3. forgetall and keeplines must also carry summary.",
+  "3. forgetall and keeplines must also carry forgotten: what is being dropped and why.",
   "4. forgetall forgets the whole row. keeplines keeps the listed lines and forgets every line "
     + "not listed.",
   "5. keeplines is an ascending array of non-overlapping [start,end] pairs, integers, inside 1..L, "
     + "where L is that row's line count shown in the table.",
-  "6. summary is one line of plain text, less than 20 words. It names what the forgotten content "
-    + "was about so it can be recalled. Use no raw newline. Escape a double quote as \\\".",
+  "6. forgotten is one line of plain text, less than 20 words. It names what is being dropped and "
+    + "why, so it can be recalled. It never describes the lines you keep. Use no raw newline. "
+    + "Escape a double quote as \\\".",
   "7. Every row in the table appears exactly once. Add no other rows, keys, or text.",
-  "8. Before sending, check each line: one object, one action key, summary present when "
+  "8. Before sending, check each line: one object, one action key, forgotten present when "
     + "forgetting, ranges ascending and inside the row, and each line parses as JSON on its own.",
   "",
   "Answer format:",
-  '{"N":{"keeplines":[[1,120]],"summary":"all kept"}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"keeplines":[[1,120]],"forgotten":"None"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
-  '{"1":{"keeplines":[[1,120]],"summary":"all kept"}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"1":{"keeplines":[[1,120]],"forgotten":"None"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",
@@ -440,14 +443,14 @@ const JSONL_20_NOKEEPALL_PROMPT_LINES = target => Object.freeze([
  */
 const JSONL_20_NOKEEPALL_REPEAT_LINES = target => Object.freeze([
   "Answer format:",
-  '{"N":{"keeplines":[[1,120]],"summary":"all kept"}}',
-  '{"N":{"forgetall":true,"summary":"<summary>"}}',
-  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+  '{"N":{"keeplines":[[1,120]],"forgotten":"None"}}',
+  '{"N":{"forgetall":true,"forgotten":"<forgotten>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"forgotten":"<forgotten>"}}',
   "Answer Example:",
-  '{"1":{"keeplines":[[1,120]],"summary":"all kept"}}',
-  '{"2":{"forgetall":true,"summary":"stale build log from the old host"}}',
-  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"summary":"the config keys and the two error strings"}}',
-  '{"4":{"keeplines":[[5,12]],"summary":"the retry block only"}}',
+  '{"1":{"keeplines":[[1,120]],"forgotten":"None"}}',
+  '{"2":{"forgetall":true,"forgotten":"stale build log from the old host"}}',
+  '{"3":{"keeplines":[[1,3],[11,18],[37,40]],"forgotten":"the stale build log and the old host block"}}',
+  '{"4":{"keeplines":[[5,12]],"forgotten":"the imports and the stale fixture setup"}}',
   "",
   target,
   "",

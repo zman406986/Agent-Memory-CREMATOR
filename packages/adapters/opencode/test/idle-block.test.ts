@@ -369,7 +369,7 @@ test('ISSUE-373: the idle-origin ask blocks inside the awaited experimental.idle
     stream.push({ type: 'session.idle', data: { sessionID: sessionId } });
     await waitFor(() => lines.of('at-rest').some(line => line['reason'] === 'turn-end'));
     assert.equal(generateCalls.length, 1, 'the event path did not stack a second ask');
-    releaseAsk({ text: '{"1":{"forgetall":"stale note"}}' });
+    releaseAsk({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' });
     await idleCall;
     assert.equal(lines.of('ask').length, 1, 'one fire');
     assert.equal(lines.of('ask')[0]?.['origin'], 'idle', 'the fire names the idle origin');
@@ -424,7 +424,7 @@ test('ISSUE-373: the wired idle hook keeps ISSUE-353\'s turn-ordinal guard on th
     assert.equal(entry.completedThroughTurnOrdinal, null,
       'ISSUE-353: the nested ask\'s idle records no completed-turn fact for the live turn');
     assert.equal(askCalls, 1, 'the event path ran no ask while the hook owns it');
-    releaseAsk({ text: '{"1":{"forgetall":"stale note"}}' });
+    releaseAsk({ text: '{"1":{"forgetall":true,"summary":"stale note"}}' });
     await idleCall;
     assert.equal(entry.askInFlight, false, 'the ask resolved');
     // The turn's OWN idle, with no ask in flight, still records the fact.

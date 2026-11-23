@@ -50,6 +50,19 @@ const ACCEPTED_ROWS: readonly AcceptedRow[] = [
     expect: { verdict: { unitId: "unit:sha256:abc", answeredInRound: 4, action: "keepall" } },
   },
   {
+    // ISSUE-515: case and one trailing `s` do not name another action, and the
+    // payload is read from the key the model wrote.
+    name: "an action key in another case or number is the same action",
+    value: { KEEPLINES: [[4, 5], [1, 2], "kept the header"] },
+    expect: {
+      verdict: {
+        unitId: "unit:sha256:abc", answeredInRound: 4, action: "keeplines",
+        ranges: [{ from: 1, to: 2 }, { from: 4, to: 5 }],
+      },
+      keeplinesSummary: "kept the header",
+    },
+  },
+  {
     name: "keeplines pairs plus its trailing summary become ordered kept spans",
     value: { keeplines: [[4, 5], [1, 2], "kept the header and the tail"] },
     expect: {
@@ -212,9 +225,11 @@ const REFUSAL_ROWS: readonly RefusalRow[] = [
   { name: "action keeplines with trailing space",
     value: { "keeplines ": "a summary that would otherwise be read as forgetall" },
     code: "unknown-action" },
-  { name: "action Keepall in the wrong case",
+  // ISSUE-515: a wrong-case key is the same action, so the payload check is
+  // what refuses this row, never the spelling.
+  { name: "a case-folded keepall still checks its payload",
     value: { Keepall: "a summary that would otherwise be read as forgetall" },
-    code: "unknown-action" },
+    code: "invalid-keepall" },
   { name: "action forgetall2", value: { forgetall2: "a summary that would otherwise be read as forgetall" },
     code: "unknown-action" },
   { name: "action forgetlinesN", value: { forgetlinesN: "a summary that would otherwise be read as forgetall" },
@@ -302,4 +317,24 @@ test("the two partial classes share one grammar and one normalisation", () => {
   assert.deepEqual(dropped.verdict, {
     unitId: "unit:sha256:abc", answeredInRound: 4, action: "forgetlines", ranges: [{ from: 1, to: 6 }],
   }, "row: dropped spans merge exactly as kept spans do");
+});
+
+test("a partial wire verdict reads forgotten canonically and summary as its alias (ISSUE-525)", () => {
+  const canonical = parseWireVerdict(
+    { keeplines: [[1, 2]], forgotten: "the stale log lines" }, stamp);
+  assert.deepEqual(canonical, {
+    verdict: { unitId: "unit:sha256:abc", answeredInRound: 4, action: "keeplines",
+      ranges: [{ from: 1, to: 2 }] },
+    keeplinesSummary: "the stale log lines",
+  });
+  assert.deepEqual(parseWireVerdict(
+    { keeplines: [[1, 2]], summary: "the stale log lines" }, stamp),
+  canonical, "the legacy key reads as the same answer");
+  refuses({ keeplines: [[1, 2]], forgotten: "a", summary: "b" },
+    "both-forgotten-and-summary", "a row carrying both keys is refused, never merged");
+  refuses({ keeplines: [[1, 2], "a"], forgotten: "b" }, "mixed-keys",
+    "a trailer beside the canonical key is refused");
+  assert.deepEqual(parseWireVerdict(
+    { forgetlines: [[1, 2]], forgotten: "the stale log lines" }, stamp).forgetlinesSummary,
+  "the stale log lines");
 });

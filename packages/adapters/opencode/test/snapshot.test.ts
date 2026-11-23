@@ -12,12 +12,19 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import {
+  UnitTracker, byteRangeForLines, isRefusedPruneAnchor, readJsonl20NoKeepallAnswer,
+} from '@cremator/core';
 import type { NodeId, PathEvidence, ToolResultNode, TranscriptNode } from '@cremator/core';
+import { opencodeResultText, opencodeTextPayload } from '../src/apply.js';
+import { OPENCODE_ASK_FLOOR_BYTES, askPromptOf, buildOpencodePassPlan } from '../src/ask.js';
 import { createOpencodeToolClassifier } from '../src/classifier.js';
-import type { OpencodeMessage, OpencodeToolResultValue } from '../src/host.js';
+import type {
+  OpencodeMessage, OpencodeToolResultPart, OpencodeToolResultValue,
+} from '../src/host.js';
 import {
   OPENCODE_RECORD_ID_FIELD, deriveOpencodeSnapshot, opencodeMessageNodeId, opencodePartNodeId,
-  opencodeToolNodeId,
+  opencodeToolNodeId, opencodeUnitText,
 } from '../src/snapshot.js';
 import type { OpencodeSnapshot } from '../src/snapshot.js';
 import {
@@ -227,6 +234,43 @@ const IDENTITY_ROWS: readonly Row[] = [
     } },
 ];
 
+/** Five lines, each long enough that the read is one above-floor unit. */
+const FIVE_LINES = [
+  `line one ${'-'.repeat(120)}`,
+  `line two ${'-'.repeat(120)}`,
+  `line three ${'-'.repeat(120)}`,
+  `line four ${'-'.repeat(120)}`,
+  `line five ${'-'.repeat(120)}`,
+];
+const FIVE_LINE_BODY = `${FIVE_LINES.join('\n')}\n`;
+
+/** One prompt, one read of `result`, one closing answer. */
+function readConversation(result: OpencodeToolResultValue): OpencodeMessage[] {
+  return [
+    userMessage('msg_u1', [text('Read NOTES.md.')]),
+    assistantMessage('msg_a1', [
+      text('Reading.'),
+      toolCall('call_1', 'read', { filePath: 'NOTES.md' }),
+    ]),
+    toolMessage('msg_t1', [toolResult('call_1', 'read', result)]),
+    assistantMessage('msg_a2', [text('Read.')]),
+  ];
+}
+
+/** The one result part of `readConversation`'s array. */
+function readResultPart(messages: readonly OpencodeMessage[]): OpencodeToolResultPart {
+  const part = messages[2]?.content[0];
+  assert.ok(part !== undefined && part.type === 'tool-result', 'the fixture holds one result part');
+  return part as OpencodeToolResultPart;
+}
+
+/** One prompt, one read returning a `content` result, one closing answer. */
+function contentConversation(value: readonly unknown[]): OpencodeMessage[] {
+  return readConversation({
+    type: 'content', value,
+  } as unknown as OpencodeToolResultValue);
+}
+
 /**
  * Table 2 — content and attachment. Each row is one content class: the bytes a
  * node carries, the kind it reports, or the evidence it leaves on a neighbour. A
@@ -264,7 +308,7 @@ const CONTENT_ROWS: readonly Row[] = [
       assert.equal(new TextDecoder().decode(answer.bytes), 'the answer',
         at('the text part keeps its own bytes'));
     } },
-  { name: 'one unit per call id with both the call and the tagged result in its bytes',
+  { name: 'one unit per call id, its body the result\'s decoded text',
     run(at) {
       const messages: readonly OpencodeMessage[] = [
         assistantMessage('msg_a1', [
@@ -286,19 +330,145 @@ const CONTENT_ROWS: readonly Row[] = [
         opencodeToolNodeId(sessionId, 'call_ok'),
         opencodeToolNodeId(sessionId, 'call_bad'),
       ], at('each unit is keyed by its call id'));
-      const body = new TextDecoder().decode(results[0]?.bytes ?? new Uint8Array());
-      assert.equal(body,
-        '{"input":{"filePath":"a.ts"},"name":"read","result":{"type":"text","value":"body"}}',
-        at('the envelope byte order is pinned: input, name, result'));
-      assert.match(body, /"input":\{"filePath":"a.ts"\}/u, at('the call input is in the bytes'));
-      assert.match(body, /"result":\{"type":"text","value":"body"\}/u,
-        at('the tagged result is in the bytes'));
-      assert.match(new TextDecoder().decode(results[1]?.bytes ?? new Uint8Array()),
-        /"type":"error"/u, at('an error result is tagged, not flattened'));
+      assert.equal(new TextDecoder().decode(results[0]?.bytes ?? new Uint8Array()), 'body',
+        at('a text result is its own text, not a {"input","name","result"} envelope'));
+      assert.equal(new TextDecoder().decode(results[1]?.bytes ?? new Uint8Array()), 'no such dir',
+        at('an error result is its text too, never a flattened tag'));
       // Evidence reads the call, not the result.
       assert.equal(results[0]?.evidence.kind, 'read', at('the call name decides the kind'));
       assert.deepEqual(results[0]?.evidence.target, { key: 'a.ts', label: 'a.ts' },
         at('the call input decides the target'));
+      assert.equal(results[0]?.evidence.paths[0]?.lineCount, 1,
+        at('a one-line body measures one line'));
+      assert.equal(results[0]?.evidence.paths[0]?.byteLength, 4,
+        at('the evidence measures the body text'));
+    } },
+  { name: 'a multi-line text read is N lines and keeplines 2-3 addresses its real bytes',
+    run(at) {
+      const messages = readConversation(textResult(FIVE_LINE_BODY));
+      const snapshot = derive(messages);
+      const node = nodeOf(snapshot, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(node.kind, 'tool-result', at('the read is one unit'));
+      if (node.kind !== 'tool-result') return;
+      assert.equal(new TextDecoder().decode(node.bytes), FIVE_LINE_BODY,
+        at('the unit body is the result text the host sends'));
+
+      const units = new UnitTracker({ sessionId, barBytes: OPENCODE_ASK_FLOOR_BYTES })
+        .units(snapshot.snapshot);
+      const unit = units[0];
+      assert.equal(units.length, 1, at('an above-floor read is one unit'));
+      assert.deepEqual(unit?.span.lineRange, { startLine: 1, endLineInclusive: 5 },
+        at('the unit is as many lines as the result text, not one'));
+
+      const plan = buildOpencodePassPlan({
+        sessionId, snapshot: snapshot.snapshot, messages, round: 1,
+      });
+      assert.equal(plan?.askRows.length, 1, at('the read is tabled'));
+      assert.match(askPromptOf(plan?.askRows ?? [], true), /\[5 lines\]/u,
+        at('the asked table states the result\'s real line count'));
+      const anchor = plan?.askRows[0]?.anchor;
+      assert.ok(anchor !== undefined && !isRefusedPruneAnchor(anchor),
+        at('the row carries a readable anchor'));
+      if (anchor !== undefined && !isRefusedPruneAnchor(anchor)) {
+        assert.match(anchor.anchors.join(' '), /of 5\b|of 5$/u,
+          at('the anchor counts the result text\'s own lines'));
+        assert.doesNotMatch(anchor.anchors.join(' '), /"input"|"name"|"result"/u,
+          at('the anchor quotes the result text, not the old envelope'));
+      }
+
+      // A partial `keeplines` for lines 2-3: the reader accepts it against L=5,
+      // and the core's own line arithmetic maps it onto the result's bytes.
+      const reading = readJsonl20NoKeepallAnswer(
+        '{"1":{"keeplines":[[2,3]],"summary":"None"}}', [1], new Map([[1, 5]]));
+      assert.equal(reading.rows[0]?.status, 'answered',
+        at('the reader accepts a partial keep inside 1..5'));
+      const range = byteRangeForLines(node.bytes, [{ startLine: 2, endLineInclusive: 3 }])[0];
+      assert.ok(range !== undefined, at('lines 2-3 have a byte range'));
+      if (range === undefined) return;
+      assert.equal(
+        new TextDecoder().decode(node.bytes.slice(range.startByte, range.endByteExclusive)),
+        `${FIVE_LINES[1]}\n${FIVE_LINES[2]}\n`,
+        at('the range is those two lines of the result text'));
+      assert.equal(node.evidence.paths[0]?.lineCount, 5,
+        at('the path evidence measures the same five lines'));
+      assert.equal(opencodeTextPayload(readResultPart(messages))?.text, FIVE_LINE_BODY,
+        at('the apply can re-emit exactly the text the archive holds'));
+    } },
+  { name: 'a single-line result is one line, and an empty one is the host\'s own literal',
+    run(at) {
+      const single = readConversation(textResult('only line'));
+      const oneUnit = new UnitTracker({ sessionId, barBytes: 0 })
+        .units(derive(single).snapshot);
+      assert.deepEqual(oneUnit[0]?.span.lineRange, { startLine: 1, endLineInclusive: 1 },
+        at('a one-line body is one line'));
+      const singleNode = nodeOf(derive(single), opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(singleNode.kind === 'tool-result' && singleNode.evidence.paths[0]?.lineCount, 1,
+        at('its evidence count is one, never null'));
+
+      const empty = readConversation(textResult(''));
+      const emptyNode = nodeOf(derive(empty), opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(emptyNode.bytes), '(no tool output)',
+        at('an empty text result is the literal the host substitutes on the wire'));
+      const emptyUnits = new UnitTracker({ sessionId, barBytes: 0 })
+        .units(derive(empty).snapshot);
+      assert.deepEqual(emptyUnits[0]?.span.lineRange, { startLine: 1, endLineInclusive: 1 },
+        at('the host literal is one line'));
+    } },
+  { name: 'a json or error result keeps the safe whole-unit behavior',
+    run(at) {
+      const jsonMessages = readConversation(jsonResult(['a', 'b']));
+      const jsonNode = nodeOf(derive(jsonMessages), opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(jsonNode.kind === 'tool-result'
+        && new TextDecoder().decode(jsonNode.bytes), '["a","b"]',
+      at('a json result body is its JSON text'));
+      assert.equal(jsonNode.kind === 'tool-result' && jsonNode.evidence.paths[0]?.lineCount, 1,
+        at('the JSON text measures one line'));
+      assert.equal(opencodeTextPayload(readResultPart(jsonMessages)), null,
+        at('a json result cannot carry kept lines'));
+
+      const errorMessages = readConversation(errorResult('ENOENT: no such file'));
+      const errorNode = nodeOf(derive(errorMessages), opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(errorNode.kind === 'tool-result'
+        && new TextDecoder().decode(errorNode.bytes), 'ENOENT: no such file',
+      at('an error result body is its text'));
+      assert.equal(errorNode.kind === 'tool-result'
+        && errorNode.evidence.paths[0]?.outcome, 'miss',
+      at('the error tag is still a miss'));
+      assert.equal(errorNode.kind === 'tool-result'
+        && errorNode.evidence.paths[0]?.lineCount, null,
+      at('a miss measures no file lines'));
+      assert.equal(opencodeTextPayload(readResultPart(errorMessages)), null,
+        at('an error result cannot carry kept lines'));
+    } },
+  { name: 'the unit text is the apply path\'s result text for every tag',
+    run(at) {
+      const cases: readonly (readonly [string, OpencodeToolResultValue, string])[] = [
+        ['text', textResult('a\nb\n'), 'a\nb\n'],
+        ['empty text', textResult(''), '(no tool output)'],
+        ['content', { type: 'content', value: [
+          { type: 'text', text: 'one' },
+          { type: 'text', text: '' },
+          { type: 'text', text: 'two' },
+        ] } as OpencodeToolResultValue, 'one\ntwo'],
+        ['file-only content', { type: 'content', value: [
+          { type: 'file', path: 'a.ts' },
+        ] } as unknown as OpencodeToolResultValue, ''],
+        ['json', jsonResult({ a: 1 }), '{"a":1}'],
+        ['json string', jsonResult('abc'), '"abc"'],
+        ['json null', jsonResult(null), 'null'],
+        ['error string', errorResult('boom'), 'boom'],
+        ['error number', { type: 'error', value: 5 } as OpencodeToolResultValue, '5'],
+        ['error structured', { type: 'error', value: { code: 'E' } } as OpencodeToolResultValue,
+          '{"code":"E"}'],
+        ['malformed content string',
+          { type: 'content', value: 'abc' } as unknown as OpencodeToolResultValue, '"abc"'],
+      ];
+      for (const [label, result, expected] of cases) {
+        const part = toolResult('call_1', 'read', result) as OpencodeToolResultPart;
+        assert.equal(opencodeUnitText(part), expected, at(`${label}: the unit text is the host text`));
+        assert.equal(opencodeUnitText(part), opencodeResultText(part),
+          at(`${label}: the snapshot decoder and the apply decoder agree`));
+      }
     } },
   { name: 'a call with no result is evidence, never a node',
     run(at) {
@@ -320,14 +490,26 @@ const CONTENT_ROWS: readonly Row[] = [
   { name: 'a result with no call is still a unit, and its apply refusal is named',
     run(at) {
       const messages: readonly OpencodeMessage[] = [
-        toolMessage('msg_t1', [toolResult('call_orphan', 'read', textResult('a'))]),
+        toolMessage('msg_t1', [
+          toolResult('call_orphan', 'read', textResult('a')),
+          toolResult('call_orphan_json', 'glob', jsonResult('abc')),
+        ]),
       ];
       const snapshot = derive(messages);
       const orphan = nodeOf(snapshot, opencodeToolNodeId(sessionId, 'call_orphan'), at);
       assert.equal(orphan.kind, 'tool-result', at('the result is projected'));
       assert.equal(orphan.kind === 'tool-result' && orphan.callId, 'call_orphan',
         at('its call id is carried'));
-      assert.equal(ids(snapshot).length, 1, at('one result is one unit'));
+      assert.equal(orphan.kind === 'tool-result'
+        && new TextDecoder().decode(orphan.bytes), 'a',
+      at('an orphan body is its decoded text, not a {name,result} envelope'));
+      // The orphan lane uses the same decoding as a paired unit: a `json`
+      // string value is JSON text (audit F1).
+      const jsonOrphan = nodeOf(snapshot, opencodeToolNodeId(sessionId, 'call_orphan_json'), at);
+      assert.equal(jsonOrphan.kind === 'tool-result'
+        && new TextDecoder().decode(jsonOrphan.bytes), '"abc"',
+      at('a json orphan body is the host\'s JSON text'));
+      assert.equal(ids(snapshot).length, 2, at('one result is one unit'));
     } },
   { name: 'a tool part in a user or system message is refused, not silently dropped',
     run(at) {
@@ -398,8 +580,8 @@ const CONTENT_ROWS: readonly Row[] = [
       const second = derive(structuredClone(messages) as OpencodeMessage[]);
       assert.deepEqual(first, second, at('the same request derives the same snapshot'));
       const unit = nodeOf(first, opencodeToolNodeId(sessionId, 'call_1'), at);
-      assert.match(new TextDecoder().decode(unit.bytes), /"options":\{"hidden":false\}/u,
-        at('nested call input is canonicalized'));
+      assert.equal(new TextDecoder().decode(unit.bytes), '["b.md","a.md"]',
+        at('a json result is the JSON text the host sends'));
     } },
   { name: 'the classifier the caller supplies is the one the evidence uses',
     run(at) {
@@ -457,7 +639,7 @@ const REVISION_ROWS: readonly Row[] = [
         at('a result-body update moves the revision'));
       assert.deepEqual(ids(next), ids(base), at('no node id moved'));
     } },
-  { name: 'a call-input change moves the revision because the unit bytes carry it',
+  { name: 'a call-input change moves the revision through the call digest',
     run(at) {
       const base = derive(minimalConversation());
       const changed = structuredClone(minimalConversation()) as OpencodeMessage[];
@@ -466,8 +648,129 @@ const REVISION_ROWS: readonly Row[] = [
       (call['input'] as Record<string, unknown>)['filePath'] = 'OTHER.md';
       const next = derive(changed);
       assert.notEqual(next.snapshot.revision, base.snapshot.revision,
-        at('a call-input change moves the revision'));
+        at('the body is the result text now, so the call declaration is its own digest entry'));
       assert.deepEqual(ids(next), ids(base), at('the unit id is still the call id'));
+    } },
+  { name: 'a tool-name change moves the revision',
+    run(at) {
+      const base = derive(minimalConversation());
+      const changed = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const call = changed[1]?.content[1];
+      assert.ok(call !== undefined && call['type'] === 'tool-call', at('the fixture has a call part'));
+      (call as Record<string, unknown>)['name'] = 'shell';
+      const next = derive(changed);
+      assert.notEqual(next.snapshot.revision, base.snapshot.revision,
+        at('the tool name is part of the call declaration digest'));
+      assert.deepEqual(ids(next), ids(base), at('no node id moved'));
+    } },
+  { name: 'a namespace-only change moves the revision, on the call or the result',
+    run(at) {
+      const base = derive(minimalConversation());
+      const onCall = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const call = onCall[1]?.content[1];
+      assert.ok(call !== undefined && call['type'] === 'tool-call', at('the fixture has a call part'));
+      (call as Record<string, unknown>)['namespace'] = 'file';
+      const callNext = derive(onCall);
+      assert.notEqual(callNext.snapshot.revision, base.snapshot.revision,
+        at('the call namespace is part of the digest'));
+      assert.deepEqual(ids(callNext), ids(base), at('no node id moved'));
+      const onResult = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const result = onResult[2]?.content[0];
+      assert.ok(result !== undefined && result['type'] === 'tool-result',
+        at('the fixture has a result part'));
+      (result as Record<string, unknown>)['namespace'] = 'file';
+      const resultNext = derive(onResult);
+      assert.notEqual(resultNext.snapshot.revision, base.snapshot.revision,
+        at('the result namespace is part of the digest too'));
+      assert.deepEqual(ids(resultNext), ids(base), at('no node id moved'));
+    } },
+  { name: 'an absent input and a null input are two revisions',
+    run(at) {
+      const withNull = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const nullCall = withNull[1]?.content[1];
+      assert.ok(nullCall !== undefined && nullCall['type'] === 'tool-call',
+        at('the fixture has a call part'));
+      (nullCall as Record<string, unknown>)['input'] = null;
+      const withAbsent = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const absentCall = withAbsent[1]?.content[1];
+      assert.ok(absentCall !== undefined && absentCall['type'] === 'tool-call',
+        at('the fixture has a call part'));
+      delete (absentCall as Record<string, unknown>)['input'];
+      const base = derive(minimalConversation());
+      const nulled = derive(withNull);
+      const absent = derive(withAbsent);
+      assert.notEqual(nulled.snapshot.revision, base.snapshot.revision,
+        at('a null input moves the revision'));
+      assert.notEqual(absent.snapshot.revision, base.snapshot.revision,
+        at('an absent input moves the revision'));
+      assert.notEqual(absent.snapshot.revision, nulled.snapshot.revision,
+        at('an absent input is not the same request as a null one'));
+    } },
+  { name: 'a result-tag change moves the revision though the body bytes do not',
+    run(at) {
+      const base = derive(minimalConversation());
+      const changed = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const result = changed[2]?.content[0] as unknown as
+        { result: { type: string } } | undefined;
+      assert.ok(result !== undefined, at('the fixture has a result part'));
+      result.result.type = 'error';
+      const next = derive(changed);
+      const before = nodeOf(base, opencodeToolNodeId(sessionId, 'call_1'), at);
+      const after = nodeOf(next, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(after.bytes),
+        new TextDecoder().decode(before.bytes),
+        at('text and error carry the same value, so the body is unchanged'));
+      assert.notEqual(next.snapshot.revision, base.snapshot.revision,
+        at('the result tag is part of the declaration digest: hit becomes miss'));
+      assert.deepEqual(ids(next), ids(base), at('no node id moved'));
+    } },
+  { name: 'a dropped content entry moves the revision though the body bytes do not',
+    run(at) {
+      const textOnly = derive(contentConversation([{ type: 'text', text: 'x' }]));
+      const textOnlyNode = nodeOf(textOnly, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(textOnlyNode.bytes), 'x',
+        at('the fixture body is its one text entry'));
+      // A file entry contributes no text, so the body is still `x`; it makes the
+      // result non-carryable for a partial keep.
+      const withFile = derive(contentConversation([
+        { type: 'text', text: 'x' },
+        { type: 'file', uri: 'file:///a.ts', mime: 'text/plain' },
+      ]));
+      const fileNode = nodeOf(withFile, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(fileNode.bytes), 'x',
+        at('a file entry leaves the body text unchanged'));
+      assert.notEqual(withFile.snapshot.revision, textOnly.snapshot.revision,
+        at('a non-text content entry is part of the declaration digest'));
+      assert.deepEqual(ids(withFile), ids(textOnly), at('no node id moved'));
+      // An empty text entry is dropped before the join and refused by the apply
+      // for the same reason, so it is residue too.
+      const withEmpty = derive(contentConversation([
+        { type: 'text', text: 'x' },
+        { type: 'text', text: '' },
+      ]));
+      const emptyNode = nodeOf(withEmpty, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(emptyNode.bytes), 'x',
+        at('an empty text entry leaves the body text unchanged'));
+      assert.notEqual(withEmpty.snapshot.revision, textOnly.snapshot.revision,
+        at('an empty text entry is part of the declaration digest'));
+      assert.deepEqual(ids(withEmpty), ids(textOnly), at('no node id moved'));
+    } },
+  { name: 'a result-part-name-only change moves the revision',
+    run(at) {
+      const base = derive(minimalConversation());
+      const changed = structuredClone(minimalConversation()) as OpencodeMessage[];
+      const result = changed[2]?.content[0];
+      assert.ok(result !== undefined && result['type'] === 'tool-result',
+        at('the fixture has a result part'));
+      (result as Record<string, unknown>)['name'] = 'shell';
+      const next = derive(changed);
+      const before = nodeOf(base, opencodeToolNodeId(sessionId, 'call_1'), at);
+      const after = nodeOf(next, opencodeToolNodeId(sessionId, 'call_1'), at);
+      assert.equal(new TextDecoder().decode(after.bytes),
+        new TextDecoder().decode(before.bytes), at('the body is unchanged'));
+      assert.notEqual(next.snapshot.revision, base.snapshot.revision,
+        at('the result part name is part of the declaration digest'));
+      assert.deepEqual(ids(next), ids(base), at('no node id moved'));
     } },
   { name: 'a part that becomes evidence moves the revision',
     run(at) {
@@ -666,10 +969,12 @@ test('the replay corpus parses with zero dropped nodes and zero unread parts', (
   assert.deepEqual(deriveOpencodeSnapshot(corpus.messages, { sessionId: corpus.sessionId }), snapshot);
 });
 
-// ISSUE-400: harness-free port of the archive-wire-text key-order gate. The
-// archived result part keeps the host's own key order (1f FIX 1, wire-text basis),
-// never a key-sorted canonical spelling. Uses only product src + fixtures so the
-// minimal public release covers the rule without the bench launcher.
+// ISSUE-400, restated by ISSUE-509: the archived body IS the host's wire text.
+// The unit body is the decoded result (never an envelope), so its key order —
+// including the order inside a structured value's JSON text — is the host's,
+// and a key-sorted spelling is a different byte string. Uses only product src +
+// fixtures so the minimal public release covers the rule without the bench
+// launcher.
 function archivedUnitText(messages: readonly OpencodeMessage[]): string {
   const node = derive(messages).snapshot.nodes
     .find(candidate => candidate.kind === 'tool-result');
@@ -677,7 +982,7 @@ function archivedUnitText(messages: readonly OpencodeMessage[]): string {
   return new TextDecoder().decode(node.bytes);
 }
 
-test('the archived result part keeps the host key order, not a sorted spelling', () => {
+test('the archived body is the host\'s own wire text, never a sorted spelling', () => {
   const cancelled = {
     error: {
       type: 'tool.execution',
@@ -699,21 +1004,23 @@ test('the archived result part keeps the host key order, not a sorted spelling',
     ]),
     assistantMessage('msg_a2', [text('Continuing without an answer.')]),
   ];
-  const unitText = archivedUnitText(errorConversation(cancelled));
-  assert.equal(unitText.includes('"result":{"type":"error","value":{"error":'), true,
-    'the result part keeps the host key order');
-  assert.equal(unitText.includes('"value":{"content":'), false, 'the sorted spelling is gone');
+  assert.equal(archivedUnitText(errorConversation(cancelled)), JSON.stringify(cancelled),
+    'a structured error body is its JSON text in the host\'s key order');
+  assert.equal(archivedUnitText(errorConversation(cancelled))
+    .includes('{"error":{"type":"tool.execution"'), true,
+  'the error key still comes first, as the host wrote it');
   const reordered = { content: cancelled.content, error: cancelled.error };
-  assert.equal(archivedUnitText(errorConversation(reordered)).includes('"value":{"content":[],"error":{'),
-    true, 'the reordered value keeps its own order in the archive');
+  assert.equal(archivedUnitText(errorConversation(reordered)), JSON.stringify(reordered),
+    'the reordered value keeps its own order in the archive');
   const jsonMessages: OpencodeMessage[] = [
     userMessage('msg_u1', [text('List it.')]),
     assistantMessage('msg_a1', [text('Listing.'), toolCall('call_json', 'glob', { pattern: '**/*.md' })]),
     toolMessage('msg_t1', [toolResult('call_json', 'glob', jsonResult({ zeta: 1, alpha: { beta: 2, gamma: 3 } }))]),
     assistantMessage('msg_a2', [text('Listed.')]),
   ];
-  assert.equal(archivedUnitText(jsonMessages).includes('"value":{"zeta":1,"alpha":{"beta":2,"gamma":3}}'),
-    true, 'neither the result nor its nested object is sorted');
+  assert.equal(archivedUnitText(jsonMessages),
+    '{"zeta":1,"alpha":{"beta":2,"gamma":3}}',
+    'neither the result nor its nested object is sorted');
   const body = '# Note\n\nbody\n';
   const stringMessages: OpencodeMessage[] = [
     userMessage('msg_u1', [text('Read the note.')]),
@@ -721,7 +1028,6 @@ test('the archived result part keeps the host key order, not a sorted spelling',
     toolMessage('msg_t1', [toolResult('call_1', 'read', textResult(body))]),
     assistantMessage('msg_a2', [text('Read.')]),
   ];
-  assert.equal(archivedUnitText(stringMessages),
-    '{"input":{"filePath":"NOTES.md"},"name":"read","result":' + JSON.stringify(textResult(body)) + '}',
-    'the envelope keeps the canonical call fields and the host result part');
+  assert.equal(archivedUnitText(stringMessages), body,
+    'a text result archives its exact bytes, newlines and all');
 });

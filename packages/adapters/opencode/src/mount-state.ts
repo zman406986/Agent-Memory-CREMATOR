@@ -10,10 +10,14 @@
  *     in-process map dies with the process; the file lets a remount resolve a
  *     prepared ledger row the previous process landed instead of reading
  *     `unknown` and blocking recovery forever (ISSUE-448; ADR-0064).
- *   - `ask` — the ask identity that was claimed or answered but not settled:
- *     the revision claims, the unit claims, and the `forgetall` verdicts an
- *     apply still owes. A restart rebuilds them instead of re-asking a claimed
- *     unit or losing an unapplied verdict (ISSUE-409; ADR-0063).
+ *   - `ask` — the ask identity that was claimed or answered: the revision
+ *     claims, the unit claims, and the removal verdicts an apply owes. A
+ *     restart rebuilds them instead of re-asking a claimed unit or losing an
+ *     unapplied verdict (ISSUE-409; ADR-0063). A whole-unit `forgetall` stops
+ *     being owed once its ledger `applied` row lands, because the banked row
+ *     re-applies it; a partial `keeplines` is RETAINED, because only the
+ *     verdict can reconstruct the kept lines on a rebuilt request or a remount
+ *     (ISSUE-509).
  *
  * Every writer reads the current document, replaces only the fact it owns and
  * republishes the whole file atomically (temp + rename), so a kill mid-write
@@ -41,7 +45,12 @@ export const MOUNT_STATE_VERSION = 1;
 /** A per-process token so two writes never stage the same temp name. */
 let tempSeq = 0;
 
-/** One `forgetall` verdict an apply still owes, with the node it addressed. */
+/**
+ * One ask verdict an apply still owes, with the node it addressed. A
+ * `forgetall` is a whole-unit removal; a partial `keeplines` is a line-level
+ * removal whose kept lines only the verdict itself can reconstruct, so it stays
+ * durable across a process boundary (ISSUE-509).
+ */
 export interface DurableAskVerdict {
   readonly unitId: string;
   readonly nodeId: string;
@@ -57,6 +66,14 @@ export interface DurableAskState {
   readonly verdicts: readonly DurableAskVerdict[];
   readonly deferredApply: boolean;
   readonly deferredFailures: number;
+  /**
+   * The table asks this session sent and had answered or refused with rows
+   * (ISSUE-509). It picks the keep-share line: `0` states 70 percent, every
+   * later value states 40 percent. A process boundary keeps it, so a resumed
+   * segment does not restate the first ask's share. Absent in an older file
+   * reads as `0` (fail-open: the share line is advisory and blocks nothing).
+   */
+  readonly askFires: number;
 }
 
 interface MountDoc {
@@ -268,6 +285,10 @@ function readAskOf(doc: MountDoc): DurableAskState | null {
     revisions: ask.revisions, askedUnitIds: ask.askedUnitIds,
     retriedUnitIds: ask.retriedUnitIds, refusedRetriedUnitIds: ask.refusedRetriedUnitIds,
     verdicts, deferredApply: ask.deferredApply, deferredFailures: ask.deferredFailures,
+    // ISSUE-509: an older file (or a write that never carried the count) reads
+    // as "no fire yet". The record is still usable, so one missing optional
+    // fact does not refuse the whole ask identity.
+    askFires: isCount(ask.askFires) ? ask.askFires : 0,
   };
 }
 

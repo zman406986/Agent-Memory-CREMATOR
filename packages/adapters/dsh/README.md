@@ -7,7 +7,7 @@ https://github.com/zman406986/Agent-Memory-CREMATOR.
 
 ## Install
 
-The packages are not published to npm. Build from this repo, then point
+The packages are not published to npm (owner decision, ISSUE-069). Build from this repo, then point
 the mount row at the built file:
 
 ```sh
@@ -64,8 +64,8 @@ The mount entry is the subpath export; the package's default entry has no host d
 
 ```yaml
 - insert:
-    - id: cremator-mount
-      name: 'file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js'
+    - id: racoons-mount
+      name: 'file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/dsh/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply
@@ -77,9 +77,9 @@ The mount entry is the subpath export; the package's default entry has no host d
 ```
 
 The entry is a Cordis plugin (`name`, `inject`, `apply`) and also exports a default instance, so a
-`file:///` specifier or a bare package specifier both work. Replace the example URL with the
-path of your own checkout:
-`file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js`. Config keys are the
+`file:///` specifier or a bare package specifier both work. The example URL is for the
+`C:\Users\TZhen\` device; on the other use
+`file:///C:/Users/TZ/Desktop/racoons/packages/adapters/dsh/dist/plugin.js`. Config keys are the
 mount's flat knobs:
 `barBytes`, `floorBytes`, `episodeNoNewPathSteps`, `sealMaxLatencyTurns`, `minCutFreedBytes`,
 `enforcement`, `recordName`, `anchors`, `judgeTimeoutMs`, `crematorStorageRoot`,
@@ -94,30 +94,33 @@ menu lists `/cremate`. The registered command runs the pass directly and awaits 
 reports the result. A typed `/cremate` message keeps the queued path: it marks the request and opens a
 `/cremate` turn, so the next `agent/pre-step` runs the pass.
 
-Defaults that matter: `barBytes` 512, `enforcement` `apply` (`record-only` is the explicit opt-out),
-`entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall`, and
+Defaults that matter: `barBytes` 512 (ADR-0051), `enforcement` `apply` (ADR-0008; `record-only` is
+the explicit opt-out), `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall` (ADR-0056), and
 `nativeCompactionBackstop` `true`. `contextWindowTokens` is the host window the apply leg plans
 against; `pruneThresholdTokens` is the absolute depth bar (test value 60,000) and requires the window.
-`entryAskTrigger: { mode: "off" }` is the product configuration: the per-result entry ask is retired
-and the entry seam stays for compatibility.
+`entryAskTrigger` defaults to `{ mode: "off" }`: the per-result entry ask is retired (ADR-0050), and
+the entry seam stays for compatibility. An explicit `{ mode: "count" }` selects the retired
+per-result cadence; `entryAskBatchSize` applies only on that path.
 
-`capBytes` and `capHeadBytes` are accepted and ignored: the entry-time size cap was scrapped, so an
-old config file still mounts and neither value is read. Remove them from new rows.
-`minCutFreedBytes` is also accepted and ignored: the cut is the earliest forgotten node.
+`capBytes` and `capHeadBytes` are accepted and ignored since 2026-10-23: ADR-0014 scrapped the
+entry-time cap, so an old config file still mounts and neither value is read. Remove them from new
+rows. `minCutFreedBytes` is also accepted and ignored: the cut is the earliest forgotten node
+(ADR-0034).
 
 ## Durable storage
 
-Storage is durable per session: session `N`'s trash ledger is
+Storage is durable per session (ADR-0013): session `N`'s trash ledger is
 `<crematorStorageRoot>/sessions/N/ledger.sqlite` with its blobs in the sibling `blobs/`
-directory. Removals survive a restart via the durable ledger; a host-confirmed
+directory. Removals survive a restart via the durable ledger (ADR-0015); a host-confirmed
 conflict blocks and journals.
 
 Only the storage root is configurable; a per-session path pair (`databasePath` + `blobRoot`) is
 refused with `explicit-storage-paths`, because one shared ledger would break the per-session rule.
 
 `crematorStorageRoot` is the config key. It must be absolute. Absent, it resolves to
-`<DSH_HOME>/storages/cremator`, where `DSH_HOME` defaults to `~/.dsh`. The `storages` level
-is dsh's own storage root; `cremator` is a subdirectory, so no dsh file
+`<DSH_HOME>/storages/cremator`, where `DSH_HOME` defaults to `~/.dsh`:
+`C:\Users\TZhen\.dsh\storages\CREMATOR` on one owner device, `C:\Users\TZ\.dsh\storages\CREMATOR`
+on the other. `storages` is dsh's own storage root; `CREMATOR` is a subdirectory, so no dsh file
 is ever shared — CREMATOR stamps its own `application_id` and `user_version`, and a shared file
 would be unreadable by both sides.
 
@@ -128,7 +131,7 @@ import { createRacoonsPlugin } from 'cremator-dsh';
 
 const plugin = createRacoonsPlugin({
   config: { enforcement: 'apply', barBytes: 512,
-    crematorStorageRoot: '~/.dsh/storages/cremator' },
+    crematorStorageRoot: 'C:/Users/TZhen/.dsh/storages/cremator' },
   journal: (record) => console.error(record.kind),
 });
 // mount: await plugin.apply(ctx)
@@ -136,7 +139,7 @@ const plugin = createRacoonsPlugin({
 
 The mount journals one `mounted` record carrying `ledgerSource`
 (`'durable' | 'host' | 'memory'`), `node` (`process.version`) and, for the durable source,
-`storageRoot` — runtime evidence of where the ledger actually landed.
+`storageRoot` — the runtime evidence ADR-0013 ruling 8 asks for.
 
 `':memory:'` is for tests only, through the programmatic `storage` option; no config value
 selects it.
@@ -151,14 +154,14 @@ selects it.
   process never minted fails as `not-found`. A retry that succeeds journals `storage-recovered` and
   the mount is fully live.
 - **A restart keeps removals live.** The durable ledger's `applied` receipts are the record of
-  record: a fresh port answers `unknown` for an intent it never saw, and the removal
+  record (ADR-0015): a fresh port answers `unknown` for an intent it never saw, and the removal
   still counts as applied. A host that positively answers `not-applied` contradicts the ledger:
   the pass blocks and journals a `receipt-conflict`. Recall is a read of the durable ledger and
   keeps working either way.
 - **Retention.** Archived bytes live until the user deletes the session directory. There is no
   automatic deletion and no expiry in v1.
 - **Scope.** A recall id resolves within the session that minted it, including after a restart or
-  resume of that session. Cross-session recall is out of scope.
+  resume of that session. Cross-session recall is out of scope (ADR-0013 ruling 7).
 
 The `necromancy` model-facing tool returns the projected output (`recallId`, `text`, `byteLength`,
 `parts`), never the ledger record's `Uint8Array` parts: dsh requires every tool value to be
@@ -167,9 +170,12 @@ admitted request at its next step or turn-end boundary, as one revert plus one r
 
 ## Status
 
-Append-mode Seal is enforced; the entry-time cap is scrapped. Verdict
-enforcement defaults to `apply`; `record-only` is the explicit opt-out. The
-stale-read and superseded-read proof rules ship and run in the mount's at-rest pass. Per-call usage reconciliation from the host's `assistant/message` row is wired. The per-path coverage meter's rows ride `SessionSnapshot.pathCoverage`, and the recall source-fallback reader is wired (`recallReader`, `recallFromSource`).
+Append-mode Seal is enforced; the entry-time cap is scrapped (ADR-0014, 2026-10-23). Verdict
+enforcement defaults to `apply` (ADR-0008); `record-only` is the explicit opt-out. The
+stale-read and superseded-read proof rules ship and run in the mount's at-rest pass (ISSUE-045
+C3). Per-call usage reconciliation from the host's `assistant/message` row is wired (ISSUE-045
+D1). The per-path coverage meter's rows ride `SessionSnapshot.pathCoverage`, and the recall
+source-fallback reader is wired (`recallReader`, `recallFromSource`).
 
 ## License
 

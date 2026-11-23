@@ -27,15 +27,15 @@ import type { OpencodeToolContext, OpencodeToolDefinition } from './host.js';
 /**
  * The core literal names what the tool does. The adapter appends only what a
  * caller must know to read an answer here: one part comes back as the bytes the
- * ledger archived for it, which for a tool-result unit is the canonical
- * `{name,input,result}` JSON envelope the unit was recorded under (the exact
- * text of a text or reasoning part is that part's own text). Several parts come
- * back one entry each and never as a joined body.
+ * ledger archived for it, which for a tool-result unit is the decoded result
+ * text the unit was recorded under (the exact text of a text or reasoning part
+ * is that part's own text). Several parts come back one entry each and never as
+ * a joined body.
  */
 const RECALL_TOOL_DESCRIPTION_OPENCODE = RECALL_TOOL_DESCRIPTION
   + ' One part returns the bytes the ledger archived for it, verbatim: for a tool-result unit'
-  + ' that is the canonical JSON envelope `{"name":...,"input":...,"result":...}` the unit was'
-  + ' recorded under, and for a text or reasoning part it is that part\'s exact text. Several'
+  + ' that is the decoded tool-result text the unit was recorded under, and for a text or'
+  + ' reasoning part it is that part\'s exact text. Several'
   + ' parts return one entry each in `parts`, and no field holds a joined body (`text` is null).';
 
 /**
@@ -100,7 +100,7 @@ export interface OpencodeRecallPart {
  * A restored record, one part at a time. Each entry carries that part's
  * `nodeId`, `sha256`, `byteLength` and its exact archived bytes decoded as
  * UTF-8; no entry spans two parts. For a tool-result unit those bytes are the
- * canonical `{name,input,result}` envelope; for a text or reasoning part they
+ * decoded result text; for a text or reasoning part they
  * are the part's own text. `text` repeats the body only when the record has
  * exactly one part and is `null` when it has several, so nothing returned ever
  * claims bytes no single part held (ADR-0003).
@@ -153,7 +153,7 @@ export function recallText(record: RecallRecord, expected: RecallId): OpencodeRe
 /**
  * The one string the host's tool result carries. A single-part record is
  * returned as its archived bytes, so a model reads exactly what the ledger
- * banked: a tool-result unit's canonical `{name,input,result}` envelope, or a
+ * banked: a tool-result unit's decoded result text, or a
  * text/reasoning part's own text. A multi-part record has no single body, so it
  * is returned as JSON naming each part separately — never a join (ADR-0003).
  */

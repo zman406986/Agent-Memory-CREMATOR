@@ -37,12 +37,17 @@ const LARGE_NOTE = `# Note\n\n${'body-'.repeat(180)}\n`;
 const LONG_QUESTION = 'Should the audit be bounded to the entry documents, or should it read '
   + 'every file in the repository across several sessions? '.repeat(6);
 
-/** The host's cancelled-`question` envelope, `error` before `content`. */
+/**
+ * The host's cancelled-`question` envelope, `error` before `content`. The body
+ * is the error value's own JSON text (ISSUE-509), so the message is long enough
+ * that the body alone clears the 512-byte floor: a unit is minted, and the
+ * retention rule — not the floor — is what keeps it.
+ */
 const CANCELLED_QUESTION = {
   error: {
     type: 'tool.execution',
-    message: 'This non-interactive run cannot ask the user questions. Continue without an '
-      + 'answer; make reasonable assumptions and state them.',
+    message: ('This non-interactive run cannot ask the user questions. Continue without an '
+      + 'answer; make reasonable assumptions and state them. ').repeat(4).trim(),
   },
   content: [],
 };
@@ -188,7 +193,7 @@ test('1f FIX 2: the ask never offers an error result, a normal result still appl
         // The retained result still occupies its pass index, so the normal row
         // is addressed by the index the table shows, not by position 1.
         const shown = Number(/^([1-9]\d*)\. \[read\]/mu.exec(input.prompt)?.[1] ?? 1);
-        return { text: JSON.stringify({ [String(shown)]: { forgetall: 'old read' } }) };
+        return { text: JSON.stringify({ [String(shown)]: { forgetall: true, summary: 'old read' } }) };
       },
       journal: record => lines.records.push(record),
     });

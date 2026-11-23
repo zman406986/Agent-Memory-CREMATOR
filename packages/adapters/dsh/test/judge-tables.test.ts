@@ -20,13 +20,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  ForkError, PRUNE_ASK_FINAL_LINE, PRUNE_ASK_NOKEEPALL_FINAL_LINE,
-  PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT, PRUNE_ASK_SYSTEM_PROMPT,
+  ENTRY_ASK_END_ANCHOR, entryBatchAskMessage, isRefusedPruneAnchor,
+  PRUNE_ASK_FINAL_LINE, PRUNE_ASK_JSONL_20_NOKEEPALL_LATER_REPEAT,
+  PRUNE_ASK_JSONL_20_NOKEEPALL_REPEAT,
+  PRUNE_ASK_SYSTEM_PROMPT,
   buildPruneAskRows, canonicalManifestBytes, equalBytes, hashMessages,
-  renderPruneAskTable, seedFork, wireRequestHash,
+  renderPruneAskTable, seedFork,
 } from '@cremator/core';
 import type {
-  PruneAskGrammar, ProcessingUnit, ToolResultNode, WireRequest,
+  EntryBatchRow, PruneAskGrammar, PruneAskRow, ProcessingUnit, ToolResultNode, WireRequest,
 } from '@cremator/core';
 import { captureMainRequest } from '../src/main-wire.js';
 import { runTables, tableAsk } from '../src/judge-tables.js';
@@ -120,6 +122,16 @@ function unit(index: number): ProcessingUnit {
     span: { byteRange: { startByte: 0, endByteExclusive: bytes.length },
       lineRange: { startLine: 1, endLineInclusive: 3 } },
     byteLength: bytes.length };
+}
+
+/** A zero-line unit: no line span, so the table shows `[0 lines]`. */
+function zeroLineUnit(index: number): ProcessingUnit {
+  const nodeId = `dsh:s1:result:z${String(index)}`;
+  return { id: `unit:${nodeId}`, nodeId,
+    source: { nodeId, sha256: `sha-z${String(index)}`, byteLength: 0 },
+    path: null,
+    span: { byteRange: { startByte: 0, endByteExclusive: 0 }, lineRange: null },
+    byteLength: 0 };
 }
 
 function nodeFor(value: ProcessingUnit): ToolResultNode {
@@ -458,33 +470,355 @@ test('the grammar selects the prompt, the closing line and the row shape; 3optio
     assert.ok(threeOption.endsWith(PRUNE_ASK_FINAL_LINE),
       'the 3option final line closes the ask');
     assert.equal(threeOption.includes('line(s)]'), false, '3option rows carry no line count');
-
-    // `nokeepall`: its own prompt, its own closing line, and every row's own L.
-    const twoVerdict = tableAsk(rows, 'nokeepall');
-    assert.ok(twoVerdict.includes(PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT),
-      'the nokeepall contract is in the ask');
-    assert.ok(twoVerdict.endsWith(PRUNE_ASK_NOKEEPALL_FINAL_LINE),
-      'the nokeepall final line closes the ask');
-    assert.match(twoVerdict, /1\. \[read\] \(call #1\) — .* \[3 lines\]$/mu);
-    assert.match(twoVerdict, /2\. \[read\] \(call #2\) — .* \[3 lines\]$/mu);
-    assert.equal(twoVerdict.match(/\[3 lines\]/gu)?.length, 2,
-      'both rows carry their own [L], not just the example');
-    assert.equal(twoVerdict.includes('"keepall"'), false,
-      'the nokeepall contract never teaches keepall');
   });
 
-test('nokeepall: a full-range keeplines becomes a clean keepall, a partial one stays keeplines',
+test('the bulk nokeepall ask IS the entry jsonl-20-nokeepall message, byte for byte (ISSUE-508)',
+  () => {
+    // Four rows: a path-bearing call, a refused anchor, and a same-kind/
+    // same-path pair (ordinals 1 and 2), so the conversion is pinned on the two
+    // facts the prune renderer writes — the target, the refusal note — and on the
+    // pass's own occurrence ordinal.
+    const units = [unit(1), unit(2), unit(3), unit(4)];
+    const rows = buildPruneAskRows([
+      { unit: units[0] as ProcessingUnit, node: nodeFor(units[0] as ProcessingUnit),
+        callFacts: { toolName: 'Read', targetPath: 'config.ts' } },
+      { unit: units[1] as ProcessingUnit,
+        callFacts: { toolName: 'Grep', targetPath: 'server.ts' } },
+      { unit: units[2] as ProcessingUnit, node: nodeFor(units[2] as ProcessingUnit),
+        callFacts: { toolName: 'Read', targetPath: 'same.ts' } },
+      { unit: units[3] as ProcessingUnit, node: nodeFor(units[3] as ProcessingUnit),
+        callFacts: { toolName: 'Read', targetPath: 'same.ts' } },
+    ]);
+    assert.deepEqual(rows.map(row => row.anchor.callOrdinal), [1, 1, 1, 2],
+      'the pass numbers by kind+path: two paths restart at 1, the repeat is 2');
+    // The same rows in the entry message's own shape, built here from the prune
+    // rows so the test names the equality the product path relies on. The
+    // ordinal is carried across, so parity also pins that pass-through.
+    const entryRowsOf = (source: readonly PruneAskRow[]): readonly EntryBatchRow[] =>
+      source.map(row => ({
+        index: row.index,
+        call: row.anchor.kind,
+        ...(row.anchor.path === undefined ? {} : { path: row.anchor.path }),
+        ...(isRefusedPruneAnchor(row.anchor)
+          ? { anchorLines: [], anchorRefusal: row.anchor.refusal }
+          : { anchorLines: row.anchor.anchors }),
+        callOrdinal: row.anchor.callOrdinal,
+        lineCount: 3,
+      }));
+    const entryRows = entryRowsOf(rows);
+    for (const firstTrigger of [true, false]) {
+      assert.equal(tableAsk(rows, 'nokeepall', firstTrigger),
+        entryBatchAskMessage(entryRows, 'jsonl-20-nokeepall', firstTrigger),
+        `the bulk table is the entry message (firstTrigger=${String(firstTrigger)})`);
+    }
+    const ask = tableAsk(rows, 'nokeepall', true);
+    assert.ok(ask.includes('1. [Read] config.ts (call #1) — '),
+      'the row keeps its call and target, exactly as the prune renderer writes them');
+    assert.match(ask, /2\. \[Grep\] server\.ts \(call #1\) — anchor unavailable: missing-node/u,
+      'a refused anchor renders its own note, never an empty anchor list');
+    assert.match(ask, /4\. \[Read\] same\.ts \(call #2\) — /u,
+      'the repeated call keeps the pass ordinal');
+    // The carried-row case: a table of that one row. Recomputing would print
+    // #1; the pass ordinal is #2, and parity must hold with it carried across.
+    const carried = [rows[3] as PruneAskRow];
+    assert.equal(tableAsk(carried, 'nokeepall', false),
+      entryBatchAskMessage(entryRowsOf(carried), 'jsonl-20-nokeepall', false),
+      'a carried table is the entry message byte for byte');
+    assert.match(tableAsk(carried, 'nokeepall', false), /4\. \[Read\] same\.ts \(call #2\) — /u,
+      'the carried row keeps its index and is not renumbered to 1');
+    assert.equal(ask.includes('[3 lines]'), true, 'every row states its own L');
+  });
+
+test('the first table ask states 70 percent; the next states 40 (ISSUE-508)', async () => {
+  const rows = rowsOf(2);
+  const first = tableAsk(rows, 'nokeepall', true);
+  const later = tableAsk(rows, 'nokeepall', false);
+  assert.ok(first.includes('keep at most 70 percent'), 'the first ask names 70');
+  assert.equal(first.includes('keep at most 40 percent'), false,
+    'one message never states both shares');
+  assert.ok(later.includes('keep at most 40 percent'), 'the later ask names 40');
+  assert.equal(later.includes('keep at most 70 percent'), false);
+
+  // Through the loop: a pass whose first table leaves a row carried sends two
+  // asks, and the second is the later share even though one flag started true.
+  const llm = scriptedLlm(['{"1":{"keeplines":[[1,3]],"summary":"None"}}']);
+  const send = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows,
+    stamps: stampsOf(rows), llm, route, grammar: 'nokeepall', firstTrigger: true,
+    journal: () => {},
+  });
+  assert.equal(send.tables, 2, 'one catch-up table carries the unanswered row');
+  const askText = (call: { readonly messages: readonly unknown[] } | undefined): string => {
+    const last = call?.messages.at(-1) as
+      { readonly content?: readonly { readonly text?: string }[] } | undefined;
+    return (last?.content ?? []).map(block => block.text ?? '').join('');
+  };
+  assert.ok(askText(llm.calls[0]).includes('keep at most 70 percent'),
+    'the pass starts on the first share');
+  assert.ok(askText(llm.calls[1]).includes('keep at most 40 percent'),
+    'the later table of the same pass states 40');
+});
+
+test('the post-table repeat and the end anchor close every table ask (ISSUE-508)', () => {
+  const rows = rowsOf(2);
+  for (const [firstTrigger, repeat] of [
+    [true, PRUNE_ASK_JSONL_20_NOKEEPALL_REPEAT],
+    [false, PRUNE_ASK_JSONL_20_NOKEEPALL_LATER_REPEAT],
+  ] as const) {
+    const ask = tableAsk(rows, 'nokeepall', firstTrigger);
+    assert.ok(ask.endsWith(repeat), 'the post-table repeat closes the ask');
+    assert.ok(ask.endsWith(ENTRY_ASK_END_ANCHOR), 'the end anchor is the last line');
+    assert.equal(ask.includes('<rows: the table'), false,
+      'the table slot was replaced, never shipped');
+  }
+});
+
+test('the reader gate: keepall refuses, a whole-range keeplines keeps, a partial one applies',
   async () => {
-    const llm = scriptedLlm(['{"1":{"keeplines":[[1,3],"everything stays"]},'
-      + '"2":{"keeplines":[[1,2],"the last line is enough"]}}']);
-    const { outcome } = await run(llm, 2, collector(), 'nokeepall');
+    // One reply, one object per line: the shape the new ask teaches.
+    const answer = [
+      '{"1":{"keepall":true}}',
+      '{"2":{"keeplines":[[1,3]],"summary":"None"}}',
+      '{"3":{"keeplines":[[1,2]],"summary":"the last line is enough"}}',
+    ].join('\n');
+    const llm = scriptedLlm([answer]);
+    const { outcome } = await run(llm, 3, collector(), 'nokeepall');
     assert.equal(outcome.tables, 1);
-    assert.equal(outcome.refused.size, 0);
-    assert.equal(outcome.kept.get(1)?.answer.verdict.action, 'keepall',
-      'a whole-range keep is a keepall, whatever its summary says');
-    assert.equal(outcome.kept.get(2)?.answer.verdict.action, 'keeplines',
-      'a partial keep is still the grammar\'s own answer');
+    assert.equal(outcome.refused.get(1)?.code, 'action-not-in-grammar',
+      'a keepall names an action the grammar does not offer, and keeps');
+    assert.equal(outcome.kept.get(2)?.answer.verdict.action, 'keepall',
+      'a whole-range keeplines is a clean keepall: it removes nothing');
+    assert.equal(outcome.kept.get(3)?.answer.verdict.action, 'keeplines',
+      'a partial keeplines reaches the apply path as itself');
   });
+
+test('the first table ask states 70 on a fresh session and 40 once the flag moved', async () => {
+  // The mount reads its persisted flag at mount; here the flag is the loop's own
+  // input, which is what a restart hands it after reading `tableAskFired`.
+  const rows = rowsOf(1);
+  const llm = scriptedLlm(['{"1":{"keeplines":[[1,3]],"summary":"None"}}']);
+  const journal = collector();
+  const outcome = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows,
+    stamps: stampsOf(rows), llm, route, grammar: 'nokeepall', firstTrigger: false,
+    journal: (kind, fields) => { journal.records.push({ kind, ...fields }); },
+  });
+  assert.equal(outcome.tables, 1);
+  const last = llm.calls[0]?.messages.at(-1) as
+    { readonly content?: readonly { readonly text?: string }[] } | undefined;
+  const text = (last?.content ?? []).map(block => block.text ?? '').join('');
+  assert.ok(text.includes('keep at most 40 percent'), 'a resumed session states 40');
+  assert.equal(text.includes('keep at most 70 percent'), false);
+});
+
+/** The text of a request's last message, as the host receives it. */
+function lastMessageText(call: { readonly messages: readonly unknown[] } | undefined): string {
+  const last = call?.messages.at(-1) as
+    { readonly content?: readonly { readonly text?: string }[] } | undefined;
+  return (last?.content ?? []).map(block => block.text ?? '').join('');
+}
+
+/** The one table answer shape the nokeepall correction teaches. */
+const CORRECTION_FORMAT_FORGETALL = '{"N":{"forgetall":true,"summary":"<summary>"}}';
+
+test('the nokeepall correction speaks the table grammar and reads a table-shaped reply '
+  + '(ISSUE-508 F3)', async () => {
+  // Table 1 refuses row 1 with a span past its L; the carry re-asks it and it
+  // refuses again; the pass's one correction turn then gets a table-shaped
+  // reply — one object on its own line — and applies it.
+  const rows = rowsOf(1);
+  const stamps = stampsOf(rows);
+  const llm = scriptedLlm([
+    '{"1":{"keeplines":[[1,9]],"summary":"too far"}}',
+    '{"1":{"keeplines":[[1,9]],"summary":"too far"}}',
+    '{"1":{"forgetall":true,"summary":"fixed"}}',
+  ]);
+  const loop = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows, stamps, llm, route,
+    grammar: 'nokeepall', journal: () => {},
+  });
+  assert.equal(loop.tables, 2, 'the span refusal spends the row\'s one re-ask');
+  assert.equal(loop.refused.get(1)?.code, 'spans-outside-result');
+  const corrected = await retryRefusedRows({
+    sessionId: 's1', round: 1, rows, loop, stamps, llm, route,
+    grammar: 'nokeepall', journal: () => {},
+  });
+  assert.equal(corrected.halted, false);
+  assert.equal(corrected.kept.get(1)?.answer.verdict.action, 'forgetall',
+    'a table-shaped correction reply applies');
+  assert.equal(corrected.refused.size, 0);
+  // The correction ask itself teaches the table's own answer shape.
+  const sent = lastMessageText(llm.calls.at(-1));
+  assert.ok(sent.includes(CORRECTION_FORMAT_FORGETALL),
+    'the one-object-per-line forgetall shape is stated');
+  assert.equal(sent.includes('exactly one JSON object, one key per row above'), false,
+    'the index-keyed instruction is not sent under this grammar');
+  assert.ok(sent.includes('[3 lines]'), 'the re-asked row carries its own L');
+});
+
+test('the old index-keyed correction reply is never accepted under nokeepall (ISSUE-508 F3)',
+  async () => {
+    // The same pass, but the correction reply uses the retired wire shape
+    // (`forgetall` value is the summary string). The line reader refuses it.
+    const rows = rowsOf(1);
+    const stamps = stampsOf(rows);
+    const llm = scriptedLlm([
+      '{"1":{"keeplines":[[1,9]],"summary":"too far"}}',
+      '{"1":{"keeplines":[[1,9]],"summary":"too far"}}',
+      '{"1":{"forgetall":"fixed"}}',
+    ]);
+    const loop = await runTables({
+      sessionId: 's1', round: 1, fork: seedFork(MAIN), rows, stamps, llm, route,
+      grammar: 'nokeepall', journal: () => {},
+    });
+    const corrected = await retryRefusedRows({
+      sessionId: 's1', round: 1, rows, loop, stamps, llm, route,
+      grammar: 'nokeepall', journal: () => {},
+    });
+    assert.equal(corrected.kept.size, 0, 'no verdict was applied');
+    assert.equal(corrected.refused.get(1)?.code, 'malformed-row',
+      'the summary-as-value shape is a row refusal, never a forgetall');
+  });
+
+test('the correction journal names the finer line code, not the collapsed one '
+  + '(ISSUE-508 F4)', async () => {
+  // One line carrying two action keys is `mixed-keys` in the line reader and
+  // `malformed-row` in the bulk vocabulary. The correction's own journal line
+  // must name the finer code so the re-ask is auditable.
+  const rows = rowsOf(1);
+  const stamps = stampsOf(rows);
+  const bad = '{"1":{"forgetall":true,"keeplines":[[1,2]],"summary":"x"}}';
+  const llm = scriptedLlm([bad, bad, '{"1":{"forgetall":true,"summary":"fixed"}}']);
+  const journal = collector();
+  const journalOf = (kind: string, fields: Record<string, unknown>): void => {
+    journal.records.push({ kind, ...fields });
+  };
+  const loop = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows, stamps, llm, route,
+    grammar: 'nokeepall', journal: journalOf,
+  });
+  assert.equal(loop.refused.get(1)?.code, 'malformed-row', 'the bulk code stays closed');
+  assert.equal(loop.refused.get(1)?.detail, 'mixed-keys', 'the finer code rides beside it');
+  const corrected = await retryRefusedRows({
+    sessionId: 's1', round: 1, rows, loop, stamps, llm, route,
+    grammar: 'nokeepall', journal: journalOf,
+  });
+  assert.equal(corrected.kept.size, 1, 'the table-shaped correction reply applies');
+  const line = journal.records.find(record => record['kind'] === 'prune-correction');
+  assert.deepEqual(line?.['reasons'], ['1:mixed-keys'],
+    'the correction journal carries index:detail');
+  const sent = lastMessageText(llm.calls.at(-1));
+  assert.ok(sent.includes('index 1 carried more than one action key or an extra key'),
+    'and the model is told the finer defect');
+});
+
+test('a zero-line row refuses keeplines [[1,1]] and keeps (ISSUE-508 F2)', async () => {
+  // The row showed `[0 lines]`. The sentinel count used to keep the reader from
+  // throwing must not turn `[[1,1]]` into a whole-range keep.
+  const rows = buildPruneAskRows([{ unit: zeroLineUnit(1) }]);
+  const llm = scriptedLlm(['{"1":{"keeplines":[[1,1]],"summary":"x"}}']);
+  const outcome = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows,
+    stamps: stampsOf(rows), llm, route, grammar: 'nokeepall', journal: () => {},
+  });
+  assert.equal(outcome.kept.size, 0, 'nothing was accepted as a keep');
+  assert.equal(outcome.refused.get(1)?.code, 'spans-outside-result',
+    'no span lies inside 1..0, so the row refuses and keeps');
+  assert.equal(outcome.tables, 2, 'the refusal is re-askable, not terminal');
+});
+
+test('call ordinals are the pass\'s kind+path numbers and survive a carried table '
+  + '(ISSUE-508 F1)', () => {
+  // Same kind, different targets: two different calls, each occurrence 1.
+  const one = unit(1);
+  const two = unit(2);
+  const differentPaths = buildPruneAskRows([
+    { unit: one, node: nodeFor(one), callFacts: { toolName: 'Read', targetPath: 'a.ts' } },
+    { unit: two, node: nodeFor(two), callFacts: { toolName: 'Read', targetPath: 'b.ts' } },
+  ]);
+  assert.deepEqual(differentPaths.map(row => row.anchor.callOrdinal), [1, 1],
+    'the pass numbers by kind and target, so the second target restarts at 1');
+  const ask = tableAsk(differentPaths, 'nokeepall', true);
+  assert.match(ask, /1\. \[Read\] a\.ts \(call #1\)/u);
+  assert.match(ask, /2\. \[Read\] b\.ts \(call #1\)/u);
+});
+
+test('a carried table re-asks its row with the pass ordinal, not a renumbered one '
+  + '(ISSUE-508 F1)', async () => {
+  const three = unit(3);
+  const four = unit(4);
+  const samePath = buildPruneAskRows([
+    { unit: three, node: nodeFor(three), callFacts: { toolName: 'Read', targetPath: 'same.ts' } },
+    { unit: four, node: nodeFor(four), callFacts: { toolName: 'Read', targetPath: 'same.ts' } },
+  ]);
+  assert.deepEqual(samePath.map(row => row.anchor.callOrdinal), [1, 2]);
+  // Row 1 answers; row 2 is carried into table 2, alone. Its ordinal must stay 2.
+  const llm = scriptedLlm(['{"1":{"keeplines":[[1,3]],"summary":"None"}}']);
+  const outcome = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows: samePath,
+    stamps: stampsOf(samePath), llm, route, grammar: 'nokeepall', journal: () => {},
+  });
+  assert.equal(outcome.tables, 2, 'the unanswered row is carried to one more table');
+  const second = lastMessageText(llm.calls[1]);
+  assert.match(second, /2\. \[Read\] same\.ts \(call #2\)/u,
+    'the carried row keeps the ordinal the pass gave it');
+  assert.equal(/2\. \[Read\] same\.ts \(call #1\)/u.test(second), false,
+    'the carried table does not renumber it to 1');
+});
+
+test('an ask refused before the send leaves the first-ask line unspent (ISSUE-508 F6/F7)',
+  async () => {
+    const rows = rowsOf(1);
+    const cases: readonly {
+      readonly name: string;
+      readonly route: { readonly provider: string; readonly model: string };
+      readonly extra: { readonly timeoutMs?: number; readonly signal?: AbortSignal };
+    }[] = [
+      { name: 'not-configured', route: { provider: '', model: '' }, extra: {} },
+      { name: 'invalid-timeout', route, extra: { timeoutMs: -1 } },
+      // A signal already aborted when the send began: the seam refuses before
+      // anything reaches the host.
+      { name: 'pre-aborted', route, extra: { signal: AbortSignal.abort() } },
+    ];
+    for (const scenario of cases) {
+      let moved = 0;
+      const outcome = await runTables({
+        sessionId: 's1', round: 1, fork: seedFork(MAIN), rows,
+        stamps: stampsOf(rows), llm: scriptedLlm(['{"1":{"keeplines":[[1,3]],"summary":"None"}}']),
+        route: scenario.route, grammar: 'nokeepall', firstTrigger: true,
+        onTableAskLeft: () => { moved += 1; }, journal: () => {}, ...scenario.extra,
+      });
+      assert.equal(moved, 0, `${scenario.name}: the first-ask line is not spent`);
+      assert.equal(outcome.halted, true, `${scenario.name}: the pass halts fail-open`);
+    }
+  });
+
+test('a mid-stream abort spends the first-ask line (ISSUE-508 F6)', async () => {
+  // The send began on a live signal; the host aborted while the stream ran. That
+  // request left, so the session's 70 percent line is spent.
+  const rows = rowsOf(1);
+  const controller = new AbortController();
+  const calls: DshLlmStreamOptions[] = [];
+  const llm: FakeLlm = {
+    calls,
+    stream(options) {
+      calls.push(options);
+      return (async function* emit() {
+        yield { type: 'usage', usage: { inputTokens: 10, cacheReadTokens: 0, outputTokens: 0 } };
+        controller.abort();
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  let moved = 0;
+  const outcome = await runTables({
+    sessionId: 's1', round: 1, fork: seedFork(MAIN), rows,
+    stamps: stampsOf(rows), llm, route, grammar: 'nokeepall', firstTrigger: true,
+    signal: controller.signal, onTableAskLeft: () => { moved += 1; }, journal: () => {},
+  });
+  assert.equal(outcome.halted, true, 'the aborted stream halts fail-open');
+  assert.equal(moved, 1, 'the request left, so the first-ask line is spent');
+});
 
 test('nokeepall: a literal keepall is action-not-in-grammar and is final, never re-asked',
   async () => {
@@ -513,7 +847,8 @@ test('nokeepall: a span past the row\'s shown L is spans-outside-result, never a
     // re-askable refusal (the entry jsonl-20 reader's own code), so the same
     // reply on attempt 2 is final.
     const journal = collector();
-    const llm = scriptedLlm(['{"1":{"keeplines":[[1,4],"the whole row and one more"]}}']);
+    const llm = scriptedLlm([
+      '{"1":{"keeplines":[[1,4]],"summary":"the whole row and one more"}}']);
     const { outcome } = await run(llm, 1, journal, 'nokeepall');
     assert.equal(outcome.halted, false, 'a readable answer is not a halt');
     assert.equal(outcome.tables, 2, 'the invalid span spends the row\'s one re-ask');

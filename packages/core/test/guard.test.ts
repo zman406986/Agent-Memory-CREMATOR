@@ -144,7 +144,8 @@ test("a cap plan is refused: the entry-time cap has no application path", async 
 test("one invalid plan rejects the whole batch", async () => {
   const v = entry(); const validation = await guard().validate({ ...v, plans: [...v.plans,
     { ruleId: "seal", baseRevision: "stale", removals: [], notes: [], operations: [] }] });
-  assert.equal(validation.ok, false); assert.equal("application" in validation, false);
+  assert.equal(validation.ok, false);
+  assert.equal("application" in validation, false);
 });
 
 test("append seal has no removals, replacements or archives", async () => {

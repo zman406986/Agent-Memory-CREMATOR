@@ -122,7 +122,7 @@ function journalCollector(): { records: { kind: string; [field: string]: unknown
 }
 
 /** A model seam that answers every prune table with one whole-unit forget. */
-function forgetLlm(answer = '{"1":{"forgetall":"big read"}}'): {
+function forgetLlm(answer = '{"1":{"forgetall":true,"summary":"big read"}}'): {
   readonly calls: readonly unknown[];
   stream(options: never): AsyncIterable<{ type: string; [field: string]: unknown }>;
 } {

@@ -23,7 +23,10 @@
  *     every refused unit keeps.
  *   - the closing line is the table ask's own `PRUNE_ASK_FINAL_LINE`, reused as
  *     is: no new anchor token exists, and a rig that matches the table ask's
- *     end still recognises this turn.
+ *     end still recognises this turn. Under `nokeepall` (ISSUE-508, F3) the
+ *     whole turn is that grammar instead — rows with their `[L line(s)]` and
+ *     the one-object-per-row answer shapes, no share line — so one pass never
+ *     speaks two grammars.
  *
  * Pure and deterministic: same input, same bytes, no I/O, nothing mutated. Only
  * invalid options throw, because those are caller bugs, not answer data.
@@ -82,6 +85,14 @@ const POLICY_LINE =
 export interface PruneCorrectionReason {
   readonly index: number;
   readonly code: PruneAnswerRefusalCode;
+  /**
+   * A finer code for the same refusal, when the reading lane has one. The
+   * `jsonl-20` line reader names `mixed-keys`, `summary-missing`,
+   * `summary-too-long`, `bad-range` and `ranges-unordered` where this closed
+   * list says `malformed-row`; the clause states the finer defect so the model
+   * is told what to fix (ISSUE-508, F4).
+   */
+  readonly detail?: string;
 }
 
 /** What the correction turn needs: the rows, the table it answers, and why. */
@@ -94,8 +105,9 @@ export interface PruneCorrectionInput {
   readonly reasons: readonly PruneCorrectionReason[];
   /**
    * The grammar this correction restates. Absent is `3option`. `nokeepall`
-   * re-renders each row with its `[L line(s)]` and closes on that grammar's
-   * final line, which never names `keepall`.
+   * re-renders each row with its `[L line(s)]` and states the one-object-per-row
+   * answer shapes, so the correction speaks exactly the grammar the table asked
+   * in (ISSUE-508).
    */
   readonly grammar?: PruneAskGrammar;
 }
@@ -103,9 +115,12 @@ export interface PruneCorrectionInput {
 /**
  * Why one index produced no verdict, in the approved phrasing. The per-index
  * codes name the index; the two whole-answer codes name the answer, because
- * every row of that table refused for the one reason.
+ * every row of that table refused for the one reason. A `detail` the closed list
+ * collapsed into `malformed-row` names the finer defect instead (F4).
  */
-function reasonClause(code: PruneAnswerRefusalCode, index: number): string {
+function reasonClause(code: PruneAnswerRefusalCode, index: number, detail?: string): string {
+  const finer = detail === undefined ? null : detailClause(detail, index);
+  if (finer !== null) return finer;
   switch (code) {
     case "missing-index":
       return `index ${String(index)} had no verdict`;
@@ -128,11 +143,50 @@ function reasonClause(code: PruneAnswerRefusalCode, index: number): string {
   }
 }
 
+/** The `jsonl-20` line reader's finer codes, as correction clauses. */
+function detailClause(detail: string, index: number): string | null {
+  if (detail === "mixed-keys") {
+    return `index ${String(index)} carried more than one action key or an extra key`;
+  }
+  if (detail === "summary-missing") {
+    return `index ${String(index)} forgot without a summary`;
+  }
+  if (detail === "summary-too-long") {
+    return `index ${String(index)} carried a summary past 30 words`;
+  }
+  if (detail === "bad-range") {
+    return `index ${String(index)} carried malformed keeplines ranges`;
+  }
+  if (detail === "ranges-unordered") {
+    return `index ${String(index)} carried keeplines ranges out of order`;
+  }
+  return null;
+}
+
+/**
+ * The two answer shapes the line-per-row correction restates. They are the
+ * table contract's own shapes (`jsonl-20`: one object per row on its own line,
+ * one action key, sibling `summary`), keyed `N` because this turn accepts only
+ * the rows above. The share line is the table ask's; a correction re-asks rows
+ * already refused, so it states no target of its own.
+ */
+const JSONL_CORRECTION_ANSWER = [
+  "Answer again, once, with one JSON object per row on its own line, same indices, nothing else:",
+  "",
+  '{"N":{"forgetall":true,"summary":"<summary>"}}',
+  '{"N":{"keeplines":[[start,end], ...],"summary":"<summary>"}}',
+].join("\n");
+
 /**
  * The one correction turn. The counts, the reasons, the refused rows, the
  * composite and the closing line are the whole message: it never restates the
  * fork's history, never re-asks an accepted row, and never asks the keep-or-
  * forget question again for a unit that answered.
+ *
+ * One grammar per pass (ISSUE-508, F3): under `nokeepall` the turn is the SAME
+ * line-per-row grammar the table asked in — the refused rows with their `[L
+ * line(s)]`, then the one-object-per-row answer shapes — and its reply is read
+ * by `readJsonl20NoKeepallAnswer`. The `3option` bytes are unchanged.
  */
 export function pruneCorrectionMessage(input: PruneCorrectionInput): string {
   const { refused, totalRows, reasons } = input;
@@ -143,14 +197,14 @@ export function pruneCorrectionMessage(input: PruneCorrectionInput): string {
   if (!Number.isSafeInteger(totalRows) || totalRows < refused.length) {
     throw new RangeError("totalRows must be a safe integer at least the refused row count.");
   }
-  const byIndex = new Map(reasons.map(reason => [reason.index, reason.code] as const));
+  const byIndex = new Map(reasons.map(reason => [reason.index, reason] as const));
   const clauses: string[] = [];
   for (const row of refused) {
-    const code = byIndex.get(row.index);
-    if (code === undefined) {
+    const reason = byIndex.get(row.index);
+    if (reason === undefined) {
       throw new RangeError(`No refusal reason for refused index ${String(row.index)}.`);
     }
-    const clause = reasonClause(code, row.index);
+    const clause = reasonClause(reason.code, row.index, reason.detail);
     // A whole-answer code yields the same clause for every row of that table;
     // stating it once is the approved phrasing ("the answer was not one JSON
     // object"), not five repetitions of it.
@@ -159,6 +213,15 @@ export function pruneCorrectionMessage(input: PruneCorrectionInput): string {
   const opening = `Your previous answer could not be applied for ${String(refused.length)} of `
     + `${String(totalRows)} rows: ${clauses.join("; ")}. Those units are kept so far. This turn `
     + "asks those rows only; the rows you answered are accepted — do not answer them again.";
+  if (grammar === "nokeepall") {
+    return [
+      opening,
+      "",
+      renderPruneAskRows(refused, { grammar }),
+      "",
+      JSONL_CORRECTION_ANSWER,
+    ].join("\n");
+  }
   return [
     opening,
     "",

@@ -64,6 +64,15 @@ export interface PruneAnswerRowRefused {
   readonly message: string;
   /** The wire parser's own code when the row itself was malformed; else null. */
   readonly wireCode: WireVerdictErrorCode | null;
+  /**
+   * A lane's finer code for the same defect, when the reading lane has a
+   * vocabulary this closed list does not carry. The `jsonl-20` line reader's
+   * codes (`mixed-keys`, `summary-missing`, `summary-too-long`, `bad-range`,
+   * `ranges-unordered`) land here beside their collapsed `malformed-row`, so the
+   * correction turn can name the actual defect (ISSUE-508). It never changes
+   * which unit is kept: `code` alone decides that.
+   */
+  readonly detail?: string;
 }
 
 export type PruneAnswerRow = PruneAnswerRowAnswered | PruneAnswerRowRefused;
