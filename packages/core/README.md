@@ -13,19 +13,13 @@ revert planner.
 
 ## Install
 
-The package is not published to npm (owner decision, ISSUE-069). Build it from this repo, then
-install the built folder into your project:
-
 ```sh
-npm install
-npm run build
-# in your project:
-npm install file:///C:/Users/TZhen/Desktop/racoons/packages/core
+npm install @cremator/core
 ```
 
-On the other owner device the path is
-`file:///C:/Users/TZ/Desktop/racoons/packages/core`. Requires Node
-`>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`).
+Requires Node `>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`). The
+adapters install it as a dependency; install it directly only when using the
+core without an adapter.
 
 ## Use
 

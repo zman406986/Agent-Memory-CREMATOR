@@ -2,8 +2,8 @@
 
 Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
-Early stage. Packages are not on npm and dsh is not publicly distributed; the
-`examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
+Early stage. The packages are on npm. Install the adapter you use; dsh is not
+publicly distributed. The `examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
 been run against real dsh. The OpenCode adapter passes functional tests against a fake host only;
 its live-run evidence is withdrawn (see [its README](packages/adapters/opencode/README.md)). This
 library does not establish any effect on answer quality.
@@ -109,11 +109,13 @@ seal's negative-fact records, and (when the entry ask is enabled) its answers st
 Node `>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`).
 
 ```sh
-git clone https://github.com/zman406986/Agent-Memory-CREMATOR
-cd Agent-Memory-CREMATOR
-npm install
-npm run build
+npm install cremator-dsh
+# or
+npm install cremator-opencode
 ```
+
+`@cremator/core` installs automatically. For a source checkout, run `npm install`
+and `npm run build` in the cloned repository.
 
 dsh is not publicly distributed. The only example that runs today without dsh is
 `examples/core-offline/`, which drives the core alone:
@@ -166,9 +168,10 @@ message still triggers the same pass.
 | --- | --- |
 | [`@cremator/core`](packages/core/README.md) | Meter, episodes, rules, prune families, guard, ledger, revert planner, engine; the core never imports harness code. |
 | [`cremator-dsh`](packages/adapters/dsh/README.md) | dsh adapter: seam mapping, the mount entry, the `forget` and `necromancy` tools (`necromancy` restores forgotten bytes by recall id). |
-| [`cremator-opencode`](packages/adapters/opencode/README.md) | OpenCode adapter: a thin seam mapping over OpenCode 2.2.5's context hooks; functional tests only, live evidence withdrawn. |
+| [`cremator-opencode`](packages/adapters/opencode/README.md) | OpenCode adapter: a thin seam mapping over OpenCode 2.4.0's context hooks and menu parts; functional tests only, live evidence withdrawn. |
 
-The packages are not published to npm.
+Install with `npm install cremator-dsh` or `npm install cremator-opencode`;
+`@cremator/core` installs as a dependency.
 
 ## License
 

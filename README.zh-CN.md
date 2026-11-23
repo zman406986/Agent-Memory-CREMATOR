@@ -4,7 +4,7 @@ Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
 CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减法。常见的压缩都等窗口快满了才动手：让模型把历史重写成一篇摘要，或者把最旧的消息截掉。CREMATOR 反着来，趁内容还新鲜就删掉那些已经没用的工具结果，原地只留一条短回执。删掉的字节全部记进账本，凭召回 id 随时逐字节还原。
 
-项目还在早期。三个包都没上 npm，dsh 也不公开分发。core 和 dsh 适配器在真实 dsh 会话里跑过，离线示例能端到端跑通。OpenCode 适配器目前只有针对假宿主的功能测试，真实运行的证据已经撤回，接入前先读 [OpenCode README](packages/adapters/opencode/README.md)。这个库对回答质量的影响还没有得到证实。
+项目还在早期。三个包都已发布到 npm：安装 `cremator-dsh` 或 `cremator-opencode`，`@cremator/core` 会作为依赖自动装好。dsh 不公开分发。core 和 dsh 适配器在真实 dsh 会话里跑过，离线示例能端到端跑通。OpenCode 适配器目前只有针对假宿主的功能测试，真实运行的证据已经撤回，接入前先读 [OpenCode README](packages/adapters/opencode/README.md)。这个库对回答质量的影响还没有得到证实。
 
 [English](README.md) · [中文](README.zh-CN.md)
 
@@ -48,11 +48,12 @@ CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减�
 Node `>=22.13.0 <23.0.0 || >=23.4.0`（这些版本里 `node:sqlite` 不用加 flag）。
 
 ```sh
-git clone https://github.com/zman406986/Agent-Memory-CREMATOR
-cd Agent-Memory-CREMATOR
-npm install
-npm run build
+npm install cremator-dsh
+# 或
+npm install cremator-opencode
 ```
+
+`@cremator/core` 会自动装好。想改源码，就克隆仓库后运行 `npm install` 和 `npm run build`。
 
 第一次上手，最省事的是 [`examples/core-offline/`](examples/core-offline/README.md)，不用 dsh 就能跑：
 
@@ -62,7 +63,7 @@ node --experimental-strip-types examples/core-offline/offline.ts
 
 预期输出里有一行 `recalled 34 bytes byte-exact: true`。
 
-dsh 是本项目开发时用的编码智能体 harness，不公开分发。OpenCode 用现成适配器 `cremator-opencode`（先完成上面的本地构建），配置全见 [packages/adapters/opencode/README.md](packages/adapters/opencode/README.md)。其他 harness 要自己写适配器，四条接缝见前文。
+dsh 是本项目开发时用的编码智能体 harness，不公开分发。OpenCode 用适配器 `cremator-opencode`（`npm install cremator-opencode`），配置全见 [packages/adapters/opencode/README.md](packages/adapters/opencode/README.md)。其他 harness 要自己写适配器，四条接缝见前文。
 
 有 dsh 的话，用 dsh 适配器：把下面这段存成文件，传给 `dsh --patch`。`name` 是 file:/// URL，指向构建出来的入口：
 
@@ -93,7 +94,7 @@ dsh plugin --profile <name> add link:<本仓库 packages/adapters/dsh 的路径>
 
 ## 包
 
-三个包都**没有发布到 npm**。本地构建，按各包 README 接入构建产物。
+三个包都发布在 npm 上。用 `npm install <包名>` 安装；想改代码就从仓库构建。
 
 | 包 | 内容 |
 | --- | --- |

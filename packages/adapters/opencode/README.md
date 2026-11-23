@@ -25,44 +25,42 @@ run uses a 200M-token soft cap; a run that exceeds it needs a recorded reason.
 
 ## Install
 
-The packages are not published to npm (owner decision, ISSUE-069). Build from this repo:
-
 ```sh
-npm install
-npm run build
+npm install cremator-opencode
 ```
 
-Then point the plugin entry at the built package directory. Requires Node
-`>=22.13.0 <23.0.0 || >=23.4.0`; the runtime imports are `@cremator/core` and node builtins, and
-the OpenCode API is duck-typed, never imported.
+`@cremator/core` installs as a dependency. Requires Node
+`>=22.13.0 <23.0.0 || >=23.4.0`; the OpenCode API is duck-typed by the server
+part, never imported.
 
 ## Mount
 
-Add the package directory to the `plugins` list in `opencode.json`:
+Add the package to the `plugins` list in `opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    { "package": "file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/opencode",
+    { "package": "cremator-opencode",
       "options": { "crematorStorageRoot": "C:/Users/TZhen/.cremator/opencode" } }
   ]
 }
 ```
 
-Other device: `file:///C:/Users/TZ/Desktop/racoons/packages/adapters/opencode`. A bare
-`"cremator-opencode"` entry works only when the package is installed into the host; it is not
-published. The host loads the directory's `./server` export, whose default is
-`{ id: "cremator-opencode", setup(context) }` (`dist/server.js`). `setup` registers one `context`
-hook, one observation-only `execute.after` hook, the `necromancy` tool and one event consumer; it
-returns the cleanup that stops the consumer and closes the ledgers.
+The host loads the package's `./server` export, whose default is
+`{ id: "cremator-opencode", setup(context) }` (`dist/server.js`). The `./tui`
+and `./gui-experimental` exports add the `/cremate` menu entry. `setup`
+registers the context hook, the observation-only `execute.after` hook, the
+`necromancy` tool, the event consumer and the server-wide RPC the menu uses.
+For a local checkout, build it and use the package directory as a `file:///`
+`package` value instead.
 
 The options object carries the durable root and the test-only tool exclusion:
 
 ```json
 {
   "plugins": [
-    { "package": "file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/opencode",
+    { "package": "cremator-opencode",
       "options": { "crematorStorageRoot": "C:/Users/TZhen/.cremator/opencode" } }
   ]
 }

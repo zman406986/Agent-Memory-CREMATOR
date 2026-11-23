@@ -7,54 +7,29 @@ https://github.com/zman406986/Agent-Memory-CREMATOR.
 
 ## Install
 
-The packages are not published to npm (owner decision, ISSUE-069). Build from this repo, then point
-the mount row at the built file:
-
 ```sh
-npm install
-npm run build
+npm install cremator-dsh
 ```
 
-`dist/plugin.js` is the entry. A bare `cremator-dsh/plugin` specifier works only after the package is
-installed into the dsh profile; a `file:///` name needs no install. Requires Node
-`>=22.13.0 <23.0.0 || >=23.4.0`; `@cremator/core` resolves from the repo's workspace.
+`@cremator/core` installs as a dependency. Requires Node
+`>=22.13.0 <23.0.0 || >=23.4.0`.
 
 ### Install as a dsh bundle
 
-The package declares `dsh.bundle.patch` (`cordis.patch.yml`). Install the checkout into a profile
-and select the bundle:
+The package declares `dsh.bundle.patch` (`cordis.patch.yml`). Add it to a profile:
 
 ```sh
-dsh plugin --profile <name> add link:<absolute package directory>
+dsh plugin --profile <name> add cremator-dsh
 ```
 
-The host's Plugins page then lists `cremator-dsh`, and the profile records the bundle in
-`dsh.profile.bundles`. The bundle patch inserts the mount with the example config; a profile patch
-after it can override any key. Do not also insert the row by hand: two rows with one id make the
-settings form unaddressable. The `file:///` row below remains the no-install route.
+The host's Plugins page then lists `cremator-dsh`, and the profile records the
+bundle in `dsh.profile.bundles`. The bundle patch inserts the mount with the
+example config; a profile patch after it can override any key. Do not also
+insert the row by hand: two rows with one id make the settings form
+unaddressable.
 
-### Installing from tarballs
-
-`npm pack` in `packages/core` and in this package produces `cremator-core-0.1.0.tgz`
-and `cremator-dsh-0.1.0.tgz`. This package declares
-`"@cremator/core": "^0.1.0"`, and nothing is on the registry, so installing
-only the adapter tarball tries to fetch core from npm and fails. Install the core
-tarball first, or point npm at it with an `overrides` entry in the consuming
-project's `package.json`:
-
-```json
-{
-  "overrides": {
-    "@cremator/core": "file:./cremator-core-0.1.0.tgz"
-  }
-}
-```
-
-Then `npm install ./cremator-dsh-0.1.0.tgz` adds both packages. Keep the
-tarballs in the consuming project's directory or adjust the `file:` path.
-Verified 2026-11-23 with npm 11.17.0: the adapter alone exits 1 on the unresolved
-core dependency; the override installs two packages; installing the core tarball
-first also works.
+For a local checkout, run `npm install && npm run build`, then use
+`dsh plugin --profile <name> add link:<absolute package directory>`.
 
 ## Use
 
