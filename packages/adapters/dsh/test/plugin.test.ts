@@ -253,12 +253,13 @@ test('the plugin declares its name and seams, and resolvePluginConfig fills and 
   const plugin = createRacoonsPlugin();
   const at: Label = what => `row: the factory: ${what}`;
   assert.equal(plugin.name, 'cremator', at('the plugin names itself cremator'));
-  assert.deepEqual(plugin.inject, ['llm', 'sessions'], at('the two seams are injected'));
+  assert.deepEqual(plugin.inject, ['llm', 'sessions', 'commands'],
+    at('the three seams are injected'));
   assert.equal(typeof plugin.apply, 'function', at('apply is a function'));
   const atConst: Label = what => `row: the module constant: ${what}`;
   assert.equal(CREMATOR_PLUGIN_NAME, 'cremator',
     atConst('the exported name matches the factory'));
-  assert.deepEqual(CREMATOR_PLUGIN_INJECT, ['llm', 'sessions'],
+  assert.deepEqual(CREMATOR_PLUGIN_INJECT, ['llm', 'sessions', 'commands'],
     atConst('the exported inject list matches the factory'));
   const config = resolvePluginConfig(undefined);
   assert.equal(config.barBytes, 512); // owner ruling 2026-11-08, ADR-0051

@@ -60,6 +60,8 @@ import { captureMainRequest, createMainWireCapture, seedRouteStale } from './mai
 import type { MainWireCapture } from './main-wire.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
+import { createCremateCommand } from './cremate-command.js';
+import type { DshCommandRegistry } from './cremate-command.js';
 import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
   readPruneRound, readPruneTriggerState,
   writeEntryAskFired, writePendingAppends,
@@ -109,9 +111,10 @@ const ASK_CARD_NAME = 'Cremating memory trash';
  * declares (`dsh-compaction-basic`: `static inject = ["llm", "tokenMeter",
  * "sessions"]`). Both surviving ask moments read it (ADR-0028): the entry
  * checkpoint and the bulk prune. Declaring it here makes that dependency a host
- * fact rather than a later guess.
+ * fact rather than a later guess. `commands` is the host's slash-command
+ * registry, used to register `/cremate` (ADR-0068).
  */
-export const CREMATOR_PLUGIN_INJECT: readonly string[] = Object.freeze(['llm', 'sessions']);
+export const CREMATOR_PLUGIN_INJECT: readonly string[] = Object.freeze(['llm', 'sessions', 'commands']);
 
 /**
  * Refused work after `close()` started (ISSUE-416). Once the mount is unloading,
@@ -488,6 +491,13 @@ export interface DshMountContext {
    * carries no dsh dependency.
    */
   llm?: DshLlmService;
+  /**
+   * The host's slash-command registry, declared through
+   * `CREMATOR_PLUGIN_INJECT`'s `commands` (ADR-0068). Absent on a stub host:
+   * the plugin mounts without registering `/cremate`, and the typed message
+   * still works.
+   */
+  commands?: DshCommandRegistry;
   tools?: DshToolHost;
   get?(name: string): unknown;
 }
@@ -833,6 +843,13 @@ export interface RacoonsMount {
   syncTranscript(entry: RacoonsSessionEntry, session: DshMountSession,
     options?: TranscriptSyncOptions): ReturnType<typeof surfaceTranscript>;
   observe(session: DshMountSession, event: DshMountEvent): DshToolResultItem | null;
+  /**
+   * Record one manual prune request for a session; the next `agent/pre-step`
+   * runs it. The typed `/cremate` message and the registered host command
+   * (ADR-0068) both land here, so a command that opens its own `/cremate` turn
+   * journals one request, not two.
+   */
+  requestPrune(sessionId: string, seq?: number): void;
   /**
    * Record one request the host's `llm/stream` waterfall dispatched as main's
    * last sent request for its session (ISSUE-026 chunk 3). A request this
@@ -1730,6 +1747,16 @@ export function createRacoonsMount(options: {
    * at the next `agent/pre-step`, which is already the at-rest boundary.
    */
   const pruneRequests = new Set<string>();
+  /**
+   * Record one manual prune request. The typed message and the registered
+   * `/cremate` command both call this; a second call for a session already
+   * waiting is a no-op, so the command's followup turn cannot journal twice.
+   */
+  function requestPrune(sessionId: string, seq: number | undefined): void {
+    if (pruneRequests.has(sessionId)) return;
+    pruneRequests.add(sessionId);
+    journal('prune-requested', { sessionId, seq });
+  }
   /**
    * Main's last dispatched request per session (ISSUE-026 chunk 3, ADR-0010).
    * Filled by the `llm/stream` observer at the only point this package can see
@@ -2643,16 +2670,16 @@ export function createRacoonsMount(options: {
       calls.set(session.id, list);
       return null;
     }
-    // The `/cremate` command (ISSUE-022 chunk 5). The mount owns this trigger, not
-    // the engine's tool union: the pass is mount state read by mount code, and
-    // a registered host tool would have to fake an engine event to reach it. A
-    // message is observed here (no append) and the pass runs at the next
-    // pre-step, which is already the at-rest boundary a prune may use.
+    // The `/cremate` command (ISSUE-022 chunk 5; ADR-0068 adds the registered
+    // command). The mount owns this trigger, not the engine's tool union: the
+    // pass is mount state read by mount code, and a registered host tool would
+    // have to fake an engine event to reach it. A message is observed here (no
+    // append) and the pass runs at the next pre-step, which is already the
+    // at-rest boundary a prune may use.
     if (event.type === 'user/message') {
       const message = isRecord(data['message']) ? data['message'] : data;
       if (textOf(message['content']).trim() === PRUNE_COMMAND) {
-        pruneRequests.add(session.id);
-        journal('prune-requested', { sessionId: session.id, seq: event.seq });
+        requestPrune(session.id, event.seq);
       }
       return null;
     }
@@ -4675,7 +4702,8 @@ export function createRacoonsMount(options: {
     return work;
   }
 
-  return { sessions, counters, observedSessionIds, sessionFor, syncTranscript, observe, observeWire,
+  return { sessions, counters, observedSessionIds, sessionFor, syncTranscript, observe, requestPrune,
+    observeWire,
     // Each public boundary registers its work so a concurrent `endSession`
     // waits it out before releasing (ISSUE-397). Internal calls (the tail
     // prune inside a step) ride the outer boundary's registration.
@@ -5272,6 +5300,31 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           mount.emitJournal('tool-registration-error', { registered: 0,
             offered, allOrNothing: true, message });
           warn(`tool registration: ${message}`);
+        }
+      }
+
+      // The host command menu's `/cremate` (ADR-0068). The handler records the
+      // same request the typed message records, then opens a `/cremate` user
+      // turn so the next pre-step runs the pass. A host without a command
+      // registry mounts unchanged; the typed-message path still works.
+      const commands = ctx.commands;
+      if (commands !== undefined && typeof commands.register === 'function') {
+        const command = createCremateCommand({
+          request: (sessionId, seq) => { mount.requestPrune(sessionId, seq); },
+        });
+        try {
+          if (ctx.effect !== undefined) {
+            ctx.effect(() => {
+              const unregister = commands.register(command);
+              return () => { unregister(); };
+            }, 'racoons.cremate-command');
+          } else {
+            commands.register(command);
+          }
+        } catch (error) {
+          // A refused registration is a missing menu entry, never a failed
+          // mount; the typed message still reaches the same pass.
+          warn(`command registration: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 

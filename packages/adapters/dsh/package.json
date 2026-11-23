@@ -40,8 +40,14 @@
       "default": "./dist/plugin.js"
     }
   },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "files": [
     "dist",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],

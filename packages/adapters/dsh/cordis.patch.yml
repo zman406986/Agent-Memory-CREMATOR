@@ -1,0 +1,21 @@
+# Bundle patch for cremator-dsh. Selected through `dsh.bundle.patch`.
+#
+# It contributes one row: the plugin itself. Install the package into a dsh
+# profile (`dsh plugin --profile <name> add link:<path>`), then select the
+# bundle; do not also insert the row by hand. Two rows with one id make the
+# settings form unaddressable.
+#
+# The config is the documented example, not a fixed policy: a profile patch
+# after the bundle layer can override any key. `contextWindowTokens` and
+# `pruneThresholdTokens` arm the depth-triggered table; omit both and only the
+# manual `/cremate` command runs a pass.
+- insert:
+    - id: cremator
+      name: 'cremator-dsh/plugin'
+      config:
+        barBytes: 512
+        enforcement: apply
+        contextWindowTokens: 400000
+        pruneThresholdTokens: 60000
+        entryAskTrigger: { mode: 'off' }
+        nativeCompactionBackstop: true

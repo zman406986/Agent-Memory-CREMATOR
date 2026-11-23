@@ -151,6 +151,15 @@ behavior) are in [packages/adapters/dsh/README.md](packages/adapters/dsh/README.
 storage root is `<DSH_HOME>/storages/cremator` (`DSH_HOME` defaults to `~/.dsh`). For OpenCode, see
 [packages/adapters/opencode/README.md](packages/adapters/opencode/README.md).
 
+The dsh adapter also installs as a dsh bundle. Point the profile at the local package directory:
+
+```sh
+dsh plugin --profile <name> add link:<path to packages/adapters/dsh>
+```
+
+The host's Plugins page then lists CREMATOR, and the slash menu shows `/cremate`. A typed `/cremate`
+message still triggers the same pass.
+
 ## Packages
 
 | Package | What it carries |

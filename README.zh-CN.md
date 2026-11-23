@@ -83,6 +83,14 @@ dsh 是本项目开发时用的编码智能体 harness，不公开分发。OpenC
 
 [`examples/dsh-mount/`](examples/dsh-mount/README.md) 有完整写法，启动命令（从仓库根执行）：`dsh --profile headless --patch examples/dsh-mount/patch.yml "your task"`。[`examples/core-offline/`](examples/core-offline/README.md) 只跑 core，不带适配器。
 
+dsh 适配器也可以作为 dsh 插件包安装。把 profile 指向本地的包目录：
+
+```sh
+dsh plugin --profile <name> add link:<本仓库 packages/adapters/dsh 的路径>
+```
+
+安装后，dsh 的插件页会列出 CREMATOR，斜杠菜单里会多出 `/cremate`；直接输入 `/cremate` 也仍然能触发同一轮清理。
+
 ## 包
 
 三个包都**没有发布到 npm**。本地构建，按各包 README 接入构建产物。

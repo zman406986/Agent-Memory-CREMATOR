@@ -19,6 +19,20 @@ npm run build
 installed into the dsh profile; a `file:///` name needs no install. Requires Node
 `>=22.13.0 <23.0.0 || >=23.4.0`; `@cremator/core` resolves from the repo's workspace.
 
+### Install as a dsh bundle
+
+The package declares `dsh.bundle.patch` (`cordis.patch.yml`). Install the checkout into a profile
+and select the bundle:
+
+```sh
+dsh plugin --profile <name> add link:<absolute package directory>
+```
+
+The host's Plugins page then lists `cremator-dsh`, and the profile records the bundle in
+`dsh.profile.bundles`. The bundle patch inserts the mount with the example config; a profile patch
+after it can override any key. Do not also insert the row by hand: two rows with one id make the
+settings form unaddressable. The `file:///` row below remains the no-install route.
+
 ### Installing from tarballs
 
 `npm pack` in `packages/core` and in this package produces `cremator-core-0.1.0.tgz`
@@ -72,6 +86,13 @@ mount's flat knobs:
 `contextWindowTokens`, `pruneThresholdTokens`, `nativeCompactionBackstop`, `entryAskTrigger`,
 `entryAskGrammar`, `pruneAskGrammar`, `entryAskBatchSize`, `dedupeSupersededByReread`,
 `dedupeCallEcho`.
+
+### The `/cremate` command
+
+When the host exposes its command registry (`commands`), the mount registers `cremate`; the slash
+menu lists `/cremate`. The command records a manual prune request and opens a `/cremate` user turn,
+so the next `agent/pre-step` runs the pass. A typed `/cremate` message still triggers the same pass
+on a host without the command seam.
 
 Defaults that matter: `barBytes` 512, `enforcement` `apply` (`record-only` is the explicit opt-out),
 `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall`, and
