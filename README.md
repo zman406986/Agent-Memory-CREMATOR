@@ -1,11 +1,17 @@
-# Agent Memory CREMATOR · 记忆焚化工
+# CREMATOR · 记忆焚化工
 
-Early stage. Packages are not on npm, dsh is not publicly distributed, and the
-`examples/core-offline/` example runs without dsh.
+Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
+
+Early stage. Packages are not on npm and dsh is not publicly distributed; the
+`examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
+been run against real dsh. The OpenCode adapter passes functional tests against a fake host only;
+its live-run evidence is withdrawn (see [its README](packages/adapters/opencode/README.md)). This
+library does not establish any effect on answer quality.
 
 CREMATOR is a TypeScript library for coding agents. It removes tool output that is provably dead, or
-that the agent marks as forgotten, soon after it lands. It never summarizes; it removes and writes a
-short negative-fact record for a failed search.
+that the agent marks as forgotten, soon after it lands. It works by subtraction: it removes what is
+dead or marked forgotten and leaves a short record — a negative fact for a failed search — rather
+than rewriting history into summaries.
 
 [English](README.md) · [中文](README.zh-CN.md)
 
@@ -18,7 +24,7 @@ shrink it: they ask the agent to summarize
 its own context, or truncate the oldest messages without asking. Compaction is lossy and fires
 mid-task, and the bytes it removes leave no recall id, so the agent must fetch the fact again.
 
-CREMATOR removes instead of summarizing. Deterministic proofs establish that some content is dead;
+CREMATOR favors removal over summarization. Deterministic proofs establish that some content is dead;
 for the rest, the agent decides.
 
 Terms used below: the **mount** is the adapter instantiated by the harness; a **fork** is a copy of
@@ -154,17 +160,6 @@ storage root is `<DSH_HOME>/storages/cremator` (`DSH_HOME` defaults to `~/.dsh`)
 | [`cremator-opencode`](packages/adapters/opencode/README.md) | OpenCode adapter: a thin seam mapping over OpenCode 2.2.5's context hooks; functional tests only, live evidence withdrawn. |
 
 The packages are not published to npm.
-
-## Status
-
-Early. The core and the dsh adapter have been run against dsh; the offline example runs end to end.
-The OpenCode adapter passes its functional tests against a fake host; its live-run evidence is
-withdrawn (see [its README](packages/adapters/opencode/README.md)). This library does not establish
-any effect on answer quality.
-
-## Name
-
-CREMATOR stands for Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
 ## License
 
