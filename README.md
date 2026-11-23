@@ -40,7 +40,7 @@ per-result ask, off in the sample config.
   superseded re-read and removes the result outright, without asking. A closed failed-search
   episode is sealed: one negative-fact record is appended, nothing is removed; a later prune removes
   the sealed miss bodies whole and also removes byte-identical duplicates and exact re-reads. What
-  no proof removes goes to the agent in tables of at most 12 rows, and only the agent's
+  no proof removes goes to the agent in a table, one row per result, and only the agent's
   keep-or-forget answer decides there.
 - **Automatic duplicate removal never leaves a byte-identical class with no live copy.** Of a pair,
   only the kept copy reaches the table; the duplicate is removed automatically. If the agent forgets
@@ -57,13 +57,12 @@ per-result ask, off in the sample config.
   seeded from the latest request the main conversation dispatched. The main transcript and its
   cache are untouched by table asks; the entry ask appends its exchange to main and rewinds it after
   a keep-all or a forget. One request, one table: one row per result still undecided (a settled
-  entry keep is not re-listed), with its path and a few line anchors; under the shipped nokeepall
-  grammar, its line count too. The mount keeps sending tables until every row is settled or the
-  loop cannot continue: no text, a refused fork append, or a refused send. A stop still lets the
-  pass apply its deterministic removals, and the unanswered rows are deferred. A refused row is
-  re-asked once in the next table; rows still refused then get one correction turn. An
-  action-outside-the-grammar row is never re-asked. The table never repeats result bodies, and the
-  row cap keeps the table's own size bounded.
+  entry keep is not re-listed), with its path, total line count and a few line anchors. The mount
+  keeps sending tables until every row is settled or the loop cannot continue: no text, a refused
+  fork append, or a refused send. A stop still lets the pass apply its deterministic removals, and
+  the unanswered rows are deferred. A refused row is re-asked once in the next table; rows still
+  refused then get one correction turn. A row whose answer is outside the allowed forms is never
+  re-asked. The table never repeats result bodies.
 - **Application is rewind plus append, never an edit.** A forget rewinds the transcript to the
   forgotten units, keeps every node it does not name, and appends one receipt per forgotten result,
   each receipt described below. A prune keeplines partial keep re-emits the kept byte ranges before
@@ -132,7 +131,6 @@ entry:
         contextWindowTokens: 400000
         pruneThresholdTokens: 60000
         entryAskTrigger: { mode: 'off' }
-        pruneAskGrammar: nokeepall
         nativeCompactionBackstop: true
 ```
 
