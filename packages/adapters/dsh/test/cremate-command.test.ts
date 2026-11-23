@@ -20,9 +20,18 @@ import type { DshCommand } from '../src/cremate-command.js';
 import {
   createRacoonsMount, createRacoonsPlugin, resolvePluginConfig, resolveStorage,
 } from '../src/plugin.js';
-import type { DshMountContext } from '../src/plugin.js';
+import type { DshMountContext, DshMountSession } from '../src/plugin.js';
 
-test('the /cremate command names itself and opens one /cremate turn', () => {
+/** The session slice a command handler receives; only `id` and `append` are used. */
+function fakeSession(id: string, seq?: number): DshMountSession {
+  return {
+    id,
+    ...(seq === undefined ? {} : { seq }),
+    append: () => ({ type: 'test', seq: 0 }),
+  } as unknown as DshMountSession;
+}
+
+test('the /cremate command names itself and opens one /cremate turn', async () => {
   const requests: { sessionId: string; seq: number | undefined }[] = [];
   const followups: unknown[] = [];
   const command = createCremateCommand({
@@ -33,9 +42,9 @@ test('the /cremate command names itself and opens one /cremate turn', () => {
   assert.equal(command.description, CREMATE_COMMAND_DESCRIPTION);
   assert.equal(typeof command.handler, 'function');
 
-  const result = command.handler({
+  const result = await command.handler({
     agent: {
-      session: { id: 'session-command-1', seq: 11 },
+      session: fakeSession('session-command-1', 11),
       followup: (message) => { followups.push(message); },
     },
   });
@@ -51,27 +60,52 @@ test('the /cremate command names itself and opens one /cremate turn', () => {
     'the turn carries the same text the typed trigger uses');
 });
 
-test('the /cremate command refuses an invocation with no live session', () => {
+test('the /cremate command refuses an invocation with no live session', async () => {
   let called = false;
   const command = createCremateCommand({ request: () => { called = true; } });
-  const result = command.handler({});
+  const result = await command.handler({});
   assert.deepEqual(result, { kind: 'error', text: CREMATE_NO_SESSION });
   assert.equal(called, false, 'no request is recorded without a session');
 });
 
-test('a throwing followup never loses the recorded request', () => {
+test('a throwing followup never loses the recorded request', async () => {
   const requests: string[] = [];
   const command = createCremateCommand({
     request: (sessionId) => { requests.push(sessionId); },
   });
-  const result = command.handler({
+  const result = await command.handler({
     agent: {
-      session: { id: 'session-command-2' },
+      session: fakeSession('session-command-2'),
       followup: () => { throw new Error('host followup failed'); },
     },
   });
   assert.equal(result.kind, 'success');
   assert.deepEqual(requests, ['session-command-2']);
+});
+
+test('a command with a run callback executes the pass directly', async () => {
+  let ran: DshMountSession | undefined;
+  const command = createCremateCommand({
+    request: () => { throw new Error('the queue path must not run'); },
+    run: async (session) => {
+      ran = session;
+      return { kind: 'success', text: 'Cremation finished; 2 results removed.' };
+    },
+  });
+  const session = fakeSession('session-command-5', 5);
+  const result = await command.handler({ agent: { session } });
+  assert.deepEqual(result, { kind: 'success', text: 'Cremation finished; 2 results removed.' });
+  assert.equal(ran?.id, 'session-command-5');
+});
+
+test('a throwing direct run returns an error card', async () => {
+  const command = createCremateCommand({
+    request: () => {},
+    run: async () => { throw new Error('prune failed'); },
+  });
+  const result = await command.handler({ agent: { session: fakeSession('session-command-6') } });
+  assert.equal(result.kind, 'error');
+  assert.match(result.text, /prune failed/u);
 });
 
 test('the mount records one prune request per session, however it arrives', async () => {

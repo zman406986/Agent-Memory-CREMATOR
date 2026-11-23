@@ -5303,14 +5303,27 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         }
       }
 
-      // The host command menu's `/cremate` (ADR-0068). The handler records the
-      // same request the typed message records, then opens a `/cremate` user
-      // turn so the next pre-step runs the pass. A host without a command
-      // registry mounts unchanged; the typed-message path still works.
+      // The host command menu's `/cremate` (ADR-0068). The registered handler
+      // runs the pass directly and awaits it; the typed message keeps the
+      // queued pre-step path. A host without a command registry mounts
+      // unchanged.
       const commands = ctx.commands;
       if (commands !== undefined && typeof commands.register === 'function') {
         const command = createCremateCommand({
           request: (sessionId, seq) => { mount.requestPrune(sessionId, seq); },
+          run: async (session) => {
+            const outcome = await mount.runPrune(session);
+            if (outcome === null) {
+              return { kind: 'success', text: 'Cremation finished; nothing needed removal.' };
+            }
+            const removed = outcome.application?.removals.length ?? 0;
+            return {
+              kind: 'success',
+              text: removed === 0
+                ? 'Cremation finished; nothing removed.'
+                : `Cremation finished; ${String(removed)} result${removed === 1 ? '' : 's'} removed.`,
+            };
+          },
         });
         try {
           if (ctx.effect !== undefined) {

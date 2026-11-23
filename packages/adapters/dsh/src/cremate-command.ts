@@ -1,15 +1,17 @@
 /**
  * The `/cremate` host command (ADR-0068, ISSUE-526).
  *
- * The command is a menu shortcut for the trigger the mount already owns: mark
- * the invoking session for one prune pass and open a user turn carrying the
- * same `/cremate` text. The mount's `session/event` listener sees that message,
- * the marker is already present, and the next `agent/pre-step` runs the pass.
+ * The host command handler is async and may appends at the command boundary, so
+ * the registered command runs the pass directly: it awaits the mount's
+ * `runPrune` and returns the outcome in the command card. The typed `/cremate`
+ * user message keeps the older path — mark the session and let the next
+ * `agent/pre-step`, already an at-rest boundary, run the pass.
  *
- * Structural only: this module imports no dsh package. The host types below are
- * the slice dsh's command registry and invocation expose.
+ * Structural only: this module imports no dsh package. The one host type it
+ * names is the adapter's own session slice, imported type-only.
  */
 import { PRUNE_COMMAND } from './prune-record.js';
+import type { DshMountSession } from './plugin.js';
 
 /** The host command name, without the leading slash. */
 export const CREMATE_COMMAND_NAME = 'cremate';
@@ -17,7 +19,7 @@ export const CREMATE_COMMAND_NAME = 'cremate';
 /** One line the host command menu shows. */
 export const CREMATE_COMMAND_DESCRIPTION = 'Remove memory trash now.';
 
-/** The command card's result line. */
+/** The queued command card's result line (the typed-message fallback). */
 export const CREMATE_COMMAND_CARD_TEXT = 'Cremation requested; it runs at the next step.';
 
 /** The refusal when the host invocation names no live session. */
@@ -34,14 +36,14 @@ export interface DshCommand {
   readonly name: string;
   readonly description: string;
   readonly input?: { readonly hint?: string };
-  handler(invocation: DshCommandInvocation): DshCommandResult;
+  handler(invocation: DshCommandInvocation): DshCommandResult | Promise<DshCommandResult>;
 }
 
 /** What the host hands a command handler. */
 export interface DshCommandInvocation {
   readonly rawInput?: string;
   readonly agent?: {
-    readonly session?: { readonly id: string; readonly seq?: number };
+    readonly session?: DshMountSession;
     followup?(message: unknown): unknown;
   };
 }
@@ -55,24 +57,41 @@ export interface DshCommandResult {
 export interface CremateCommandOptions {
   /** Record one manual prune request for this session; the next pre-step runs it. */
   request(sessionId: string, seq: number | undefined): void;
+  /**
+   * Run the pass directly from the command handler. Present on the shipped
+   * mount; absent in a stub host, where the handler falls back to the queued
+   * typed-message path.
+   */
+  run?(session: DshMountSession): Promise<DshCommandResult>;
 }
 
-/** A unique-enough message id for the turn this command opens. */
+/** A unique-enough message id for the turn the queued path opens. */
 let turnOrdinal = 0;
 
 /**
- * Build the `/cremate` command. The handler records the request BEFORE opening
- * the turn, so a host whose followup fails still has the marker for the next
- * boundary; the message listener's own request is idempotent.
+ * Build the `/cremate` command. With `run`, the handler awaits the pass and the
+ * command card carries its outcome. Without `run`, it records the request and
+ * opens a `/cremate` turn, so the next pre-step runs it; the message listener's
+ * own request is idempotent.
  */
 export function createCremateCommand(options: CremateCommandOptions): DshCommand {
   return {
     name: CREMATE_COMMAND_NAME,
     description: CREMATE_COMMAND_DESCRIPTION,
-    handler(invocation) {
+    async handler(invocation) {
       const session = invocation.agent?.session;
       if (session === undefined) {
         return { kind: 'error', text: CREMATE_NO_SESSION };
+      }
+      if (options.run !== undefined) {
+        try {
+          return await options.run(session);
+        } catch (error) {
+          return {
+            kind: 'error',
+            text: `Cremation failed: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
       }
       const sessionId = String(session.id);
       options.request(sessionId, session.seq);

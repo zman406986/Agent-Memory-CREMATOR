@@ -90,9 +90,9 @@ mount's flat knobs:
 ### The `/cremate` command
 
 When the host exposes its command registry (`commands`), the mount registers `cremate`; the slash
-menu lists `/cremate`. The command records a manual prune request and opens a `/cremate` user turn,
-so the next `agent/pre-step` runs the pass. A typed `/cremate` message still triggers the same pass
-on a host without the command seam.
+menu lists `/cremate`. The registered command runs the pass directly and awaits it; the command card
+reports the result. A typed `/cremate` message keeps the queued path: it marks the request and opens a
+`/cremate` turn, so the next `agent/pre-step` runs the pass.
 
 Defaults that matter: `barBytes` 512, `enforcement` `apply` (`record-only` is the explicit opt-out),
 `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall`, and
