@@ -62,8 +62,8 @@ import { captureMainRequest, createMainWireCapture, seedRouteStale } from './mai
 import type { CapturedMainRequest, MainWireCapture } from './main-wire.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
-import { createCremateCommand, cremateMarkerOf } from './cremate-command.js';
-import type { CrematePassResult, CremateWait, DshCommandRegistry }
+import { CREMATE_COMMAND_NAME, createCremateCommand, cremateMarkerOf } from './cremate-command.js';
+import type { CrematePassResult, CremateWait, DshCommand, DshCommandRegistry }
   from './cremate-command.js';
 import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
   readPruneHeaderFacts, readPruneRound, readPruneTriggerState, readTableAskFired,
@@ -5923,6 +5923,34 @@ interface ActivePluginMount {
   readonly config: ResolvedRacoonsConfig;
   /** Live applies on this mount; it closes when the last one releases. */
   shares: number;
+  /**
+   * The `/cremate` registration this mount owns (ISSUE-603). One per mount,
+   * never one per apply: the command's lifetime is the mount's long-lived
+   * scope, and a joined apply or a rebuilt surface refreshes that same entry
+   * instead of seeding a second one.
+   */
+  command?: CommandSurfaceState;
+}
+
+/**
+ * One mount's live `/cremate` registration (ISSUE-603). The host lists
+ * commands per agent through `list(agent)` and refreshes that view when it
+ * emits `commands/change`; the entry is made when the mount is created and
+ * disposed only when the last holder closes the mount.
+ */
+interface CommandSurfaceState {
+  readonly command: DshCommand;
+  /** The live registration's disposer; replaced, never kept past death. */
+  unregister?: (() => void) | undefined;
+}
+
+/** Drop a surface's registration; a dead scope's disposer must not throw. */
+function disposeCommandSurface(surface: CommandSurfaceState | undefined): void {
+  if (surface === undefined) return;
+  const dispose = surface.unregister;
+  surface.unregister = undefined;
+  if (dispose === undefined) return;
+  try { dispose(); } catch { /* the entry died with its scope */ }
 }
 
 /**
@@ -6049,6 +6077,12 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       const liveMountRecords = storage.root === undefined
         ? 0 : readMountRecords(storage.root).length;
       /**
+       * The `/cremate` surface this apply holds (ISSUE-603), assigned below
+       * when the host has a command registry. It lives on the mount record, so
+       * the last holder's release is what disposes it.
+       */
+      let ownedSurface: CommandSurfaceState | undefined;
+      /**
        * ISSUE-577: a second apply of one root holds the same mount, so its
        * unload must not close the ledgers the other holder is still using —
        * only the last release closes anything. Registered before the wiring, so
@@ -6066,6 +6100,9 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
               activePluginMounts.delete(registryKey);
             }
           }
+          // The command's lifetime is the mount's; it goes before the mount it
+          // calls into, and only when this holder is the one closing.
+          disposeCommandSurface(ownedSurface);
           await mount.close();
         } finally {
           if (mountRecord !== null) releaseMountRecord(mountRecord);
@@ -6194,34 +6231,143 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       // pass settled. A host without a command registry mounts unchanged; the
       // typed-message path still works.
       const commands = ctx.commands;
+      /**
+       * ISSUE-603: the host keys a command to the plugin's long-lived context
+       * and lists commands per agent (`commands.list(agent)`), so a permission
+       * change that rebuilds an agent's command surface can drop the entry.
+       * The registration therefore belongs to the MOUNT, not to one apply or
+       * one session: it is made once when the mount is created, re-checked only
+       * when the host announces `commands/change` (the same refresh native
+       * commands rely on), and disposed when the last holder closes the mount.
+       * A registry with no `list` is an older host, where the first
+       * registration stands because the surface cannot be read back.
+       */
+      let ensureCremateCommand: ((agent?: unknown) => void) | undefined;
+      /**
+       * Re-register without the presence check (ISSUE-603). The client keeps a
+       * per-session catalog snapshot and only re-pulls it on `commands/change`,
+       * which the host emits on a layer mutation. A permission change emits
+       * none of its triggers, so a stale snapshot must be forced to re-pull.
+       */
+      let forceCremateCommand: (() => void) | undefined;
+      /**
+       * Set only when the host has no usable `commands/change` subscription:
+       * the pre-step is then the one remaining place to notice a dropped entry.
+       */
+      let refreshOnPreStep = false;
+      /**
+       * The agents this apply has seen (ISSUE-603). The host's
+       * `commands/change` is emitted with no payload, so these are the agents
+       * a refresh can re-list; a step names them as turns run.
+       */
+      const seenAgents = new Set<unknown>();
       if (commands !== undefined && typeof commands.register === 'function') {
-        const command = createCremateCommand({
-          begin: (sessionId, messageId, commandId) =>
-            mount.beginCremate(sessionId, messageId, commandId),
-          cancel: (sessionId, messageId, message) =>
-            mount.cancelCremate(sessionId, messageId, message),
-        });
-        try {
-          if (ctx.effect !== undefined) {
-            ctx.effect(() => {
-              const unregister = commands.register(command);
-              return () => { unregister(); };
-            }, 'racoons.cremate-command');
-          } else {
-            commands.register(command);
+        const surface: CommandSurfaceState = joined?.command ?? {
+          command: createCremateCommand({
+            begin: (sessionId, messageId, commandId) =>
+              mount.beginCremate(sessionId, messageId, commandId),
+            cancel: (sessionId, messageId, message) =>
+              mount.cancelCremate(sessionId, messageId, message),
+          }),
+        };
+        ownedSurface = surface;
+        // One surface per mount: a joined apply refreshes this entry and never
+        // seeds a second one.
+        if (joined !== undefined) joined.command = surface;
+        else if (registryKey !== null) {
+          const created = activePluginMounts.get(registryKey);
+          if (created !== undefined) created.command = surface;
+        }
+        /** Whether the host's list for this agent already carries `/cremate`. */
+        const listedFor = (agent: unknown): boolean | undefined => {
+          if (typeof commands.list !== 'function') return undefined;
+          try {
+            const listed = commands.list(agent);
+            if (!Array.isArray(listed)) return undefined;
+            return listed.some(entry => entry?.name === CREMATE_COMMAND_NAME);
+          } catch {
+            // A refused listing says nothing either way about the surface.
+            return undefined;
           }
+        };
+        ensureCremateCommand = (agent?: unknown): void => {
+          // No agent names no surface: at apply the entry is written once.
+          const present = agent === undefined ? undefined : listedFor(agent);
+          if (present === true) return;
+          // With no readable surface, a second register could double the entry,
+          // so an unreadable host keeps its one registration.
+          if (present === undefined && surface.unregister !== undefined) return;
+          disposeCommandSurface(surface);
+          try {
+            surface.unregister = commands.register(surface.command);
+          } catch (error) {
+            // A refused registration is a missing menu entry, never a failed
+            // mount; the typed message still reaches the same pass.
+            warn(`command registration: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        };
+        ensureCremateCommand();
+        /**
+         * ISSUE-603: a permission change leaves the client's catalog snapshot
+         * stale or empty, and the client re-pulls only on `commands/change`.
+         * The host emits that on a layer mutation, so the live entry is
+         * disposed and registered again — the presence check is deliberately
+         * skipped, because "already present" is exactly the state the client
+         * cannot see.
+         */
+        forceCremateCommand = (): void => {
+          disposeCommandSurface(surface);
+          try {
+            surface.unregister = commands.register(surface.command);
+          } catch (error) {
+            warn(`command re-registration: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        };
+        // A rebuilt surface is announced by name on the host's own event. It
+        // carries no payload, so the agents to re-list are the ones a step has
+        // already named. This is a refresh notification, not a second
+        // registration path: each pass reads `list(agent)` first and does
+        // nothing when the command is present.
+        try {
+          ctx.on('commands/change', () => {
+            for (const agent of seenAgents) {
+              try { ensureCremateCommand?.(agent); }
+              catch (error) {
+                warn(`command refresh: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            }
+          });
         } catch (error) {
-          // A refused registration is a missing menu entry, never a failed
-          // mount; the typed message still reaches the same pass.
-          warn(`command registration: ${error instanceof Error ? error.message : String(error)}`);
+          // Without the event seam, the pre-step must carry the refresh.
+          refreshOnPreStep = true;
+          warn(`command change hook: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
+
+      // ISSUE-603: the client's per-session catalog snapshot re-pulls only on
+      // `commands/change`, and a permission change fires none of its triggers,
+      // so a stale or empty snapshot persists. A forced re-registration is the
+      // public way to emit `commands/change`. This host carries the change only
+      // as session event types, never on the event bus, so the `session/event`
+      // listener below is the one path that sees it. An approval policy change
+      // is the same surface change as far as the client's snapshot goes.
+      const surfaceChangeEvents: readonly string[] =
+        ['permission/preset', 'sandbox/mode', 'approval/policy'];
+      const forceOnSurfaceChange = (): void => {
+        try { forceCremateCommand?.(); }
+        catch (error) {
+          warn(`command force: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
 
       // Observe only. Appending here reenters the host's publication boundary.
       ctx.on('session/event', (session: DshMountSession, event: DshMountEvent) => {
         try { mount.observe(session, event); }
         catch (error) {
           warn(`observe ${String(event?.type)}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (typeof event?.type === 'string' && surfaceChangeEvents.includes(event.type)) {
+          forceOnSurfaceChange();
         }
       });
 
@@ -6290,6 +6436,19 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         step?: number;
         signal?: AbortSignal;
       }, next: () => unknown) => {
+        // ISSUE-603: the step names the agent, which is what a payload-less
+        // `commands/change` cannot. Only without that event seam does the step
+        // also refresh; with the event available a permission edge costs the
+        // step nothing but the set insert.
+        if (payload.agent !== undefined && ensureCremateCommand !== undefined) {
+          seenAgents.add(payload.agent);
+        }
+        if (refreshOnPreStep) {
+          try { ensureCremateCommand?.(payload.agent); }
+          catch (error) {
+            warn(`command re-registration: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
         const session = payload.agent?.session;
         if (session === undefined) return next();
         // A host (or a rig) may name any value in the `signal` slot. Only a

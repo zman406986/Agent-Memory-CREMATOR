@@ -82,6 +82,14 @@ export interface CremateWait {
 /** The host command registry's registration shape. */
 export interface DshCommandRegistry {
   register(command: DshCommand): () => void;
+  /**
+   * The commands the host will offer an agent (ISSUE-603). The host keys the
+   * surface by scope and rebuilds it when a permission change recreates an
+   * agent's scope, so a registration made under the old scope drops out.
+   * Optional: an older host has no such seam, and the first registration is
+   * then never re-read.
+   */
+  list?(agent?: unknown): readonly DshCommand[];
 }
 
 /** One command definition as the host registry accepts it. */
