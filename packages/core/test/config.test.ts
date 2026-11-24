@@ -91,9 +91,9 @@ const REFUSALS: readonly [name: string, config: unknown, expected: string][] = [
     { ...DEFAULT_CONFIG, entryAskGrammar: "2option" },
     'entryAskGrammar must be "3option", "two-option", "jsonl-20" or "jsonl-20-nokeepall"'
       + " when declared."],
-  ["pruneAskGrammar names one of its two grammars",
+  ["pruneAskGrammar names one of its three grammars",
     { ...DEFAULT_CONFIG, pruneAskGrammar: "jsonl-20" },
-    'pruneAskGrammar must be "3option" or "nokeepall" when declared.'],
+    'pruneAskGrammar must be "3option", "nokeepall" or "jsonl-20-nokeepall" when declared.'],
   ["protocol.dedupe must be an object",
     { ...DEFAULT_CONFIG, protocol: { ...DEFAULT_CONFIG.protocol, dedupe: 1 } },
     "protocol.dedupe must be an object."],
@@ -236,7 +236,9 @@ test("every optional protocol and trigger knob admits its shipped values and ref
       assert.deepEqual(withPruneGrammar(undefined), [], `row: ${row} — absent is nokeepall`);
       assert.deepEqual(withPruneGrammar("3option"), [], `row: ${row} — 3option`);
       assert.deepEqual(withPruneGrammar("nokeepall"), [], `row: ${row} — nokeepall`);
-      for (const grammar of ["2option", "", "3option ", "jsonl-20", "jsonl-20-nokeepall",
+      assert.deepEqual(withPruneGrammar("jsonl-20-nokeepall"), [],
+        `row: ${row} — the entry two-verdict spelling is accepted (ISSUE-522)`);
+      for (const grammar of ["2option", "", "3option ", "jsonl-20",
         "NOKEEPALL", null, 3, {}]) {
         assert.equal(withPruneGrammar(grammar).some(problem => problem.includes("pruneAskGrammar")),
           true, `row: ${row} — grammar=${String(grammar)} must be refused`);

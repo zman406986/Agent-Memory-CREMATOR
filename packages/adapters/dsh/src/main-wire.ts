@@ -29,12 +29,14 @@
  * A request this package sent itself (an entry or a prune ask) is skipped: it is
  * not main, and seeding from it would replay the wrong conversation.
  *
- * So is a request the host stamped `purpose: 'session-title'` (ISSUE-031): the
- * title call is a second async request carrying the same session id, one
- * system prompt and no tools. It is not main's conversation, and taking it as
- * main's last request seeds the next fork from the title prompt instead of the
- * conversation. Skipping it leaves the previous main request in place; a
- * session that has sent only a title request has no seed at all.
+ * So is a request the host stamped with an auxiliary `purpose` (ISSUE-031,
+ * ISSUE-553): a session-title call, and the host's own compaction request
+ * (`purpose: 'compaction'`), are second requests on the same session, not
+ * main's conversation. Taking one as main's last request seeds the next fork
+ * from that prompt instead of the conversation. Only an absent purpose (or an
+ * explicit `'main'`) is main's lane; skipping an auxiliary call leaves the
+ * previous main request in place, and a session that has sent only auxiliary
+ * requests has no seed at all.
  */
 import type { Sha256, WireMessage, WireRequest, WireTool } from '@cremator/core';
 import { wireRequestHash } from '@cremator/core';
@@ -135,9 +137,14 @@ function seedRole(role: string): WireMessage['role'] {
 export function captureMainRequest(options: unknown): CapturedMainRequest | null {
   if (!isRecord(options)) return null;
   if (isRacoonsAskRequest(options)) return null;
-  // dsh stamps an auxiliary call with the purpose it serves; a session-title
-  // call is not main's conversation and must not become the fork's seed.
-  if (options['purpose'] === 'session-title') return null;
+  // dsh stamps an auxiliary call with the purpose it serves; only the main
+  // conversation may become the fork's seed. A session-title call (ISSUE-031)
+  // and the host's own compaction request (`purpose: 'compaction'`, ISSUE-553)
+  // are not main's conversation: taking one as main's last request seeds the
+  // next ask from that prompt instead of the conversation. Absent (or an
+  // explicit `main`) is the main lane.
+  const purpose = options['purpose'];
+  if (purpose !== undefined && purpose !== null && purpose !== 'main') return null;
   const messages = options['messages'];
   if (!Array.isArray(messages)) return null;
   const tools = Array.isArray(options['tools'])

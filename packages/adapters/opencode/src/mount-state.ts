@@ -6,6 +6,13 @@
  * two facts that must survive a process boundary but are not ledger events, in
  * a sibling `mount-state.json` under the same session directory:
  *
+ *   - `install` — the mount identity this session's durable state belongs to:
+ *     a generation, the install wall time, the tool-result node ids present at
+ *     the first mount (identity evidence, never an eligibility gate — ADR-0069)
+ *     and the session id it was installed for. A remount reads it to know the
+ *     state is its own (a restart) rather than a fork's copy of a parent's
+ *     state, and a fork does not restore the parent's ask identity
+ *     (ISSUE-521 items 1 and 7; the dsh `install` fact).
  *   - `receipts` — the host receipts this port minted for applied removals. The
  *     in-process map dies with the process; the file lets a remount resolve a
  *     prepared ledger row the previous process landed instead of reading
@@ -63,6 +70,31 @@ export interface DurableAskVerdict {
   readonly answer: WireAnswer;
 }
 
+/**
+ * The durable install identity of one session (ISSUE-521 item 1, the dsh
+ * `install` fact ported). It is identity evidence, never an eligibility gate
+ * (ADR-0069): it says whether a mount is a fresh install, a restart of its own
+ * state, or a fork holding a copy of another session's state, and the
+ * `sessionId` it names is what stops a child restoring the parent's ask
+ * identity (ISSUE-521 item 7).
+ */
+export interface DurableInstall {
+  /** One per mount of this durable state; the first mount writes 1. */
+  readonly generation: number;
+  /** The wall time the first mount recorded, in ms. */
+  readonly installedAtMs: number;
+  /**
+   * The tool-result node ids on the host surface at the first mount. Identity
+   * evidence for a fork/clone (ADR-0069 decision 2); it gates no eligibility.
+   */
+  readonly preInstallNodeIds: readonly string[];
+  /**
+   * The session id this durable state was first installed for. A mount reading
+   * a different id holds a fork's copy of a parent's state.
+   */
+  readonly sessionId: string;
+}
+
 /** The ask identity a remount restores (ISSUE-409; ADR-0063). */
 export interface DurableAskState {
   readonly revisions: readonly string[];
@@ -84,6 +116,7 @@ export interface DurableAskState {
 
 interface MountDoc {
   readonly version?: number;
+  readonly install?: DurableInstall;
   readonly receipts?: readonly ApplyReceipt[];
   readonly ask?: DurableAskState;
 }
@@ -123,20 +156,24 @@ function isCount(value: unknown): value is number {
  * wrote (ISSUE-484).
  */
 function isLegacyMountDoc(value: Record<string, unknown>): boolean {
-  return Array.isArray(value.receipts) || isRecord(value.ask);
+  return Array.isArray(value.receipts) || isRecord(value.ask) || isRecord(value.install);
 }
 
 /**
  * Read one document. An absent file is legitimately empty; a present file this
- * build cannot read — bad JSON, not an object, or another format version — is
- * refused with its reason so the caller can journal it by name (ISSUE-472).
+ * build cannot read — a transient `readFileSync` failure (Windows AV/EBUSY/
+ * EPERM/EMFILE on a just-renamed file), bad JSON, not an object, or another
+ * format version — is refused with its reason so the caller can journal it by
+ * name and a writer refuses to merge over it (ISSUE-521 item 2; ISSUE-472).
  */
 function readDoc(dir: string): DocRead {
   let raw: string;
   try {
     raw = fs.readFileSync(join(dir, MOUNT_STATE_FILE), 'utf8');
-  } catch {
-    return { doc: {} };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { doc: {} };
+    return { doc: {}, rejected: 'the mount-state file could not be read: '
+      + (error instanceof Error ? error.message : String(error)) };
   }
   let parsed: unknown;
   try {
@@ -239,18 +276,31 @@ function lockFailure(target: StorageTarget, error: unknown): DurableWriteResult 
     + `cross-process lock: ${reason}` };
 }
 
-function readReceiptsOf(doc: MountDoc): ApplyReceipt[] {
+/** The receipts fact as read, and why a readable document's copy was unusable. */
+interface ReceiptsRead {
+  readonly rows: ApplyReceipt[];
+  readonly rejected?: string;
+}
+
+function readReceiptsOf(doc: MountDoc): ReceiptsRead {
   const receipts = doc.receipts;
-  if (!Array.isArray(receipts)) return [];
+  if (receipts === undefined) return { rows: [] };
+  if (!Array.isArray(receipts)) {
+    return { rows: [], rejected: 'the receipts record is not an array' };
+  }
   const out: ApplyReceipt[] = [];
   for (const value of receipts) {
-    if (!isRecord(value)) return [];
+    if (!isRecord(value)) {
+      return { rows: [], rejected: 'the receipts record holds a structurally invalid row' };
+    }
     if (typeof value.intentId !== 'string' || typeof value.sessionId !== 'string'
       || typeof value.baseRevision !== 'string' || typeof value.resultRevision !== 'string'
-      || typeof value.applicationSha256 !== 'string' || !isCount(value.appliedAtMs)) return [];
+      || typeof value.applicationSha256 !== 'string' || !isCount(value.appliedAtMs)) {
+      return { rows: [], rejected: 'the receipts record holds a structurally invalid row' };
+    }
     out.push(value as unknown as ApplyReceipt);
   }
-  return out;
+  return { rows: out };
 }
 
 /** The host receipts a previous process minted for this session (ISSUE-448). */
@@ -264,17 +314,12 @@ export function readDurableReceipts(
     onReject?.(read.rejected);
     return [];
   }
-  const rows = readReceiptsOf(read.doc);
-  const receipts = read.doc.receipts;
-  if (receipts !== undefined && !Array.isArray(receipts)) {
-    onReject?.('the receipts record is not an array; reading it as absent');
+  const receipts = readReceiptsOf(read.doc);
+  if (receipts.rejected !== undefined) {
+    onReject?.(`${receipts.rejected}; reading it as absent`);
     return [];
   }
-  if (rows.length === 0 && (receipts?.length ?? 0) > 0) {
-    onReject?.('the receipts record is structurally invalid; reading it as absent');
-    return [];
-  }
-  return rows;
+  return receipts.rows;
 }
 
 /**
@@ -291,8 +336,14 @@ export function writeDurableReceipt(
   return withLedgerLock(target, () => {
     const read = readDoc(dir);
     if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
-    const prior = readReceiptsOf(read.doc).filter(row => row.intentId !== receipt.intentId);
-    return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] });
+    const prior = readReceiptsOf(read.doc);
+    // ISSUE-521 item 2 (the dsh ISSUE-568 rule): a record this build cannot
+    // parse is never replaced by a merge over an empty read. Refusing by name
+    // keeps a valid sibling receipt from being erased by a row this build could
+    // not read, and the write is retried once the file reads again.
+    if (prior.rejected !== undefined) return refuseWrite(dir, prior.rejected);
+    const kept = prior.rows.filter(row => row.intentId !== receipt.intentId);
+    return publishDoc(dir, { ...read.doc, receipts: [...kept, receipt] });
   });
 }
 
@@ -314,7 +365,11 @@ export function removeDurableReceipt(
   return withLedgerLock(target, () => {
     const read = readDoc(dir);
     if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
-    const prior = readReceiptsOf(read.doc);
+    const read1 = readReceiptsOf(read.doc);
+    // A record this build cannot parse is not read as "no receipt to collect":
+    // the collection would republish the document without it (ISSUE-521 item 2).
+    if (read1.rejected !== undefined) return refuseWrite(dir, read1.rejected);
+    const prior = read1.rows;
     const remaining = prior.filter(row => row.intentId !== intentId);
     if (remaining.length === prior.length) return { ok: true };
     const { receipts: _prior, ...rest } = read.doc;
@@ -390,6 +445,65 @@ export function writeDurableAskState(
   return withLedgerLock(target, () => {
     const read = readDoc(dir);
     if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+    // ISSUE-521 item 2: an ask record this build cannot parse is not merged
+    // over. Replacing it with this process's empty (or partial) state would
+    // erase a settled unit's claim and leave it ask-eligible again.
+    if (read.doc.ask !== undefined && readAskOf(read.doc) === null) {
+      return refuseWrite(dir, 'the ask record is structurally invalid');
+    }
     return publishDoc(dir, { ...read.doc, ask });
+  });
+}
+
+function isInstallOf(value: unknown): DurableInstall | null {
+  if (!isRecord(value)) return null;
+  if (!isCount(value.generation) || value.generation < 1) return null;
+  if (!isCount(value.installedAtMs) || typeof value.sessionId !== 'string'
+    || value.sessionId.length === 0 || !isStringArray(value.preInstallNodeIds)) return null;
+  return {
+    generation: value.generation, installedAtMs: value.installedAtMs,
+    preInstallNodeIds: value.preInstallNodeIds, sessionId: value.sessionId,
+  };
+}
+
+/**
+ * The install identity this session's durable state carries, or null (fresh).
+ * A present record this build cannot parse is named before it reads as fresh,
+ * so "no identity" is never silently the same as "unreadable" (ISSUE-521
+ * item 1). Absent in a document written before this fact existed, which reads
+ * as the pre-521 behaviour (a mount that reads a ledger is a restart).
+ */
+export function readDurableInstall(
+  target: StorageTarget, onReject?: MountStateRejection,
+): DurableInstall | null {
+  const dir = sessionDirOf(target);
+  if (dir === null) return null;
+  const read = readDoc(dir);
+  if (read.rejected !== undefined) {
+    onReject?.(read.rejected);
+    return null;
+  }
+  if (read.doc.install === undefined) return null;
+  const install = isInstallOf(read.doc.install);
+  if (install === null) {
+    onReject?.('the install record is structurally invalid; reading it as absent');
+    return null;
+  }
+  return install;
+}
+
+/** Record the mount identity/generation, preserving every other fact. */
+export function writeDurableInstall(
+  target: StorageTarget, install: DurableInstall,
+): DurableWriteResult {
+  const dir = sessionDirOf(target);
+  if (dir === null) return { ok: true };
+  return withLedgerLock(target, () => {
+    const read = readDoc(dir);
+    if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+    if (read.doc.install !== undefined && isInstallOf(read.doc.install) === null) {
+      return refuseWrite(dir, 'the install record is structurally invalid');
+    }
+    return publishDoc(dir, { ...read.doc, install });
   });
 }

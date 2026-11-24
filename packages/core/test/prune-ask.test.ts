@@ -192,7 +192,8 @@ test("nokeepall rows carry [L line(s)]; 3option renders the shipped bytes unchan
   assert.equal(pruneAskSystemPromptOf(), PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT,
     "the absent grammar is the shipped nokeepall prompt");
   assert.throws(() => renderPruneAskRows(rows, { grammar: "nope" as never }),
-    /"3option" or "nokeepall"/u, "an unknown grammar is refused by name");
+    /"3option", "nokeepall" or "jsonl-20-nokeepall"/u,
+    "an unknown grammar is refused by name");
 });
 
 test("an inverted lineRange is fail-open under nokeepall: [0 lines] and the row keeps (ISSUE-334)", () => {

@@ -23,7 +23,7 @@
  */
 
 import type { Episode } from "../episodes/types.js";
-import type { PruneAskGrammar } from "../config.js";
+import type { PrunePlanGrammar } from "../config.js";
 import type { NodeId, UnitId } from "../types/identity.js";
 import type { ToolResultNode, TranscriptNode } from "../types/transcript.js";
 import type { ProcessingUnit } from "../units/types.js";
@@ -80,14 +80,14 @@ export interface PrunePassInput {
    * shipped contract byte for byte, stays selectable by name. The plan carries
    * the grammar so the table, correction and estimate paths select the same one.
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
 }
 
 /** One pass as a document: the two layers, the dedupe, and its ask tables. */
 export interface PrunePassPlan {
   readonly round: number;
   /** The grammar the ask tables state; `nokeepall` when the caller named none. */
-  readonly grammar: PruneAskGrammar;
+  readonly grammar: PrunePlanGrammar;
   /** L1's own verdict. */
   readonly l1: Level1PrunePlan;
   /**

@@ -506,6 +506,30 @@ export function gitResolvesAbove({ from, campaignRoot, exists = existsSync }) {
  * written), so a mutator naming one is a violation, not a permitted read. */
 const MUTATING_TOOLS = new Set(['write', 'edit', 'multi_edit', 'str_replace', 'apply_patch', 'notebook_edit']);
 
+/** The call a `tool/result` answers, by any id dsh's log carries. */
+function resultCallIdOf(event) {
+  const id = event?.data?.toolCallId ?? event?.data?.callId ?? event?.data?.message?.source?.callId;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/** A host denial marker: a refused call, a blocked path. */
+const DENIAL = /denied|refused|blocked|forbidden|not-permitted/u;
+
+/**
+ * The denial a `tool/result` states, as the host's own status or code, or
+ * `null` (ISSUE-523 item 6). Only an explicit denial marker counts: an ordinary
+ * tool error (a missing file, a non-zero exit) is not a boundary fact.
+ */
+function denialOf(event) {
+  const data = event?.data ?? {};
+  const message = data.message ?? {};
+  for (const value of [data.status, message.status, data.denial, message.denial,
+    data.code, message.code, data.wireCode, message.wireCode]) {
+    if (typeof value === 'string' && DENIAL.test(value)) return value;
+  }
+  return null;
+}
+
 /**
  * Classify every `tool/call` in a session log against the arm's world.
  *
@@ -526,10 +550,12 @@ const MUTATING_TOOLS = new Set(['write', 'edit', 'multi_edit', 'str_replace', 'a
  *                 allow-listed operator path is READ-only (`bench-brief-035.md`:
  *                 the template checkout may be read and must not be written), so
  *                 a mutating tool naming one is a `violations` row instead.
- * - `violations`— a path naming `evidenceDir` (`scope: 'evidence-path'`), or a
- *                 path inside the campaign tree but outside the world
- *                 (`scope: 'campaign'`): another arm's evidence,
- *                 `derive-*.json`, `build/`, `VERDICT.md`. The run fails and
+ * - `violations`— a path naming `evidenceDir` (`scope: 'evidence-path'`), a path
+ *                 inside the campaign tree but outside the world
+ *                 (`scope: 'campaign'`), or a call whose `tool/result` states a
+ *                 deny (`scope: 'denied'`, `status` naming the host's marker):
+ *                 another arm's evidence, `derive-*.json`, `build/`,
+ *                 `VERDICT.md`, a refused or redirected read. The run fails and
  *                 names the call.
  * - `outside`   — anywhere else on the machine; recorded, not gated.
  * - `gitChannel`— a `git` read sub-command whose repository resolution can climb
@@ -548,6 +574,15 @@ export function classifyToolCalls({
   evidenceDir = null, exists = existsSync,
 }) {
   const report = { judged: 0, inside: 0, allowed: 0, violations: [], outside: [], gitChannel: [] };
+  // ISSUE-523 item 6: pair each call with its `tool/result`. A denied read or a
+  // redirected path is a fact only the result carries, and nothing in dsh
+  // 0.2.x emits one, so this map is empty on every current run.
+  const resultsByCall = new Map();
+  for (const event of sessionEvents) {
+    if (event?.type !== 'tool/result') continue;
+    const callId = resultCallIdOf(event);
+    if (callId !== null && !resultsByCall.has(callId)) resultsByCall.set(callId, event);
+  }
   // The climb is a property of the world, not of the call, so it is decided
   // once. `workDir` is where the child actually runs.
   const climbs = gitResolvesAbove({ from: workDir, campaignRoot, exists });
@@ -564,6 +599,8 @@ export function classifyToolCalls({
       // An unparseable argument string is still text the model wrote; scan it raw.
       parsed = typeof event.data?.arguments === 'string' ? event.data.arguments : null;
     }
+    const paths = extractPaths(parsed);
+    let firstResolved = null;
     if (climbs) {
       // One row per CALL, so the count reads as `N call(s)`. A call may run
       // several git sub-commands (`rev-parse; log`); the verbs are listed.
@@ -579,8 +616,9 @@ export function classifyToolCalls({
       }
       if (verbs.length > 0) report.gitChannel.push({ tool, callId, seq, verbs, command });
     }
-    for (const path of extractPaths(parsed)) {
+    for (const path of paths) {
       const absolute = isAbsolute(path) ? resolve(path) : resolve(workDir, path);
+      if (firstResolved === null) firstResolved = absolute;
       report.judged += 1;
       // The evidence dir is the harness's own output and may sit inside the
       // world (`--world` puts it at <world>/evidence). A tool call naming it is
@@ -615,6 +653,18 @@ export function classifyToolCalls({
       } else if (inside(campaignRoot, absolute)) report.violations.push({ ...row, scope: 'campaign' });
       else report.outside.push(row);
     }
+    // A call the host denied is a violation even when its arguments named an
+    // allowed path: the host refused what this classifier would have read as
+    // clean (ISSUE-523 item 6). One row per call; the path is the first one the
+    // call named, or none when the denial names no target. A `tool/result` this
+    // build does not pair (no call id) classifies nothing, as before.
+    const denial = denialOf(resultsByCall.get(callId));
+    if (denial !== null) {
+      report.violations.push({ tool, callId, seq,
+        path: paths[0] ?? null,
+        ...(firstResolved === null ? {} : { resolved: firstResolved }),
+        scope: 'denied', status: denial });
+    }
   }
   return report;
 }
@@ -629,6 +679,8 @@ export function describeViolation(row) {
   const scope = row.scope === 'read-only'
     ? ` (a write under read-only ${row.allowedRoot})`
     : row.scope === 'campaign' ? ' (inside the campaign, outside the world)'
-      : row.scope === 'evidence-path' ? ' (the evidence dir: harness output, not a tool target)' : '';
-  return `${row.tool} call${row.seq === null ? '' : ` seq ${String(row.seq)}`} named ${row.path}${scope}`;
+      : row.scope === 'evidence-path' ? ' (the evidence dir: harness output, not a tool target)'
+        : row.scope === 'denied' ? ` (the host denied it: ${String(row.status)})` : '';
+  return `${row.tool} call${row.seq === null ? '' : ` seq ${String(row.seq)}`}`
+    + ` named ${row.path === null || row.path === undefined ? 'no path' : row.path}${scope}`;
 }

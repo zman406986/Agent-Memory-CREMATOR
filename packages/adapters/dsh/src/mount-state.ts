@@ -41,6 +41,12 @@
  * as an empty list with no cause; the read itself still fails open, and a
  * writer refuses to republish over the record it could not parse (ISSUE-568),
  * so a valid sibling receipt is never erased by a row this build cannot read.
+ *
+ * The document is versioned (ISSUE-523 item 4): `MOUNT_STATE_VERSION` is
+ * stamped on every write, a document that declares another version is refused
+ * by name, and an untagged document reads as version 1 so a pre-upgrade
+ * session keeps its facts, so a future format change cannot silently drop a
+ * fact and no upgrade drops one either.
  */
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -51,6 +57,15 @@ import type { MountJournal } from './journal-kinds.js';
 
 /** The state file's name, beside `ledger.sqlite`, `blobs/` and `prune-round.json`. */
 export const MOUNT_STATE_FILE = 'mount-state.json';
+
+/**
+ * The document's format version (ISSUE-523 item 4). A renamed or removed field
+ * would otherwise read as absent with no signal, so a future format change
+ * silently drops claims, forgets or receipts. Every write stamps this value and
+ * a read refuses a document that declares another one by name; an untagged
+ * document is v1-shaped and reads as this version.
+ */
+const MOUNT_STATE_VERSION = 1;
 
 /** A per-process token so two writes never stage the same temp name. */
 let tempSeq = 0;
@@ -90,6 +105,8 @@ export interface DurableForget {
 }
 
 interface MountDoc {
+  /** The format this document was written under (`MOUNT_STATE_VERSION`). */
+  readonly version?: number;
   readonly install?: DurableInstall;
   readonly forgets?: readonly DurableForget[];
   readonly receipts?: readonly ApplyReceipt[];
@@ -133,6 +150,15 @@ function readDoc(dir: string): DocRead {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return { doc: {}, reason: 'the mount-state file is not a JSON object' };
   }
+  // A document written before the version field existed is v1-shaped: its three
+  // facts already match `MOUNT_STATE_VERSION`, so an absent tag reads as 1 and
+  // the install identity, owed forgets and receipts survive the upgrade. Only a
+  // tag that states another version is refused by name.
+  const version = (parsed as { readonly version?: unknown }).version;
+  if (version !== undefined && version !== MOUNT_STATE_VERSION) {
+    return { doc: {}, reason: 'the mount-state file declares format version '
+      + `${String(version)}; this build reads only version ${String(MOUNT_STATE_VERSION)}` };
+  }
   return { doc: parsed as MountDoc };
 }
 
@@ -165,7 +191,7 @@ function publishDoc(dir: string, doc: MountDoc, journal: MountJournal, sessionId
   const temp = `${final}.${String(process.pid)}.${String(tempSeq++)}.tmp`;
   try {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(temp, `${JSON.stringify(doc)}\n`, 'utf8');
+    fs.writeFileSync(temp, `${JSON.stringify({ ...doc, version: MOUNT_STATE_VERSION })}\n`, 'utf8');
     fs.renameSync(temp, final);
     return true;
   } catch (error) {

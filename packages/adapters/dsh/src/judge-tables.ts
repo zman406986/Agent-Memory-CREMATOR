@@ -41,13 +41,13 @@
  */
 import {
   entryBatchAskMessage, ForkError, isRefusedPruneAnchor,
-  appendAsk, appendVerdict, parsePruneAnswer, planCarryOver, pruneAskFinalLineOf,
-  pruneAskSystemPromptOf, readJsonl20NoKeepallAnswer, renderPruneAskTable,
-  summarizePassAttempts, summarizeTableAttempt,
+  appendAsk, appendVerdict, isTwoVerdictGrammar, parsePruneAnswer, planCarryOver,
+  pruneAskFinalLineOf, pruneAskSystemPromptOf, readJsonl20NoKeepallAnswer,
+  renderPruneAskTable, summarizePassAttempts, summarizeTableAttempt,
 } from '@cremator/core';
 import type {
   EntryAnswer, EntryBatchRow, Jsonl20RowRefusalCode, PruneAnswerParse, PruneAnswerRefusalCode,
-  PruneAnswerRejection, PruneAnswerRow, PruneAskGrammar, PruneAskRow, PruneCarryDeferred,
+  PruneAnswerRejection, PruneAnswerRow, PrunePlanGrammar, PruneAskRow, PruneCarryDeferred,
   PruneCarryOverPlan, PrunePassAttemptTotals, PruneTableAttempt, ProcessingUnit, WireAnswer,
   WireFork, WireStamp, WireVerdictErrorCode,
 } from '@cremator/core';
@@ -58,11 +58,11 @@ import type { JudgeRoute } from './route.js';
 import type { DshLlmService } from './plugin.js';
 
 /**
- * The bulk ask grammars this loop can render (core's closed `PruneAskGrammar`).
+ * The bulk ask grammars this loop can render (core's closed `PrunePlanGrammar`).
  * The list is closed so a typo'd config name is refused as `invalid-grammar`
  * before core's grammar-gated renderer can throw into the pass (ISSUE-346).
  */
-const PRUNE_ASK_GRAMMARS = ['3option', 'nokeepall'] as const;
+const PRUNE_ASK_GRAMMARS = ['3option', 'nokeepall', 'jsonl-20-nokeepall'] as const;
 
 /**
  * The stream refusals that never touched the host: no route to ask, and a
@@ -142,7 +142,7 @@ export interface TableLoopOptions {
    * reply with the matching line reader (ISSUE-508); `3option` keeps the
    * shipped prompt, row shape and batch reader.
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
   /**
    * Whether this pass's FIRST table ask is the session's first table ask
    * (ISSUE-508; ISSUE-194's rule on the bulk lane). `true` — the default — ships
@@ -221,9 +221,9 @@ function messageOf(error: unknown): string {
  * `3option` keeps today's bytes exactly: the fork frame, that grammar's
  * contract, the table without per-row counts, and its closing line.
  */
-export function tableAsk(rows: readonly TableRow[], grammar: PruneAskGrammar = '3option',
+export function tableAsk(rows: readonly TableRow[], grammar: PrunePlanGrammar = '3option',
   firstTrigger = true): string {
-  if (grammar === 'nokeepall') {
+  if (isTwoVerdictGrammar(grammar)) {
     return entryBatchAskMessage(entryRowsOf(rows), 'jsonl-20-nokeepall', firstTrigger);
   }
   return `${ASK_FRAME}\n\n${pruneAskSystemPromptOf(grammar)}\n\n`
@@ -320,9 +320,9 @@ export function parseTableReply(
   indices: readonly number[],
   stamps: ReadonlyMap<number, { readonly unitId: string; readonly answeredInRound: number }>,
   table: readonly TableRow[],
-  grammar: PruneAskGrammar,
+  grammar: PrunePlanGrammar,
 ): PruneAnswerParse {
-  if (grammar !== 'nokeepall') return parsePruneAnswer(text, { indices, stamps });
+  if (!isTwoVerdictGrammar(grammar)) return parsePruneAnswer(text, { indices, stamps });
   const counts = new Map<number, number>();
   const zeroLine = new Set<number>();
   for (const row of table) {

@@ -24,9 +24,10 @@
  * invalid options throw, because those are caller bugs, not transcript data.
  */
 
-import type { PruneAskGrammar } from "../config.js";
+import type { PrunePlanGrammar } from "../config.js";
 import {
-  KEEP_WHOLE_SUMMARY, oneLine, PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT, PRUNE_ASK_SYSTEM_PROMPT,
+  KEEP_WHOLE_SUMMARY, oneLine, PRUNE_ASK_JSONL_20_NOKEEPALL_SYSTEM_PROMPT,
+  PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT, PRUNE_ASK_SYSTEM_PROMPT,
 } from "../rules/assets.js";
 import type { ProcessingUnit } from "../units/types.js";
 import type { PruneCarryEntry } from "./ask-carry.js";
@@ -108,15 +109,27 @@ export function nextTable(
   return { rows, carried: carried.length };
 }
 
+/**
+ * Whether a plan label names a two-verdict grammar (`forgetall` or
+ * `keeplines`, no `keepall`) (ISSUE-522). Every grammar but `3option` is
+ * two-verdict today, and this predicate is the ONE place that is decided, so a
+ * future grammar id cannot silently become two-verdict by failing an inequality:
+ * adding one to `PrunePlanGrammar` leaves it `false` here until this function
+ * names it.
+ */
+export function isTwoVerdictGrammar(grammar: PrunePlanGrammar | undefined): boolean {
+  return grammar === "nokeepall" || grammar === "jsonl-20-nokeepall";
+}
+
 /** Options for the table renderers; production passes none. */
 export interface PruneAskRenderOptions {
   /**
    * The answer grammar whose row shape this table states. Absent is `3option`,
-   * byte for byte. `nokeepall` appends each row's ` [L line(s)]` (including
-   * `[0 lines]` for a zero-line unit), because that grammar's whole-range
-   * answer must name the row's own L.
+   * byte for byte. A two-verdict grammar appends each row's ` [L line(s)]`
+   * (including `[0 lines]` for a zero-line unit), because its whole-range answer
+   * must name the row's own L.
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
 }
 
 /** The table block as it ships: the heading, a blank line, then one row per unit. */
@@ -156,9 +169,11 @@ export function renderPruneAskRows(
  * on the call facts is what keeps harness metadata from forging a row that
  * starts with an index we never wrote.
  */
-function renderPruneAskRow(row: PruneAskRow, grammar: PruneAskGrammar): string {
+function renderPruneAskRow(row: PruneAskRow, grammar: PrunePlanGrammar): string {
   const rendered = renderPruneAskRowCore(row);
-  return grammar === "nokeepall" ? `${rendered}${lineCountLabelOf(row.unit)}` : rendered;
+  // Every two-verdict spelling states the row's own line count; `3option` alone
+  // keeps the shipped bytes (ISSUE-522).
+  return isTwoVerdictGrammar(grammar) ? `${rendered}${lineCountLabelOf(row.unit)}` : rendered;
 }
 
 function renderPruneAskRowCore(row: PruneAskRow): string {
@@ -192,32 +207,37 @@ function lineCountLabelOf(unit: ProcessingUnit): string {
 /**
  * The contract a bulk prune ask states for one grammar: the two-verdict
  * `nokeepall` prompt by default (ADR-0056), the shipped three-way prompt when
- * `3option` is selected by name. Exported so the table path selects its prompt
- * from the same grammar id its rows and its correction turn use, instead of
- * hard-coding the shipped bytes.
+ * `3option` is selected by name. `jsonl-20-nokeepall` names the ADR-0053 entry
+ * asset — that label says the plan's prompt IS the entry message — never the
+ * bulk `nokeepall` message (ISSUE-522). Exported so the table path selects its
+ * prompt from the same grammar id its rows and its correction turn use, instead
+ * of hard-coding the shipped bytes.
  */
-export function pruneAskSystemPromptOf(grammar: PruneAskGrammar = "nokeepall"): string {
-  return checkedGrammar(grammar) === "nokeepall"
-    ? PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT : PRUNE_ASK_SYSTEM_PROMPT;
+export function pruneAskSystemPromptOf(grammar: PrunePlanGrammar = "nokeepall"): string {
+  const checked = checkedGrammar(grammar);
+  if (checked === "jsonl-20-nokeepall") return PRUNE_ASK_JSONL_20_NOKEEPALL_SYSTEM_PROMPT;
+  return isTwoVerdictGrammar(checked) ? PRUNE_ASK_NOKEEPALL_SYSTEM_PROMPT : PRUNE_ASK_SYSTEM_PROMPT;
 }
 
 /**
  * The closing instruction a bulk prune ask (or its correction turn) states for
- * one grammar. Under `nokeepall` it names the two verdicts that grammar offers;
- * every other grammar keeps the shipped line byte for byte. Absent is
+ * one grammar. Under a two-verdict grammar it names the two verdicts that
+ * grammar offers; `3option` keeps the shipped line byte for byte. Absent is
  * `nokeepall`, the same default `pruneAskSystemPromptOf` and the pass state
  * (ADR-0056).
  */
-export function pruneAskFinalLineOf(grammar: PruneAskGrammar = "nokeepall"): string {
-  return checkedGrammar(grammar) === "nokeepall"
+export function pruneAskFinalLineOf(grammar: PrunePlanGrammar = "nokeepall"): string {
+  return isTwoVerdictGrammar(checkedGrammar(grammar))
     ? PRUNE_ASK_NOKEEPALL_FINAL_LINE : PRUNE_ASK_FINAL_LINE;
 }
 
 /** The grammar's canonical id, or a `RangeError` for a JS caller's typo. */
-function checkedGrammar(grammar: string): PruneAskGrammar {
-  if (grammar !== "3option" && grammar !== "nokeepall") {
+function checkedGrammar(grammar: string): PrunePlanGrammar {
+  if (grammar !== "3option" && grammar !== "nokeepall"
+    && grammar !== "jsonl-20-nokeepall") {
     throw new RangeError(
-      `A prune ask grammar is "3option" or "nokeepall", got ${String(grammar)}.`,
+      'A prune ask grammar is "3option", "nokeepall" or "jsonl-20-nokeepall", '
+      + `got ${String(grammar)}.`,
     );
   }
   return grammar;

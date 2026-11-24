@@ -132,8 +132,11 @@ function step(session: FakeSession, body: string, callId = 'c1'): void {
   session.append('step/end', { turn: 1, step: 1 });
 }
 
-function oversizedBody(bytes: number): string {
-  const line = 'x'.repeat(63);
+// `tag` keeps two bodies in one session from nesting: identical filler makes the
+// shorter body a substring of the longer one, and the retention rules then keep
+// it (ISSUE-519). Each body a test needs removed names its own character.
+function oversizedBody(bytes: number, tag = 'x'): string {
+  const line = tag.repeat(63);
   return `${`${line}\n`.repeat(Math.ceil(bytes / (line.length + 1)))}`.slice(0, bytes);
 }
 
@@ -530,8 +533,8 @@ test('removal applies after restart — ledger is record of record', async () =>
   try {
     // 1. Run a keep-all pass, then a removing pass, through the first mount.
     await first.apply();
-    const kept = oversizedBody(16 * 1024);
-    const original = oversizedBody(40 * 1024);
+    const kept = oversizedBody(16 * 1024, 'k');
+    const original = oversizedBody(40 * 1024, 'o');
     const session = fakeSession('session-restart-removal');
     attach(first, session);
     step(session, kept, 'k1');
@@ -559,7 +562,7 @@ test('removal applies after restart — ledger is record of record', async () =>
     await second.apply();
     const resumed = fakeSession('session-restart-removal');
     attach(second, resumed);
-    const fresh = oversizedBody(32 * 1024);
+    const fresh = oversizedBody(32 * 1024, 'f');
     // A resumed transcript's calls are new nodes: reusing the pre-restart call
     // id would name the event the ledger already records as applied.
     step(resumed, fresh, 'r1');

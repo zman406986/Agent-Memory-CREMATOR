@@ -32,10 +32,10 @@
  * invalid options throw, because those are caller bugs, not answer data.
  */
 
-import type { PruneAskGrammar } from "../config.js";
+import type { PrunePlanGrammar } from "../config.js";
 import type { PruneAnswerRefusalCode } from "./ask-answer.js";
 import type { PruneAskRow } from "./ask-message.js";
-import { pruneAskFinalLineOf, renderPruneAskRows } from "./ask-message.js";
+import { isTwoVerdictGrammar, pruneAskFinalLineOf, renderPruneAskRows } from "./ask-message.js";
 
 /**
  * The approved composite example: one real `keeplines` answer and one real
@@ -104,12 +104,12 @@ export interface PruneCorrectionInput {
   /** One entry per refused row; a missing entry is a caller bug. */
   readonly reasons: readonly PruneCorrectionReason[];
   /**
-   * The grammar this correction restates. Absent is `3option`. `nokeepall`
-   * re-renders each row with its `[L line(s)]` and states the one-object-per-row
-   * answer shapes, so the correction speaks exactly the grammar the table asked
-   * in (ISSUE-508).
+   * The grammar this correction restates. Absent is `3option`. A two-verdict
+   * grammar re-renders each row with its `[L line(s)]` and states the
+   * one-object-per-row answer shapes, so the correction speaks exactly the
+   * grammar the table asked in (ISSUE-508).
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
 }
 
 /**
@@ -213,7 +213,7 @@ export function pruneCorrectionMessage(input: PruneCorrectionInput): string {
   const opening = `Your previous answer could not be applied for ${String(refused.length)} of `
     + `${String(totalRows)} rows: ${clauses.join("; ")}. Those units are kept so far. This turn `
     + "asks those rows only; the rows you answered are accepted — do not answer them again.";
-  if (grammar === "nokeepall") {
+  if (isTwoVerdictGrammar(grammar)) {
     return [
       opening,
       "",

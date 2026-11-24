@@ -8,20 +8,15 @@
  * imported. The call and its result are the host's own; nothing here replaces a
  * native read (ADR-0007).
  *
- * Both declared tools now have an execution path. `necromancy` restores an
- * archived unit; `forget` resolves a path and line ranges against the request's
- * own snapshot and schedules the removal for the next request boundary, where
- * the engine applies it through the ledger (`forget.ts`). A build whose mount
- * supplies no forget handler does not register the tool, so the model is never
- * offered a tool that would fail.
+ * The one declared tool now has an execution path. `necromancy` restores an
+ * archived unit. The manual `forget` tool is gone (ISSUE-518): this adapter
+ * offers no tool that schedules a removal.
  */
 
 import type { NodeId, RecallId, RecallRecord, ToolSpec } from '@cremator/core';
 import {
   RECALL_TOOL_DESCRIPTION, canonicalManifestBytes, normalizeRecallId, sha256Sync,
 } from '@cremator/core';
-import { forgetAnswerText } from './forget.js';
-import type { OpencodeForgetValue } from './forget.js';
 import type { OpencodeToolContext, OpencodeToolDefinition } from './host.js';
 
 /**
@@ -59,26 +54,11 @@ function deepFreeze<T>(value: T): T {
 }
 
 /**
- * The two additive tools the contract names (`ToolSpec`). Nothing replaces a
- * native read (ADR-0007); they sit beside the host's own tools. The inventory
- * and every nested `parameters` object are deep-frozen (ISSUE-269).
+ * The additive tool the contract names (`ToolSpec`). Nothing replaces a native
+ * read (ADR-0007); it sits beside the host's own tools. The inventory and every
+ * nested `parameters` object are deep-frozen (ISSUE-269).
  */
 export const OPENCODE_TOOL_SPECS: readonly ToolSpec[] = deepFreeze<readonly ToolSpec[]>([
-  { name: 'forget',
-    description: 'marks listed content as not retained; give the path and line ranges. '
-      + 'A necromancy id restores the exact original bytes.',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'the path the content came from' },
-        ranges: { type: 'array', items: {
-          type: 'object',
-          properties: { startLine: { type: 'integer' }, endLine: { type: 'integer' } },
-          required: ['startLine', 'endLine'], additionalProperties: false,
-        } },
-      },
-      required: ['path'], additionalProperties: false,
-    } },
   { name: 'necromancy',
     description: RECALL_TOOL_DESCRIPTION_OPENCODE,
     parameters: {
@@ -162,15 +142,24 @@ export function recallOutputText(output: OpencodeRecallOutput): string {
     byteLength: output.byteLength, parts: output.parts });
 }
 
-/** What the adapter can answer today. An absent handler means an unregistered tool. */
+/** What the adapter can answer today. */
 export interface OpencodeToolSources {
-  readonly recall: (id: RecallId) => Promise<RecallRecord>;
   /**
-   * The manual forget handler: it resolves the arguments and answers a
-   * scheduled request or the lookup's own refusal. Absent means the `forget`
-   * tool is not registered.
+   * The caller's own session id from the host tool context, or `null` when the
+   * context named none (ISSUE-522). It is threaded through, never remembered:
+   * the handler refuses an ambiguous multi-session host by name.
    */
-  readonly forget?: (args: unknown) => Promise<OpencodeForgetValue>;
+  readonly recall: (id: RecallId, sessionId: string | null) => Promise<RecallRecord>;
+}
+
+/**
+ * The session the host's tool context names, or `null` (ISSUE-522). A context
+ * with no usable id is `null`, and the handler refuses an ambiguous host rather
+ * than acting on a guessed session.
+ */
+function contextSessionId(context: OpencodeToolContext | undefined): string | null {
+  const id = context?.sessionID;
+  return typeof id === 'string' && id.length > 0 ? id : null;
 }
 
 /**
@@ -209,34 +198,11 @@ export function createOpencodeTool(sources: OpencodeToolSources): OpencodeToolDe
     // copy immutable to the same depth as the inventory (ISSUE-269).
     input: deepFreeze(structuredClone(recallSpec.parameters)),
     options: Object.freeze({ codemode: false }),
-    execute: async (input: unknown, _context: OpencodeToolContext) => {
+    execute: async (input: unknown, context: OpencodeToolContext) => {
       const id = recallIdArg(input);
-      return { content: recallOutputText(recallText(await sources.recall(id), id)) };
+      return { content: recallOutputText(
+        recallText(await sources.recall(id, contextSessionId(context)), id)) };
     },
-  });
-}
-
-/**
- * The manual `forget` tool, when the mount supplies a handler. Its execution
- * answers the scheduled/refused value as text; the removal itself lands at the
- * next request boundary through the engine, never inside the call.
- *
- * `options.codemode: false` is what makes the tool visible by name, exactly as
- * it is for `necromancy`.
- */
-export function createOpencodeForgetTool(sources: OpencodeToolSources): OpencodeToolDefinition | null {
-  const forget = sources.forget;
-  if (forget === undefined) return null;
-  const spec = OPENCODE_TOOL_SPECS.find(candidate => candidate.name === 'forget');
-  if (spec === undefined) throw new Error('The forget spec left the inventory');
-  return Object.freeze({
-    name: spec.name,
-    description: spec.description,
-    input: deepFreeze(structuredClone(spec.parameters)),
-    options: Object.freeze({ codemode: false }),
-    execute: async (input: unknown, _context: OpencodeToolContext) => ({
-      content: forgetAnswerText(await forget(input)),
-    }),
   });
 }
 

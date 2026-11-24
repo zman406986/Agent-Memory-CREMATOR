@@ -56,7 +56,7 @@
  *   }
  */
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -428,7 +428,14 @@ function main() {
   else if (rewritten.totals.unmapped > 0) summary.verdict = 'unmapped';
   else if (targetsFatal && targets.missing.length > 0) summary.verdict = 'missing-targets';
 
-  if (opts.out !== null) writeFileSync(opts.out, serialized);
+  // A leaked script is never written: the refusal would exit 3 and leave the
+  // file behind as if it were usable (ISSUE-581). The write is temp + rename
+  // so a kill mid-write cannot leave a half script either.
+  if (opts.out !== null && summary.verdict !== 'leak') {
+    const temp = `${opts.out}.${String(process.pid)}.tmp`;
+    writeFileSync(temp, serialized);
+    renameSync(temp, opts.out);
+  }
 
   if (opts.json) process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
   else printHuman(summary);

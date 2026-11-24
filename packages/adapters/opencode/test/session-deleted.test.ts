@@ -298,7 +298,7 @@ test('ISSUE-393: a hook during close() neither re-opens a released session nor t
   }
 });
 
-test('ISSUE-407: a released id is not reopened by late event, tool or idle traffic', async () => {
+test('ISSUE-407: a released id is not reopened by late event or idle traffic', async () => {
   const lines = journalLines();
   const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
@@ -313,8 +313,6 @@ test('ISSUE-407: a released id is not reopened by late event, tool or idle traff
 
     // Late traffic names the released id; none of these lanes may reopen it.
     await mount.event({ type: 'session.idle', data: { sessionID: SES_A } });
-    const forgot = await mount.forget(SES_A, { path: 'NOTES.md' });
-    assert.equal(forgot.status, 'refused', 'a tool call for a released id is refused');
     await mount.idle(SES_A);
     await mount.cremate(SES_A);
     assert.equal(opens(), 1, 'no late lane opened a second ledger');

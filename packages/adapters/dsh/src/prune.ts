@@ -32,10 +32,10 @@
  */
 import { EpisodeTracker, UnitTracker } from '@cremator/core';
 import {
-  applyPruneAnswers, computeInvalidation, ForkError, planPrunePass, seedFork,
+  applyPruneAnswers, computeInvalidation, ForkError, isTwoVerdictGrammar, planPrunePass, seedFork,
 } from '@cremator/core';
 import type {
-  DedupeClasses, Episode, PruneAskGrammar, PruneCallFacts,
+  DedupeClasses, Episode, PrunePlanGrammar, PruneCallFacts,
   PrunePassApplication, PrunePassPlan, ProcessingUnit, SessionSnapshot, ToolResultNode,
   UnitId, WireAnswer, WireFork,
 } from '@cremator/core';
@@ -51,6 +51,7 @@ import { journalPruneRecord, recordOnlyOutcome } from './prune-record.js';
 import type { PruneRefusalReason, RecordOnlyPruneOutcome } from './prune-record.js';
 import { retryRefusedRows } from './prune-retry.js';
 import type { JudgeRoute } from './route.js';
+import { dshRetentionOf } from './retention.js';
 
 export type { PruneRefusalReason, PruneSummaryTrace, RecordOnlyPruneOutcome } from './prune-record.js';
 export { PRUNE_COMMAND } from './prune-record.js';
@@ -103,7 +104,7 @@ export interface RecordOnlyPruneOptions {
    * bytes. The plan carries it, so the table, correction and estimate paths all
    * select the same one.
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
   /**
    * Whether this pass's first table ask is the session's first table ask
    * (ISSUE-508). The mount reads it from its persisted `tableAskFired` fact:
@@ -190,7 +191,20 @@ export async function runRecordOnlyPrune(
   // it was handed, so a later `/cremate` or automatic pass can table and remove
   // history this mount did not observe land.
   const snapshot = options.snapshot;
-  const units = new UnitTracker({ sessionId, barBytes: options.barBytes }).units(snapshot);
+  const allUnits = new UnitTracker({ sessionId, barBytes: options.barBytes }).units(snapshot);
+  // ISSUE-519: the two retention rules gate the units BEFORE any plan exists. A
+  // unit whose node is the recall tool's own answer, or whose text another live
+  // result already contains, keeps: it is not planned, it is not asked about,
+  // and the journal names the marker. The nodes stay in the snapshot, so a
+  // retained result still serves as a witness for every other unit.
+  const units = allUnits.filter(unit => {
+    const verdict = dshRetentionOf(unit.nodeId, options.transcript);
+    if (verdict === null) return true;
+    journal('prune-retained', { sessionId, round: options.round, unitId: unit.id,
+      nodeId: unit.nodeId, byteLength: unit.byteLength, reason: verdict.code,
+      containedInNodeId: verdict.containedInNodeId });
+    return false;
+  });
   const nodes = nodesOf(snapshot);
   const episodes: readonly Episode[] = new EpisodeTracker({
     noNewPathSteps: options.episodeNoNewPathSteps,
@@ -326,14 +340,14 @@ export async function runRecordOnlyPrune(
  * `refusedCount` decision. The count travels in the attempt totals instead.
  */
 function mergeSettled(plan: PrunePassPlan, loop: TableLoopOutcome): PrunePassApplication {
-  // ISSUE-221: under `nokeepall` a full-range `keeplines` was normalized to a
-  // clean `keepall` before the carry scheduler saw it. Re-encoding that keep as
-  // `{"keepall":true}` would make core's own gate read it as an action this
-  // grammar does not offer, so the keep is not sent back at all: a keep verdict
-  // produces no removal, and the merge keeps every unit with no verdict. Every
-  // other answer is handled exactly as before.
+  // ISSUE-221: under a two-verdict grammar a full-range `keeplines` was
+  // normalized to a clean `keepall` before the carry scheduler saw it.
+  // Re-encoding that keep as `{"keepall":true}` would make core's own gate read
+  // it as an action this grammar does not offer, so the keep is not sent back at
+  // all: a keep verdict produces no removal, and the merge keeps every unit with
+  // no verdict. Every other answer is handled exactly as before.
   const answered = [...loop.kept.entries()]
-    .filter(([, row]) => plan.grammar !== 'nokeepall'
+    .filter(([, row]) => !isTwoVerdictGrammar(plan.grammar)
       || row.answer.verdict.action !== 'keepall')
     .sort(([left], [right]) => left - right);
   const text = answered.length === 0 ? [] : [JSON.stringify(Object.fromEntries(

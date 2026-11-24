@@ -482,8 +482,10 @@ describe('matchers', () => {
     assert.equal(classified.toolResults, 1);
   });
 
-  it('fails a script with an invalid regex at match time', () => {
-    assert.throws(() => matches({ last_user_text_matches: '(' }, ctx), /invalid last_user_text_matches regex/u);
+  it('treats an invalid regex as a row that does not match', () => {
+    // The script is refused at load, so the request path never throws
+    // (ISSUE-581).
+    assert.equal(matches({ last_user_text_matches: '(' }, ctx), false);
   });
 });
 

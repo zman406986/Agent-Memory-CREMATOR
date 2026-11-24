@@ -34,7 +34,7 @@ import {
   ForkError, appendAsk, appendVerdict, pruneCorrectionMessage, summarizeTableAttempt,
 } from '@cremator/core';
 import type {
-  PruneAnswerRejection, PruneAskGrammar, PruneAskRow, PruneCorrectionReason, PruneTableAttempt,
+  PruneAnswerRejection, PrunePlanGrammar, PruneAskRow, PruneCorrectionReason, PruneTableAttempt,
   WireFork,
 } from '@cremator/core';
 import { parseTableReply } from './judge-tables.js';
@@ -65,7 +65,7 @@ export interface CorrectionTurnOptions {
    * no closing line), and a row refused `action-not-in-grammar` is never
    * re-asked.
    */
-  readonly grammar?: PruneAskGrammar;
+  readonly grammar?: PrunePlanGrammar;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
 }

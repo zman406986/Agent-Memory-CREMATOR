@@ -106,6 +106,15 @@ export type EntryAskGrammar = "3option" | "two-option" | "jsonl-20" | "jsonl-20-
  */
 export type PruneAskGrammar = "3option" | "nokeepall";
 
+/**
+ * The grammar a prune plan's label carries (ISSUE-522). The bulk grammars above
+ * plus the entry contract's own two-verdict spelling, `jsonl-20-nokeepall`: an
+ * adapter whose table prompt IS that entry message labels its plan with it, so
+ * the label names the grammar the ask actually stated. It is a label, not a new
+ * answer shape — `isTwoVerdictGrammar` decides the gate for every spelling.
+ */
+export type PrunePlanGrammar = PruneAskGrammar | "jsonl-20-nokeepall";
+
 export interface RacoonsConfig {
   readonly thresholds: Thresholds;
   readonly freshZone: FreshZoneConfig;
@@ -155,8 +164,11 @@ export interface RacoonsConfig {
    * default (ADR-0056): it offers only `forgetall` and `keeplines`, and a whole
    * unit is kept as a `keeplines` over its whole range with summary `None`.
    * `3option`, the original contract byte for byte, stays selectable by name.
+   * `jsonl-20-nokeepall` is accepted too (ISSUE-522): it is the entry message's
+   * spelling of the same two-verdict contract, so a host that names it gets the
+   * entry asset and the two-verdict gate.
    */
-  readonly pruneAskGrammar?: PruneAskGrammar;
+  readonly pruneAskGrammar?: PrunePlanGrammar;
 }
 
 /** The default size floor: the calibration note's average of its nine rows. */
@@ -298,11 +310,14 @@ export function validateConfig(config: unknown): string[] {
     }
   }
   // The bulk ask's grammar is optional (absent is `3option`); a declared value
-  // must be one this build can render and read.
+  // must be one this build can render and read. `jsonl-20-nokeepall` names the
+  // entry asset for the same two-verdict contract (ISSUE-522).
   if (config["pruneAskGrammar"] !== undefined) {
     const grammar = config["pruneAskGrammar"];
-    if (grammar !== "3option" && grammar !== "nokeepall") {
-      problems.push('pruneAskGrammar must be "3option" or "nokeepall" when declared.');
+    if (grammar !== "3option" && grammar !== "nokeepall"
+      && grammar !== "jsonl-20-nokeepall") {
+      problems.push('pruneAskGrammar must be "3option", "nokeepall" or '
+        + '"jsonl-20-nokeepall" when declared.');
     }
   }
   // Optional with a default: absent is valid, a declared value must be a count.

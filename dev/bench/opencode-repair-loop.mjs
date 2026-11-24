@@ -215,7 +215,13 @@ function main() {
       process.stderr.write(`launch produced no result.json at ${arm}; stopping\n`);
       process.exit(1);
     }
-    const result = JSON.parse(readFileSync(join(arm, 'result.json'), 'utf8'));
+    let result;
+    try {
+      result = JSON.parse(readFileSync(join(arm, 'result.json'), 'utf8'));
+    } catch (error) {
+      process.stderr.write(`result.json at ${arm} did not parse (${error instanceof Error ? error.message : String(error)}); stopping\n`);
+      process.exit(1);
+    }
     process.stdout.write(`  exit=${String(run.status)} passed=${String(result.passed)} removals=${String(result.removals?.applied ?? 'null')} final=${JSON.stringify(result.task?.finalText ?? '').slice(0, 120)}\n`);
     prior = arm;
   }

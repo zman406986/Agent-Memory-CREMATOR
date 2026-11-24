@@ -42,6 +42,12 @@ export const CREMATOR_JOURNAL_KINDS = [
   // the prune pass (ISSUE-022; ADR-0028: the ONE table ask left)
   'prune-requested', 'prune-off', 'prune-unseeded', 'prune-plan', 'prune-seed',
   'prune-seed-refused', 'prune-send-refused', 'prune-skip', 'prune-table',
+  // a unit the two retention rules keep out of the pass (ISSUE-519): `reason`
+  // is `recall-answer-retained` for the recall tool's own answer, or
+  // `contained-in-live-result` with `containedInNodeId` naming the longer live
+  // result whose bytes already carry this unit. The unit was never planned, so
+  // the pass frees none of its bytes.
+  'prune-retained',
   // the bulk prune's ask COST (ISSUE-178): one line per table send, answered or
   // refused, carrying the host's `usage` reading under the same field names the
   // entry lane's `entry-ask` / `entry-ask-refused` rows use. Additive: the
@@ -69,7 +75,9 @@ export const CREMATOR_JOURNAL_KINDS = [
   // an `assistant/message` step that carried no usage row at all
   'usage-reconciled', 'usage-missing',
   // the manual forget tool's apply leg (G1, ISSUE-045 D2): one line per request
-  // the mount drained at a boundary, and one for a drain that threw
+  // the mount drained at a boundary, and one for a drain that threw. A thrown
+  // process applied nothing, so the request is re-queued and its durable record
+  // stands: the `forget-error` row carries `requeued: true` (ISSUE-523 item 3).
   'forget', 'forget-error',
   // the entry checkpoint's ask (G7, ISSUE-056 C6a; ADR-0022): `entry-ask`
   // carries the answer, its action fields and the observed ask cost;
@@ -103,7 +111,10 @@ export const CREMATOR_JOURNAL_KINDS = [
   'entry-resume-recovered',
   // a boundary's flush of committed-but-unpublished append applications
   // (ISSUE-342) threw: `pending` counts the requests still queued for the next
-  // boundary's retry, and `message` is the host append's own error.
+  // boundary's retry, and `message` is the host append's own error. A PERMANENT
+  // failure is set aside instead of stalling the queue (ISSUE-523 item 2):
+  // `permanent: true`, `code` names it, `intentId` names the request, and
+  // `pending` counts what remains behind it.
   'append-publish-failed',
   // the durable pending-append intent (ISSUE-374) could not be written: the
   // in-memory queue still flushes this process, only the restart durability

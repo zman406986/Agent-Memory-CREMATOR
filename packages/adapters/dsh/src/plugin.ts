@@ -23,13 +23,13 @@
 import { randomUUID } from 'node:crypto';
 import {
   CharHeuristicTokenMeter, DEFAULT_CONFIG, DEFAULT_FLOOR_BYTES, Meter, RacoonsEngine,
-  batchVerdict, createDefaultRules, estimateContent, floorForModel,
+  batchVerdict, createDefaultRules, estimateContent, floorForModel, isTwoVerdictGrammar,
   landedBytesTriggerVerdict,
 } from '@cremator/core';
 import type {
   AnchorMode, Clock, ContentEstimate, EngineResult, EntryAskGrammar, EntryAskTriggerConfig,
   EntryBatchState, FreshZoneConfig, Ledger, MessageProvenance, ProtocolConfig,
-  PruneAskGrammar, RacoonsConfig, RecallId, RecallRecord, RequestPrefix, Rule,
+  PrunePlanGrammar, RacoonsConfig, RecallId, RecallRecord, RequestPrefix, Rule,
   SessionSnapshot, Thresholds, ToolResultNode, UnitId, WireRequest, ApplyReceipt, EventId,
   IntentId, PruneWindowTriggerState,
 } from '@cremator/core';
@@ -44,6 +44,8 @@ import { classifyDshTool } from './evidence.js';
 import type { DshResultFacts, DshPathObservation } from './evidence.js';
 import type { DshToolResultItem, DshTranscriptItem } from './envelope.js';
 import { toCoreEnvelope } from './envelope.js';
+import { dshRetentionOf } from './retention.js';
+import type { DshRetentionVerdict } from './retention.js';
 import { createDshPort } from './port.js';
 import type { DshApplicationPort, DshAskExchange } from './port.js';
 import type { DshEntryAnswerOutcome } from './adapter.js';
@@ -57,7 +59,7 @@ import { DEFAULT_ASK_TIMEOUT_MS, MAX_ASK_DEADLINE_MS, messageOf } from './llm-as
 import { JudgeRouteError, judgeRouteOf, normalizeJudgeRoute } from './route.js';
 import type { JudgeRoute } from './route.js';
 import { captureMainRequest, createMainWireCapture, seedRouteStale } from './main-wire.js';
-import type { MainWireCapture } from './main-wire.js';
+import type { CapturedMainRequest, MainWireCapture } from './main-wire.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
 import { createCremateCommand, cremateMarkerOf } from './cremate-command.js';
@@ -238,7 +240,7 @@ export interface RacoonsPluginConfig {
    * summary `None`, and a literal `keepall` is refused `action-not-in-grammar`
    * and keeps. The 3option bytes are unchanged.
    */
-  readonly pruneAskGrammar?: PruneAskGrammar;
+  readonly pruneAskGrammar?: PrunePlanGrammar;
   readonly minCutFreedBytes?: number;
   /**
    * Accepted and ignored (ADR-0028). The anchor arm belonged to the removed
@@ -397,7 +399,7 @@ export interface ResolvedRacoonsConfig {
    * `nokeepall` when absent, the shipped default; `3option`, the original
    * contract byte for byte, stays selectable by name.
    */
-  readonly pruneAskGrammar: PruneAskGrammar;
+  readonly pruneAskGrammar: PrunePlanGrammar;
 }
 
 /**
@@ -1165,8 +1167,9 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
     throw new Error('cremator: entryAskGrammar must be "3option", "two-option", '
       + '"jsonl-20" or "jsonl-20-nokeepall"');
   }
-  if (pruneAskGrammar !== '3option' && pruneAskGrammar !== 'nokeepall') {
-    throw new Error('cremator: pruneAskGrammar must be "3option" or "nokeepall"');
+  if (pruneAskGrammar !== '3option' && !isTwoVerdictGrammar(pruneAskGrammar)) {
+    throw new Error('cremator: pruneAskGrammar must be "3option", "nokeepall" or '
+      + '"jsonl-20-nokeepall"');
   }
   if (!isCount(minCutFreedBytes)) {
     throw new Error('cremator: minCutFreedBytes must be a non-negative safe integer');
@@ -3271,6 +3274,20 @@ export function createRacoonsMount(options: {
   }
 
   /**
+   * The retention verdict on one admitted result (ISSUE-519), or `null` when
+   * the result may be asked. Only a result the three gates above would table is
+   * subject to it: a sub-floor or un-tableable result keeps writing nothing.
+   * The capture's own item joins the read when the port has not published it
+   * yet, so the candidate is always its own first witness.
+   */
+  function entryRetentionOf(entry: RacoonsSessionEntry, capture: Capture,
+    live: readonly DshTranscriptItem[]): DshRetentionVerdict | null {
+    const items = live.some(item => item.id === capture.eventId)
+      ? live : [...live, capture.item];
+    return dshRetentionOf(capture.eventId, items);
+  }
+
+  /**
    * The landed result as a core node. The port already holds the host's own
    * item under this id after `deliverToolResult`, so its transcript is
    * authoritative; the capture is the fallback for a host that delivered
@@ -3305,9 +3322,8 @@ export function createRacoonsMount(options: {
   }
 
   /**
-   * Main's wire as the HOST SURFACE stated it at the moment ONE result landed —
-   * every live node up to and including that result's own turn, in the surface's
-   * own order (ISSUE-058 chunk P3d; the live blocker P3c-2 recorded).
+   * The live surface projected into the seed shape — every live node, or the
+   * nodes up to one result and no further (ISSUE-058 chunk P3d; ISSUE-553).
    *
    * Why a request capture is not enough: a capture holds a REQUEST, and the
    * assistant turn that made a tool call is a provider RESPONSE, not something
@@ -3317,12 +3333,19 @@ export function createRacoonsMount(options: {
    * turns in a row — the fork's `role-conflict`, which the entry lane reported
    * as a silent fail-open `no-seed` (P3c-2's live observation).
    *
-   * Why the CUT matters: a step may land several results (parallel tool calls)
-   * and the asks for them run one after another against the surface as it
-   * stands at the END of the step. The ask is about the result immediately
-   * above it (ADR-0022 §4), so an ask for all but the last would otherwise sit
-   * under a LATER result. Cutting after this result's own node gives every ask
-   * the wire state the host held when that result landed.
+   * A capture is also STALE after the product removes bytes: a turn-end
+   * `forget` replaces surface nodes after that turn's last main request was
+   * captured, so a fork from the capture would replay bytes the product already
+   * took away. The prune lane therefore projects the WHOLE surface
+   * (`stopNodeId === null`) as it stands when the ask is built, receipt and all
+   * (ISSUE-553).
+   *
+   * Why the CUT matters where there is one: a step may land several results
+   * (parallel tool calls) and the asks for them run one after another against
+   * the surface as it stands at the END of the step. The ask is about the
+   * result immediately above it (ADR-0022 §4), so an ask for all but the last
+   * would otherwise sit under a LATER result. Cutting after this result's own
+   * node gives every ask the wire state the host held when that result landed.
    *
    * It is not a second renderer: the surface nodes are re-wrapped in the host's
    * request-message shape and handed to `captureMainRequest`, the one projection
@@ -3330,19 +3353,24 @@ export function createRacoonsMount(options: {
    * and the same `[tool call <name> <args>]` rendering, so a surface seed and a
    * captured seed can never disagree about a shared turn.
    *
-   * `system` and `tools` come from the capture when one exists: they are the
-   * request's fixed prefix, and the surface carries the prompt as a leading
-   * `system/message` (the loop's `in-history` shape), which the projection keeps
-   * where main put it. No capture means no tool list, and a fork with no tools
-   * would be a different conversation — so this returns null and the caller
-   * keeps its fail-open `no-seed`.
+   * `system`, `tools` and the route come from the capture when one exists: they
+   * are the request's fixed prefix, and the surface carries the prompt as a
+   * leading `system/message` (the loop's `in-history` shape), which the
+   * projection keeps where main put it. No capture means no tool list, and a
+   * fork with no tools would be a different conversation — so this returns null
+   * and the caller keeps its fail-open `no-seed`.
    *
-   * Returns null when the surface never reaches `stopNodeId`: a prefix that
-   * cannot name its own end is not a seed for that result.
+   * Returns null when the surface never reaches `stopNodeId` (a prefix that
+   * cannot name its own end is not a seed for that result), yields no message at
+   * all, holds a node the session holds no event for, or holds a `tool/result`
+   * with no call id: an unprojectable surface is `no-seed`, never a partial
+   * guess. A node type the seed does not carry (a compaction marker, a
+   * `tool/call`, a turn edge) is skipped by name; only a node whose reply would
+   * go missing refuses the whole projection.
    */
-  function postLandingWire(session: DshMountSession, sessionId: string,
-    stopNodeId: string,
-  ): WireRequest | null {
+  function surfaceWire(session: DshMountSession, sessionId: string,
+    stopNodeId: string | null,
+  ): CapturedMainRequest | null {
     const captured = mainWire.last(sessionId);
     if (captured === null) return null;
     const nodes = Array.isArray(session.surface?.nodes) ? session.surface.nodes : [];
@@ -3350,14 +3378,23 @@ export function createRacoonsMount(options: {
     let reached = false;
     for (const seq of nodes) {
       const event = session.eventAt?.(seq);
-      if (event === undefined) continue;
+      // A node with no event is a surface this projection cannot reach for
+      // certain; the whole surface is no seed rather than a seed missing a turn.
+      if (event === undefined) return null;
       const data = isRecord(event.data) ? event.data : {};
       if (event.type === 'tool/result') {
         const callId = callIdOf(event);
-        if (callId === null) continue;
+        // A result with no call id cannot be paired with its call, so dropping
+        // it would leave an assistant tool-call with no reply — a partial seed.
+        // `observe` already refuses to give such a result an identity above;
+        // here the whole surface is no seed rather than a fork missing a turn.
+        if (callId === null) return null;
         const message = isRecord(data['message']) ? data['message'] : {};
         messages.push({ role: 'tool', toolCallId: callId, content: message['content'] });
-        if (resultNodeId(sessionId, callId) === stopNodeId) { reached = true; break; }
+        if (stopNodeId !== null && resultNodeId(sessionId, callId) === stopNodeId) {
+          reached = true;
+          break;
+        }
         continue;
       }
       const role = event.type === 'user/message' ? 'user'
@@ -3368,9 +3405,19 @@ export function createRacoonsMount(options: {
       const message = role === 'user' ? data : isRecord(data['message']) ? data['message'] : {};
       messages.push({ role, content: message['content'] });
     }
-    if (!reached || messages.length === 0) return null;
+    if (stopNodeId !== null && !reached) return null;
+    if (messages.length === 0) return null;
     return captureMainRequest({ sessionId, system: captured.wire.system,
-      tools: captured.wire.tools, messages })?.wire ?? null;
+      tools: captured.wire.tools, messages,
+      ...(captured.provider === null ? {} : { provider: captured.provider }),
+      ...(captured.model === null ? {} : { model: captured.model }) });
+  }
+
+  /** The surface wire as a request, for the entry/landing lane's `surface` slot. */
+  function postLandingWire(session: DshMountSession, sessionId: string,
+    stopNodeId: string,
+  ): WireRequest | null {
+    return surfaceWire(session, sessionId, stopNodeId)?.wire ?? null;
   }
 
   /**
@@ -3630,17 +3677,24 @@ export function createRacoonsMount(options: {
   async function runEntryAsks(entry: RacoonsSessionEntry, session: DshMountSession,
     captures: readonly Capture[], signal?: AbortSignal): Promise<void> {
     const trigger = config.entryAskTrigger;
+    // One live read for the whole step: the retention rules witness against the
+    // surface as it stands, not the landing copies (ISSUE-519).
+    const live = entry.port.transcript();
     if (trigger.mode === 'off') {
       // ADR-0050 decision 4: the product configuration. Each result the entry
       // gate WOULD have asked about gets one line saying why it was not asked;
       // a non-askable result writes nothing, exactly as a sub-floor result has
-      // always landed silently. The loop has not started, so no pending row and
-      // no landed-bytes accumulator is read or written.
+      // always landed silently. A result a retention rule keeps names that rule,
+      // which is the more specific reason it is not asked (ISSUE-519). The loop
+      // has not started, so no pending row and no landed-bytes accumulator is
+      // read or written.
       for (const capture of captures) {
         if (!entryAskable(entry, capture)) continue;
+        const retention = entryRetentionOf(entry, capture, live);
         journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
           callId: capture.item.callId, byteLength: capture.item.bytes.length,
-          reason: 'configured-off' });
+          reason: retention?.code ?? 'configured-off',
+          ...(retention === null ? {} : { containedInNodeId: retention.containedInNodeId }) });
       }
       return;
     }
@@ -3654,6 +3708,16 @@ export function createRacoonsMount(options: {
     const standdown = await ledgerStanddown(entry);
     for (const capture of captures) {
       if (!entryAskable(entry, capture)) continue;
+      // ISSUE-519: a result the retention rules keep is never offered. It lands
+      // whole and the line names the marker, ahead of the seam conditions that
+      // would otherwise describe a removal nobody may make.
+      const retention = entryRetentionOf(entry, capture, live);
+      if (retention !== null) {
+        journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
+          callId: capture.item.callId, byteLength: capture.item.bytes.length,
+          reason: retention.code, containedInNodeId: retention.containedInNodeId });
+        continue;
+      }
       if (llm === undefined) {
         journal('entry-ask-off', { sessionId: entry.sessionId, eventId: capture.eventId,
           callId: capture.item.callId, byteLength: capture.item.bytes.length,
@@ -3771,6 +3835,10 @@ export function createRacoonsMount(options: {
     // changed, is dropped by name and answers nothing.
     const live: { readonly capture: Capture; readonly node: ToolResultNode;
       readonly unitId: UnitId }[] = [];
+    // ISSUE-519: the retention rules are re-read at the fire, not only at
+    // admission. A result that landed after this row can already carry its text,
+    // and an ask about it would offer a removal that frees nothing.
+    const liveItems = entry.port.transcript();
     for (const [position, row] of rows.entries()) {
       const node = liveTranscriptNodeOf(entry, row.capture);
       if (node === null) {
@@ -3798,6 +3866,14 @@ export function createRacoonsMount(options: {
         journal('entry-ask-off', { sessionId: entry.sessionId, eventId: row.capture.eventId,
           callId: row.capture.item.callId, unitId, byteLength: node.bytes.length,
           rowIndex: position + 1, batchSize: rows.length, reason: 'no-quotes' });
+        continue;
+      }
+      const retention = entryRetentionOf(entry, row.capture, liveItems);
+      if (retention !== null) {
+        journal('entry-ask-off', { sessionId: entry.sessionId, eventId: row.capture.eventId,
+          callId: row.capture.item.callId, unitId, byteLength: node.bytes.length,
+          rowIndex: position + 1, batchSize: rows.length, reason: retention.code,
+          containedInNodeId: retention.containedInNodeId });
         continue;
       }
       live.push({ capture: row.capture, node, unitId });
@@ -3927,6 +4003,9 @@ export function createRacoonsMount(options: {
             callId: row.capture.item.callId, unitId: row.unitId,
             code: 'compaction-generation-changed',
             askGeneration, compactionGeneration: entry.compactionGeneration,
+            ...(outcome.raw === undefined
+              ? {}
+              : { raw: outcome.raw.slice(0, ENTRY_ASK_REFUSED_RAW_CHARS) }),
             retried: outcome.retried, turns: outcome.turns.length,
             reason: 'the host compacted during the ask, so the answer names an array that no longer exists; '
               + 'the exchange was not appended and the unit keeps' });
@@ -4006,6 +4085,12 @@ export function createRacoonsMount(options: {
             ...(read === undefined || read.wireCode === undefined || read.wireCode === null
               ? {}
               : { wireCode: read.wireCode }),
+            // The answer text is the one fact that splits a parser defect from
+            // an unreadable-answer shape; an all-unreadable batch would
+            // otherwise leave no text at all (ISSUE-523 item 5).
+            ...(outcome.raw === undefined
+              ? {}
+              : { raw: outcome.raw.slice(0, ENTRY_ASK_REFUSED_RAW_CHARS) }),
             retried: outcome.retried, turns: outcome.turns.length, batchIndex: position + 1 });
           continue;
         }
@@ -4415,9 +4500,13 @@ export function createRacoonsMount(options: {
           },
           ...(options.llm === undefined ? {} : { llm: options.llm }),
           route: () => resolveRoute(entry.host ?? session),
-          // The capture main's last sent request (ISSUE-027, ADR-0010): a prune
-          // ask is a fork of it, never a re-render.
-          seed: () => mainWire.last(entry.sessionId),
+          // ISSUE-553: the seed is a projection of the LIVE surface, not the
+          // capture. A turn-end `forget` replaces the surface after that turn's
+          // last main request was captured, so a fork from the capture would
+          // replay bytes the product already removed. No capture, or a surface
+          // the projection cannot reach, is the named `no-seed` path — never a
+          // partial fork.
+          seed: () => surfaceWire(session, entry.sessionId, null),
           journal,
           timeoutMs: config.judgeTimeoutMs,
           // ISSUE-405: the same host pre-step signal the entry ask receives
@@ -4632,8 +4721,14 @@ export function createRacoonsMount(options: {
         result = await entry.engine.process({ kind: 'forget', eventId: pending.eventId,
           request: pending.request });
       } catch (error) {
+        // ISSUE-523 item 3: a thrown process applied nothing, so the request
+        // goes back on the queue and its durable record stands. Clearing the
+        // owed-forget fact here would lose an accepted forget that never
+        // applied; the next boundary retries it, and the engine dedupes by
+        // event id if the throw landed a partial write.
+        entry.pendingForgets.push(pending);
         journal('forget-error', { sessionId: entry.sessionId, eventId: pending.eventId,
-          unitId: pending.unitId,
+          unitId: pending.unitId, requeued: true,
           message: error instanceof Error ? error.message : String(error) });
         continue;
       }
@@ -4646,8 +4741,10 @@ export function createRacoonsMount(options: {
       outcomes.push(result);
     }
     // ISSUE-417: the queue is empty again, so the durable owed-forget fact goes
-    // with it. A failed clear leaves the row for a remount to replay; the engine
-    // dedupes by event id, so a replay of an applied forget applies nothing.
+    // with it. A failed clear leaves the row for a remount to replay, and a
+    // thrown process re-queued its request above, so the file keeps exactly the
+    // requests that never applied; the engine dedupes by event id, so a replay
+    // of an applied forget applies nothing.
     // Only a boundary that actually drained something rewrites the file; a
     // forget that landed during the drain was already persisted by the queue.
     const target = targets.get(entry.sessionId);
@@ -4840,7 +4937,7 @@ export function createRacoonsMount(options: {
     await refreshBoundaryWindow(entry, signal);
     // Retry any append an earlier boundary committed but never landed
     // (ISSUE-342): a failed publishAppend stays queued until it succeeds.
-    try { flushAppends(session, entry, config); }
+    try { flushAppends(session, entry, config, journal); }
     catch (error) {
       journal('append-publish-failed', { sessionId: entry.sessionId,
         pending: entry.pendingAppends.length,
@@ -5018,7 +5115,7 @@ export function createRacoonsMount(options: {
     // one-shot run; it re-arms and persists, but it never fires a pass
     // (ADR-0072).
     await refreshBoundaryWindow(entry);
-    try { flushAppends(session, entry, config); }
+    try { flushAppends(session, entry, config, journal); }
     catch (error) {
       journal('append-publish-failed', { sessionId: entry.sessionId,
         pending: entry.pendingAppends.length,
@@ -5205,7 +5302,7 @@ export function createRacoonsMount(options: {
     if (entry === undefined) return;
     const session = entry.host;
     if (session === null) return;
-    try { flushAppends(session, entry, config); }
+    try { flushAppends(session, entry, config, journal); }
     catch (error) {
       journal('append-publish-failed', { sessionId: entry.sessionId,
         pending: entry.pendingAppends.length,
@@ -5284,7 +5381,7 @@ export function createRacoonsMount(options: {
         await drainOtherEndings(session.id, registration);
         return;
       }
-      try { flushAppends(session, entry, config); }
+      try { flushAppends(session, entry, config, journal); }
       catch (error) {
         journal('append-publish-failed', { sessionId: entry.sessionId,
           pending: entry.pendingAppends.length,
@@ -5345,27 +5442,96 @@ export function createRacoonsMount(options: {
 /**
  * Flush the append applications the port committed but the host may not hold
  * yet (ISSUE-342), in commit order. A request leaves the queue only once
- * `publishAppend` succeeds; a throw propagates with the failed request still
- * at the head, so the next boundary retries it (idempotent by record id)
- * instead of letting the ledger claim applied while the surface lacks the
- * records. Once the queue drains, the durable intent is cleared (ISSUE-374):
- * a death mid-flush leaves the durable record standing, and the replay skips
- * whatever already landed, so clearing only at a full drain is safe.
+ * `publishAppend` succeeds; a transient throw propagates with the failed
+ * request still at the head, so the next boundary retries it (idempotent by
+ * record id) instead of letting the ledger claim applied while the surface
+ * lacks the records. Once the queue drains, the durable intent is cleared
+ * (ISSUE-374): a death mid-flush leaves the durable record standing, and the
+ * replay skips whatever already landed, so clearing only at a full drain is
+ * safe.
+ *
+ * ISSUE-523 item 2: a PERMANENT failure at the head is set aside instead of
+ * stalling the rows behind it. A record the host can never accept (no record
+ * id, or bytes that are not bytes) or a throw that states its own permanence
+ * (`permanent: true`, or a `code` this mount treats as permanent) leaves the
+ * queue with a named `append-publish-failed` row, and the flush carries on
+ * with the next request. A transient throw still stops the flush: retrying is
+ * what makes a durable intent durable.
  */
 export function flushAppends(session: DshMountSession, entry: RacoonsSessionEntry,
-  config: ResolvedRacoonsConfig): DshMountEvent[] {
+  config: ResolvedRacoonsConfig, journal?: MountJournal): DshMountEvent[] {
   const events: DshMountEvent[] = [];
   let drained = false;
-  for (;;) {
+  const setAside = (request: RacoonsApplicationRequest, code: string, message: string): void => {
+    entry.pendingAppends.shift();
+    drained = true;
+    journal?.('append-publish-failed', { sessionId: entry.sessionId, permanent: true, code,
+      intentId: request.intent.intentId, pending: entry.pendingAppends.length, message });
+  };
+  while (entry.pendingAppends.length > 0) {
     const request = entry.pendingAppends[0];
     if (request === undefined) break;
-    events.push(...publishAppend(session, request, config));
+    const poison = poisonAppendCodeOf(request);
+    if (poison !== null) {
+      setAside(request, poison, 'the request carries a record the host can never accept');
+      continue;
+    }
+    try {
+      events.push(...publishAppend(session, request, config));
+    } catch (error) {
+      const permanent = permanentAppendCodeOf(error);
+      if (permanent === null) throw error;
+      setAside(request, permanent, error instanceof Error ? error.message : String(error));
+      continue;
+    }
     entry.pendingAppends.shift();
     drained = true;
   }
   if (drained) entry.persistPendingAppends?.();
   return events;
 }
+
+/**
+ * A contract defect in one queued request that no retry can fix: a record with
+ * no id, or bytes that are not a byte array (ISSUE-523 item 2). Detected
+ * BEFORE `publishAppend` so a poison row cannot land part of its list first.
+ * `null` means the request is well-formed.
+ */
+function poisonAppendCodeOf(request: RacoonsApplicationRequest): string | null {
+  for (const record of request.application.appendRecords) {
+    if (typeof record.recordId !== 'string' || record.recordId.length === 0) {
+      return 'append-record-no-id';
+    }
+    if (!(record.bytes instanceof Uint8Array)) return 'append-record-invalid-bytes';
+  }
+  return null;
+}
+
+/**
+ * The code a thrown append states for itself when retrying cannot help, or
+ * `null` for a transient host failure (ISSUE-523 item 2). The host is the only
+ * party that knows a refusal is permanent, so it says so: `permanent: true`
+ * with its own `code`, or one of the codes this mount reads as permanent. A
+ * permission denial is not in that set: a restart may lift it, so it must state
+ * `permanent: true` before the mount sets its records aside.
+ */
+function permanentAppendCodeOf(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const value = error as { readonly permanent?: unknown; readonly code?: unknown };
+  const code = typeof value.code === 'string' && value.code.length > 0 ? value.code : null;
+  if (value.permanent === true) return code ?? 'append-publish-permanent';
+  return code !== null && PERMANENT_APPEND_CODES.has(code) ? code : null;
+}
+
+/**
+ * Host refusal codes retrying cannot resolve: the surface cannot hold the
+ * record, ever. A transient code (a lock, a busy file, a denial that a restart
+ * may lift) is absent here on purpose and stays queued; such a failure must
+ * state its own `permanent: true` to be set aside.
+ */
+const PERMANENT_APPEND_CODES: ReadonlySet<string> = new Set([
+  'unsupported', 'invalid-argument', 'invalid-record',
+]);
 
 /**
  * The queue's replay payload (ISSUE-374): every owed record in commit order,
@@ -5827,6 +5993,17 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       const warn = (message: string): void => {
         try { ctx.logger?.warn?.(`racoons: ${message}`); } catch { /* logging only */ }
       };
+      /**
+       * The wiring's own journal for a flush's set-aside row (ISSUE-523 item 2).
+       * The mount keeps its journal private; this one reaches the same sink the
+       * mount was given and swallows a sink failure exactly as the mount does.
+       */
+      const wiringJournal: MountJournal = (kind, fields): void => {
+        const emit = options.journal;
+        if (emit === undefined) return;
+        try { emit(Object.freeze({ kind, atMs: nowMs(), ...fields }) as RacoonsJournalRecord); }
+        catch { /* a sink must never alter outcomes */ }
+      };
       let mount: RacoonsMount;
       /**
        * The plan the wiring below flushes against: the live mount's own when
@@ -6128,7 +6305,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
             { turn: Number(payload.turn ?? 0), step: Number(payload.step ?? 0) },
             signal, marker?.id);
           if (stepResult.appendRequest !== null) {
-            try { flushAppends(session, stepResult.entry, wiringConfig); }
+            try { flushAppends(session, stepResult.entry, wiringConfig, wiringJournal); }
             catch (error) {
               warn(`append publish: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -6168,7 +6345,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           try {
             const turnResult = await mount.runTurnEnd(session, Number(payload.turn ?? 0));
             if (turnResult.appendRequest !== null) {
-              try { flushAppends(session, turnResult.entry, wiringConfig); }
+              try { flushAppends(session, turnResult.entry, wiringConfig, wiringJournal); }
               catch (error) {
                 warn(`turn-end append publish: ${error instanceof Error ? error.message : String(error)}`);
               }

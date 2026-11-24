@@ -129,9 +129,18 @@ export function checkAppliedSets({
 }) {
   for (const [arm, rows] of Object.entries(rowsByArm)) {
     for (const row of rows) {
-      const applied = arm === 'off'
-        ? []
-        : appliedSetAt(decisionsFor(arm, row.sessionId), row.lastTurn);
+      let applied;
+      try {
+        applied = arm === 'off'
+          ? []
+          : appliedSetAt(decisionsFor(arm, row.sessionId), row.lastTurn);
+      } catch (error) {
+        // One row whose derivation throws is a failed row, not the end of the
+        // pass: the later rows are still judged (ISSUE-581).
+        recordFailure('epoch-applied-set',
+          `${arm} ${row.tableId}: re-derivation threw: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
       const appliedSet = JSON.stringify(applied);
       const appliedSha = sha256Sync(Buffer.from(appliedSet, 'utf8'));
       if (appliedSha !== row.applied?.sha256) {

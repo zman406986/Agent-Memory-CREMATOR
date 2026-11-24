@@ -4919,7 +4919,17 @@ export function ledgerState(ledgerPath) {
     events: {}, applications: {}, recallIds: [], recallParts: [], sealedEpisodeIds: [],
     appliedRemovals: null, blobRoot, error: null };
   if (ledgerPath === null || !existsSync(ledgerPath)) return absent;
-  const bytes = readFileSync(ledgerPath).length;
+  // The byte read is evidence collection too, so an unreadable file is reported
+  // by name, never thrown out of the report stage (ISSUE-581).
+  let bytes;
+  try {
+    bytes = readFileSync(ledgerPath).length;
+  } catch (unread) {
+    return { present: true, file: ledgerPath, bytes: null, readable: false, via: null, events: {},
+      applications: {}, recallIds: [], recallParts: [], sealedEpisodeIds: [],
+      appliedRemovals: null, blobRoot,
+      error: `ledger bytes unreadable: ${unread instanceof Error ? unread.message : String(unread)}` };
+  }
   try {
     return { present: true, file: ledgerPath, bytes, readable: true, via: 'evidence',
       ...readLedgerCounts(ledgerPath, true), blobRoot, error: null };
@@ -6081,7 +6091,10 @@ async function main() {
   const stderrChunks = [];
   child.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
   child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
-  const childExit = new Promise((resolveExit) => child.on('exit', (code, signal) => resolveExit({ code, signal })));
+  // Resolve on `close`, not `exit`: `exit` can fire while stdout/stderr still
+  // hold unread bytes, and the artifact is written from those chunks below
+  // (ISSUE-581). `close` fires once every stdio stream is drained.
+  const childExit = new Promise((resolveExit) => child.on('close', (code, signal) => resolveExit({ code, signal })));
 
   // ── Kill timer: armed before any wait ONLY when a positive cap was asked. ──
   // `--kill-ms 0` (the default) leaves the box OFF: the token grant is the only

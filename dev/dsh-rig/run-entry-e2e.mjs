@@ -864,6 +864,11 @@ function main() {
     process.on('exit', () => { rmSync(scenarioPath, { force: true }); });
   }
   const started = Date.now();
+  // The date dir is stamped at launch, where the driver stamps it: a run that
+  // crosses midnight still names the directory the child wrote (ISSUE-581).
+  const stamp = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  const dateDir = `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}`;
   const run = spawnSync(process.execPath, [RUN, '--scenario', scenarioPath],
     { encoding: 'utf8', windowsHide: true, cwd: REPO_ROOT });
   const elapsed = Date.now() - started;
@@ -877,10 +882,8 @@ function main() {
     process.exit(1);
   }
 
-  // The scenario's date-dir name is part of the driver's contract.
-  const stamp = new Date();
-  const pad = (value) => String(value).padStart(2, '0');
-  const dateDir = `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}`;
+  // The scenario's date-dir name is part of the driver's contract; it is the
+  // stamp taken before the launch above.
   const evidence = join(REPO_ROOT, 'scratchpad', 'dsh-rig', `${dateDir}-entry-e2e`);
   const racoonsDir = join(evidence, 'racoons');
   const requests = readJsonl(join(evidence, 'requests.jsonl'));

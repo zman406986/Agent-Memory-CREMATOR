@@ -61,7 +61,9 @@ export function proofSubjects(context: RuleContext): readonly ProofSubject[] {
     if (node === undefined || node.kind !== "tool-result") continue;
     if (node.evidence.kind !== "read") continue;
     // A proof removal's node index is its cut; ADR-0012 refuses a cut below a
-    // real warm watermark, so nothing below it is planned.
+    // real warm watermark, so nothing below it is planned. The fence is the
+    // host's cache fact, never an install boundary: a read that predates the
+    // first mount is a proof subject like any other (ADR-0069, ISSUE-523).
     if (snapshot.cache.kind === "warm" && index < context.freshZone.startNodeIndex) continue;
     subjects.push({ unit, node, index });
   }

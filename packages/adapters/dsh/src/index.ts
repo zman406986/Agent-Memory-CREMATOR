@@ -36,7 +36,7 @@ export type {
   DshSurfaceType,
 } from './revert.js';
 export {
-  DSH_TOOL_SPECS, createDshTools, dshToolSpecs, recallText, registerDshTools,
+  DSH_RECALL_TOOL_NAME, DSH_TOOL_SPECS, createDshTools, dshToolSpecs, recallText, registerDshTools,
 } from './tools.js';
 export type {
   DshRecallOutput, DshRecallPart, DshToolHost, DshToolRegistration, DshToolSources,
@@ -55,6 +55,10 @@ export {
 export type {
   DshForgetDecision, DshForgetRefusal, DshForgetScheduled, DshForgetValue,
 } from './forget-tool.js';
+// The two retention rules every removal path clears (ISSUE-519). Exported so a
+// rig can read the verdict a unit would get without driving a mount.
+export { dshRetentionOf } from './retention.js';
+export type { DshRetentionCode, DshRetentionVerdict } from './retention.js';
 export { createDshAdapter } from './adapter.js';
 export type {
   DshAdapter, DshAdapterOptions, DshAdapterPort, DshEngine, DshEntryAnswerOutcome,

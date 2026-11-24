@@ -510,6 +510,16 @@ export interface OpencodeAppliedPlan {
    * pass id survive every re-application.
    */
   readonly receiptTexts?: ReadonlyMap<string, string>;
+  /**
+   * The units this plan removed PARTIALLY (a `keeplines` verdict or a ranged
+   * `forget`), by node id (ISSUE-521 item 3). A banked removal is re-applied as
+   * a whole-unit `forgetall` on the next rebuilt request; for a partial removal
+   * that would over-remove the lines the request kept, so the re-apply must not
+   * invent a whole-unit removal for a node this list names. A row written
+   * before this field existed cannot tell, and the mount reads that absence as
+   * "whole unit", the pre-521 behaviour.
+   */
+  readonly partial?: readonly string[];
 }
 
 /**

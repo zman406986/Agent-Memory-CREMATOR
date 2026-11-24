@@ -4,7 +4,7 @@ import type {
   UnitId,
 } from '@cremator/core';
 import { createDshCapabilities } from './capabilities.js';
-import type { DshToolResultItem } from './envelope.js';
+import type { DshToolResultItem, DshTranscriptItem } from './envelope.js';
 import { decideForget, forgetAnswer, forgetNotDurable, forgetUnavailable } from './forget-tool.js';
 import type { DshForgetDecision, DshForgetValue } from './forget-tool.js';
 import type { DshAskExchange, DshEntryApplyOutcome, DshEntryRefusal } from './port.js';
@@ -30,6 +30,12 @@ export interface DshEngine {
 }
 
 export interface DshAdapterPort extends ApplicationPort {
+  /**
+   * The live items the host surface holds right now. The retention rules read
+   * them before a manual forget is scheduled (ISSUE-519): the recall tool's own
+   * answer and a result another live result contains are never removed.
+   */
+  transcript(): readonly DshTranscriptItem[];
   /**
    * Deliver one landed result, unchanged (ISSUE-058 chunk P3a; ADR-0022 §2).
    * The port hands the engine the node the host already wrote; it never stages,
@@ -171,6 +177,10 @@ export function createDshAdapter(options: DshAdapterOptions): DshAdapter {
       const snapshot = await port.snapshot();
       const decision = decideForget({
         snapshot, sessionId: snapshot.sessionId, request,
+        // ISSUE-519: the retention rules read the same live surface every other
+        // removal path reads, so a manual forget cannot take the recall answer
+        // or a result another live result already carries.
+        live: port.transcript(),
       });
       if (decision.status === 'scheduled') {
         // ISSUE-417: the queue makes the request durable before this tool

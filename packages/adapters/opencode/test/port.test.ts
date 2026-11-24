@@ -185,7 +185,16 @@ test('snapshot() carries the corpus derivation, with the corpus\'s own counts', 
   for (const node of snapshot.nodes) {
     assert.ok(node.id.startsWith(`oc:${corpus.sessionId}:`), `${node.id} is not host-keyed`);
   }
-  assert.deepEqual(snapshot, deriveOpencodeSnapshot(messages, { sessionId: corpus.sessionId }).snapshot);
+  // ISSUE-522: the port adds the per-path coverage rows the engine plans against
+  // (`CoverageMeter`), so every other field still equals the raw derivation.
+  const { pathCoverage, ...rest } = snapshot;
+  assert.deepEqual(rest, deriveOpencodeSnapshot(messages, { sessionId: corpus.sessionId }).snapshot);
+  assert.ok(pathCoverage !== undefined && pathCoverage.length > 0,
+    'the snapshot carries per-path coverage rows');
+  for (const row of pathCoverage) {
+    assert.equal(typeof row.pathKey, 'string');
+    assert.equal(row.bytes, row.hitBytes + row.missBytes + row.unknownBytes);
+  }
 
   const minimal = createOpencodePort({ sessionId, clock, messages: hostArray() });
   const small = await minimal.snapshot();

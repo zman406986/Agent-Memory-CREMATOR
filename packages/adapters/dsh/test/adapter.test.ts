@@ -127,6 +127,7 @@ const ROWS: readonly Row[] = [
         snapshot: async () => { throw new Error('Adapter queried snapshot'); },
         apply: async () => { throw new Error('Adapter applied a policy'); },
         lookupReceipt: async () => ({ status: 'unknown' }),
+        transcript: () => [],
         setColdBoundary: boundary => { boundaries.push(boundary); },
         deliverToolResult: async (eventId, result, process) => {
           assert.equal(eventId, 'opaque-event', at('the event id reaches the port'));

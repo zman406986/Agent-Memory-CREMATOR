@@ -161,7 +161,7 @@ a single-part record comes back as its archived bytes, a multi-part record as on
 `{"name":...,"input":...,"result":...}` the unit was recorded under, so the tool name and its
 arguments are part of the answer; for a text or reasoning part they are that part's exact text.
 The id is verified against the ledger's manifest-derived id; invalid UTF-8 throws instead of
-substituting. `forget` ships as a declared spec only and is never registered. The tool is
+substituting. The necromancy tool is
 registered through `context.tool.transform` with the JSON Schema from the spec, so no schema
 library is imported. It carries `options.codemode: false`: 2.4.0 offers only tools with that exact
 flag as their own entries in a request's tool table, and folds every other registered tool into

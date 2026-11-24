@@ -18,6 +18,7 @@ import type { ProcessingUnit } from "../units/types.js";
 import type { KeptLineSpan } from "../verdicts/types.js";
 import type { WireAnswer, WireVerdictErrorCode } from "../verdicts/wire.js";
 import type { PruneAnswerRejection, PruneAnswerRefusalCode } from "./ask-answer.js";
+import { isTwoVerdictGrammar } from "./ask-message.js";
 import type { DedupeClass, DedupeProof } from "./dedupe/types.js";
 import type { PrunePassPlan } from "./pass.js";
 import { gateRemovals, locateContents, unlocatedIdentities } from "./survivors.js";
@@ -293,7 +294,11 @@ function normalizeAnswers(
   verdicts: ReadonlyMap<UnitId, WireAnswer>,
   refusals: ReadonlyMap<UnitId, PrunePassRefusal>,
 ): NormalizedAnswers {
-  const twoVerdict = (plan.grammar ?? "3option") === "nokeepall";
+  // Every two-verdict spelling (`nokeepall`, `jsonl-20-nokeepall`) gates the
+  // same way; only `3option` carries the three-way contract (ISSUE-522). The
+  // predicate is core's one decision, so a future grammar id is not two-verdict
+  // by accident.
+  const twoVerdict = isTwoVerdictGrammar(plan.grammar ?? "3option");
   const units = new Map(plan.units.map(unit => [unit.id, unit] as const));
   const indices = new Map(plan.askRows.map(row => [row.unit.id, row.index] as const));
   const normalized = new Map<UnitId, WireAnswer>();

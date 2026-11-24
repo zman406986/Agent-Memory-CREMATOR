@@ -17,6 +17,13 @@ const RECALL_TOOL_DESCRIPTION_DSH = RECALL_TOOL_DESCRIPTION
   + ' `parts`, and `text` is null.';
 
 /**
+ * The recall tool's inventory name. One spelling, read by the spec that
+ * advertises it and by the retention rule that never removes its answer
+ * (ISSUE-519).
+ */
+export const DSH_RECALL_TOOL_NAME = 'necromancy';
+
+/**
  * The two additive tools the contract names (`ToolSpec`). Nothing here
  * replaces a native read (ADR-0007): `forget`/`recall` sit beside the host's
  * own tools.
@@ -46,7 +53,7 @@ export const DSH_TOOL_SPECS: readonly ToolSpec[] = Object.freeze([
       },
       required: ['path'], additionalProperties: false,
     } },
-  { name: 'necromancy',
+  { name: DSH_RECALL_TOOL_NAME,
     description: RECALL_TOOL_DESCRIPTION_DSH,
     parameters: {
       type: 'object',
@@ -149,7 +156,7 @@ function recallIdArg(args: unknown): RecallId {
  * that wires no manual-forget path never offers the tool.
  */
 export function createDshTools(sources: DshToolSources): readonly DshToolRegistration[] {
-  const recallSpec = DSH_TOOL_SPECS.find(spec => spec.name === 'necromancy');
+  const recallSpec = DSH_TOOL_SPECS.find(spec => spec.name === DSH_RECALL_TOOL_NAME);
   if (recallSpec === undefined) throw new Error('The recall spec left the inventory');
   const forget = sources.forget;
   const forgetSpec = DSH_TOOL_SPECS.find(spec => spec.name === 'forget');

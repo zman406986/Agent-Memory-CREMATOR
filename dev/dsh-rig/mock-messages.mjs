@@ -620,6 +620,27 @@ export function lastAssistantToolNames(body) {
 }
 
 /**
+ * The compiled `last_user_text_matches` pattern for one matcher, cached on the
+ * matcher object so a request does not recompile it. A pattern that will not
+ * compile is null here; `main` refuses such a script at load, so a served
+ * request never meets one (ISSUE-581).
+ * @param {object} match
+ * @returns {RegExp|null}
+ */
+const matcherRegexes = new WeakMap();
+function matcherRegex(match) {
+  if (matcherRegexes.has(match)) return matcherRegexes.get(match);
+  let re = null;
+  try {
+    re = new RegExp(match.last_user_text_matches, 'u');
+  } catch {
+    re = null;
+  }
+  matcherRegexes.set(match, re);
+  return re;
+}
+
+/**
  * Test one matcher against a request. Every present field must hold (AND).
  * @param {object} match - matcher from the script.
  * @param {{body: object, serialized: string, tools: unknown[], toolResults: number, lastUserText: string, lastAssistantToolNames?: string[]}} ctx
@@ -647,13 +668,8 @@ export function matches(match, ctx) {
     }
   }
   if ('last_user_text_matches' in match) {
-    let re;
-    try {
-      re = new RegExp(match.last_user_text_matches, 'u');
-    } catch (error) {
-      throw new Error(`rig script: invalid last_user_text_matches regex: ${error.message}`);
-    }
-    if (!re.test(ctx.lastUserText)) return false;
+    const re = matcherRegex(match);
+    if (re === null || !re.test(ctx.lastUserText)) return false;
   }
   return true;
 }
@@ -837,6 +853,18 @@ function main() {
   let script;
   try {
     script = normalizeScript(JSON.parse(readFileSync(opts.script, 'utf8')));
+    // Every pattern is compiled here, before the server starts serving: a bad
+    // one refuses the script by name instead of killing the mock mid-run
+    // (ISSUE-581).
+    for (const entry of script.replies) {
+      const pattern = entry?.match?.last_user_text_matches;
+      if (pattern === undefined) continue;
+      try {
+        new RegExp(pattern, 'u');
+      } catch (error) {
+        throw new Error(`invalid last_user_text_matches regex ${JSON.stringify(pattern)}: ${error.message}`);
+      }
+    }
   } catch (error) {
     process.stderr.write(`mock-messages: ${error.message}\n`);
     process.exit(2);

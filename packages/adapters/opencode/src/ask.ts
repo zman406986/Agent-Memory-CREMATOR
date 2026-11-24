@@ -416,12 +416,12 @@ export function buildOpencodePassPlan(input: {
     callFacts: callFactsOf(input.messages, input.sessionId),
     round: input.round,
     classes: input.classes ?? {},
-    // The plan's grammar selects the merge gate only. This adapter's reader is
-    // core's `jsonl-20-nokeepall` one, which refuses a literal `keepall` and
-    // normalizes a whole-range `keeplines` to a clean `keepall` before anything
-    // is stored, so `3option` is the core grammar that accepts every answer this
-    // mount stores (`keepall`, `forgetall`, a partial `keeplines`) unchanged.
-    grammar: '3option',
+    // The label names the grammar the prompt actually states (ISSUE-522): the
+    // entry `jsonl-20-nokeepall` message below, whose reader refuses a literal
+    // `keepall` and normalizes a whole-range `keeplines` to a clean `keepall`.
+    // Core gates every non-`3option` spelling as the same two-verdict grammar,
+    // so the label and the gate agree.
+    grammar: 'jsonl-20-nokeepall',
   });
 }
 
@@ -536,8 +536,13 @@ export function readOpencodeAskAnswer(
       throw new RangeError(`No stamp for index ${String(row.index)}.`);
     }
     if (row.status === 'refused') {
+      // ISSUE-522 (dsh parity): the reader's own finer code rides as `detail`
+      // beside the collapsed `malformed-row`, so a report can tell a
+      // `mixed-keys` row from any other malformed row. It never changes which
+      // unit is kept: `code` alone decides that.
       return { index: row.index, unitId: stamp.unitId, status: 'refused',
-        code: OPENCODE_ROW_REFUSAL_CODE[row.code], message: row.message, wireCode: null };
+        code: OPENCODE_ROW_REFUSAL_CODE[row.code], message: row.message, wireCode: null,
+        detail: row.code };
     }
     if (zeroLine.has(row.index)
       && (row.answer.action === 'keeplines' || row.answer.action === 'keepall')) {
@@ -545,7 +550,7 @@ export function readOpencodeAskAnswer(
         code: 'spans-outside-result',
         message: "The keeplines answer named a line outside that row's own 1..L; the row is "
           + 'kept.',
-        wireCode: null };
+        wireCode: null, detail: 'spans-outside-result' };
     }
     return { index: row.index, unitId: stamp.unitId, status: 'answered',
       answer: wireAnswerOf(row.answer, stamp) };

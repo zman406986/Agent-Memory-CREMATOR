@@ -1396,7 +1396,11 @@ function writeEvidence(options, name, payload) {
   const dir = evidenceDir(options);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, name);
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2));
+  // Temp + rename: a kill mid-write leaves the previous record intact instead
+  // of an empty evidence file (ISSUE-581).
+  const temp = `${file}.${String(process.pid)}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(payload, null, 2));
+  fs.renameSync(temp, file);
   return file;
 }
 

@@ -51,11 +51,14 @@
  */
 
 import type {
-  ApplicationPort, ApplyReceipt, ApplyRequest, ApplyResult, CapabilityFlags, Clock, IntentId,
-  Ledger, LedgerEvent, ReceiptLookup, SessionSnapshot,
+  ApplicationPort, ApplyReceipt, ApplyRequest, ApplyResult, ArchiveRecord, CapabilityFlags, Clock,
+  IndexedRecall, IntentId, Ledger, LedgerEvent, LedgerSourceReader, RecallId,
+  ReceiptLookup, SessionSnapshot,
 } from '@cremator/core';
+import { CoverageMeter, FileSourceReader } from '@cremator/core';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { OpencodeAppliedPlan, OpencodeAppliedPlanIndex } from './apply.js';
-import { opencodeReceiptRecallIdOfRecord } from './apply.js';
+import { opencodePartialKeeps, opencodeReceiptRecallIdOfRecord } from './apply.js';
 import { createOpencodeCapabilities } from './capabilities.js';
 import type { OpencodeToolClassifier } from './classifier.js';
 import type { OpencodeMessage } from './host.js';
@@ -172,6 +175,13 @@ export interface OpencodePortOptions extends OpencodePortSnapshotOptions {
    * from. Fail-open: a throwing callback never changes the apply's outcome.
    */
   readonly persistReceipt?: (receipt: ApplyReceipt) => void;
+  /**
+   * The folder this activation serves (ISSUE-522; dsh `workspaceRoot`). With it,
+   * an applied archive's source paths are indexed and a ledger miss may answer
+   * from an unchanged file on disk. Absent or not absolute, no reader is
+   * supplied and a miss stays `not-found`, exactly as before.
+   */
+  readonly workspaceRoot?: string;
 }
 
 interface StagedCommit {
@@ -198,6 +208,21 @@ function sameMessages(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The absolute path of a source inside the workspace root, or `null` when it
+ * cannot be read as one (ISSUE-522; dsh `sourcePathInside`). A path outside the
+ * root is refused: a source lane may name only files this mount could have read,
+ * and the reader's hash check guards the bytes either way.
+ */
+function sourcePathInside(root: string, path: string): string | null {
+  const absolute = resolve(root, path);
+  const inside = relative(root, absolute);
+  if (inside === '' || inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
+    return null;
+  }
+  return absolute;
 }
 
 /** One archived removal as the prepared event states it: the unit and its recall. */
@@ -282,6 +307,32 @@ export async function opencodeAppliedPlansFromLedger(
 ): Promise<readonly OpencodeSeededAppliedPlan[]> {
   const prepared = new Map<string, readonly BankedSource[]>();
   const plans: OpencodeSeededAppliedPlan[] = [];
+  /**
+   * ISSUE-521 item 3: the seeded row must know which removals were partial, or
+   * a restarted mount re-applies a `keeplines`/ranged removal as a whole-unit
+   * one and over-removes the kept lines. The recalled record is the durable
+   * proof: a part whose removed ranges do not cover its whole body was kept in
+   * part. Cached by recall id (one read per applied pass, not per unit) and a
+   * record that cannot be read counts as partial — the safe side, which keeps
+   * the unit whole instead of removing bytes the request asked to keep.
+   */
+  const partialOfRecall = new Map<string, boolean>();
+  const isPartial = async (nodeId: string, recallId: string): Promise<boolean> => {
+    const cached = partialOfRecall.get(recallId);
+    if (cached !== undefined) return cached;
+    let partial = true;
+    try {
+      const record = await ledger.recall(recallId as Parameters<Ledger['recall']>[0]);
+      const part = record.manifest.parts.find(candidate => candidate.source.nodeId === nodeId);
+      if (part !== undefined) {
+        const removed = part.removedRanges
+          .reduce((sum, range) => sum + (range.range.endByteExclusive - range.range.startByte), 0);
+        partial = removed < part.source.byteLength;
+      }
+    } catch { /* an unreadable record: the safe side, keep the unit whole */ }
+    partialOfRecall.set(recallId, partial);
+    return partial;
+  };
   for await (const { event } of ledger.events(sessionId)) {
     if (event.kind === 'prepared') {
       const sources = bankedSourcesOf(event);
@@ -293,12 +344,18 @@ export async function opencodeAppliedPlansFromLedger(
     if (sources === undefined || sources.length === 0) continue;
     const forgotten: string[] = [];
     const recalls: string[] = [];
+    const partial: string[] = [];
     const seen = new Set<string>();
     for (const pair of sources) {
-      if (seen.has(pair.nodeId)) continue;
-      seen.add(pair.nodeId);
-      forgotten.push(pair.nodeId);
-      recalls.push(pair.recallId);
+      const firstForNode = !seen.has(pair.nodeId);
+      if (firstForNode) {
+        seen.add(pair.nodeId);
+        forgotten.push(pair.nodeId);
+        recalls.push(pair.recallId);
+      }
+      if (await isPartial(pair.nodeId, pair.recallId) && !partial.includes(pair.nodeId)) {
+        partial.push(pair.nodeId);
+      }
     }
     if (forgotten.length === 0) continue;
     plans.push(Object.freeze({
@@ -310,6 +367,7 @@ export async function opencodeAppliedPlansFromLedger(
       receipts: Object.freeze([]),
       recalls: Object.freeze(recalls),
       forgotten: Object.freeze(forgotten),
+      ...(partial.length === 0 ? {} : { partial: Object.freeze(partial) }),
     }));
   }
   return plans;
@@ -332,6 +390,21 @@ export class OpencodeApplicationPort implements ApplicationPort {
    */
   private readonly durableReceipts = new Map<IntentId, ApplyReceipt>();
   private readonly persistReceipt: OpencodePortOptions['persistReceipt'];
+  /**
+   * Per-path byte coverage over every tool-result node this port derives
+   * (ISSUE-522; dsh's port; PRD §6.6). Recorded on every derivation, so the
+   * rows name exactly the nodes the engine plans against; recording the same
+   * node twice is a no-op, so a re-derivation cannot inflate a row.
+   */
+  private readonly coverage = new CoverageMeter();
+  /** The folder this activation serves, when it named an absolute one. */
+  private workspaceRoot: string | undefined;
+  /**
+   * The archives this port applied, with the file each part came from
+   * (ISSUE-522). A ledger miss may answer from those files while they still
+   * hold the archived bytes; nothing here caches bytes.
+   */
+  private readonly sources = new Map<RecallId, IndexedRecall>();
   /** Intents whose staged array `commit()` actually spliced onto the caller's array. */
   private readonly committedIntents = new Set<IntentId>();
   /** The applied-plan index (plan §4): a read cache seeded from the ledger at open. */
@@ -373,6 +446,10 @@ export class OpencodeApplicationPort implements ApplicationPort {
     };
     // Held by reference, not copied: `commit()` must splice the host's own array.
     this.messages = (options.messages ?? []) as OpencodeMessage[];
+    // A root that is not absolute names no file this mount could have read, so
+    // it supplies no reader (ISSUE-522; dsh's constructor).
+    this.workspaceRoot = options.workspaceRoot !== undefined && isAbsolute(options.workspaceRoot)
+      ? options.workspaceRoot : undefined;
     // Durable rows first, in applied order: the earliest pass a receipt names and
     // the units a restart must treat as banked both read this order. A row the
     // ledger seeded also names the application its intent was keyed by; it is
@@ -394,7 +471,63 @@ export class OpencodeApplicationPort implements ApplicationPort {
   }
 
   private derive(messages: readonly OpencodeMessage[]): OpencodeSnapshot {
-    return deriveOpencodeSnapshot(messages, { sessionId: this.sessionId, ...this.snapshotOptions });
+    const derived = deriveOpencodeSnapshot(
+      messages, { sessionId: this.sessionId, ...this.snapshotOptions });
+    // Every tool result the derived transcript holds is metered HERE, so the
+    // rows name exactly the nodes the engine plans against (ISSUE-522; dsh's
+    // port; PRD §6.6). `record` is idempotent per node id, so the repeated
+    // derivations a step makes cannot inflate a row.
+    for (const node of derived.snapshot.nodes) {
+      if (node.kind === 'tool-result') this.coverage.record(node);
+    }
+    return { ...derived,
+      snapshot: { ...derived.snapshot, pathCoverage: this.coverage.bytesByPath() } };
+  }
+
+  /**
+   * The source index a ledger miss may answer from, or `null` when this port
+   * cannot name the boundary (ISSUE-522; dsh `recallReader`; PRD §6.7). A port
+   * opened with no absolute workspace root supplies no reader, so a miss stays
+   * `not-found`; one that has applied no archive yet has no path to name and
+   * answers the same. Rebuilt per call and caching no bytes, so a file edited
+   * after the archive was minted is refused by the reader's own hash check.
+   */
+  recallReader(): LedgerSourceReader | null {
+    if (this.workspaceRoot === undefined || this.sources.size === 0) return null;
+    return new FileSourceReader([...this.sources.values()]);
+  }
+
+  /**
+   * Remember where each part of every archive just applied came from, so a
+   * later ledger miss can re-read it (ISSUE-522; dsh `indexSources`). The path
+   * is the tool-result node's own evidence path, resolved inside the workspace
+   * root; a part whose node is gone or whose path is unknown or outside the root
+   * drops the whole record, because a source lane may name only files this mount
+   * could have read.
+   */
+  private indexSources(archives: readonly ArchiveRecord[]): void {
+    const root = this.workspaceRoot;
+    if (root === undefined) return;
+    const paths = new Map<string, string | null>();
+    for (const node of this.derive(this.messages).snapshot.nodes) {
+      if (node.kind !== 'tool-result') continue;
+      const named = node.evidence.paths;
+      // One path or none: a multi-path result proves no per-part share, so it
+      // names no file this archive's part came from.
+      const key = named.length === 1 ? named[0]?.pathKey ?? null : null;
+      paths.set(node.id, key === null ? null : sourcePathInside(root, key));
+    }
+    for (const archive of archives) {
+      const located: string[] = [];
+      for (const part of archive.recall.manifest.parts) {
+        const path = paths.get(part.source.nodeId) ?? null;
+        if (path === null) { located.length = 0; break; }
+        located.push(path);
+      }
+      if (located.length === 0) continue;
+      this.sources.set(archive.recall.id, { recallId: archive.recall.id,
+        manifest: archive.recall.manifest, paths: located });
+    }
   }
 
   /**
@@ -581,6 +714,10 @@ export class OpencodeApplicationPort implements ApplicationPort {
     // pass reads when its own array no longer carries the line.
     const plan = this.appliedPlanOf(
       intent.intentId, request, staging.receiptTexts, staging.restores);
+    // The archives were banked before this call, and their parts' paths come from
+    // the array the stage is about to replace, so the index is built while the
+    // forgotten nodes are still addressable (ISSUE-522; dsh's apply).
+    this.indexSources(request.application.archives);
     this.staged = {
       intentId: intent.intentId, messages: staging.messages,
       baseLength: this.messages.length, receipt, plan,
@@ -638,6 +775,11 @@ export class OpencodeApplicationPort implements ApplicationPort {
       // append whose record is missing or is not the product's receipt line.
       if (recallId !== null) recalls.push(recallId);
     }
+    // ISSUE-521 item 3: the units this plan removed only partly. A banked row is
+    // re-applied as a whole-unit removal, which would over-remove the lines a
+    // `keeplines` verdict (or a ranged `forget`) kept.
+    const keeps = opencodePartialKeeps(request.application.archives);
+    const partial = keeps.status === 'derived' ? [...keeps.keeps.keys()] : [];
     return Object.freeze({
       intentId,
       planSha256: revert?.planSha256 ?? '',
@@ -646,6 +788,7 @@ export class OpencodeApplicationPort implements ApplicationPort {
       receipts: [...(revert?.appends.map(append => append.noteId) ?? [])],
       recalls: Object.freeze(recalls),
       forgotten: [...(revert?.perNode.map(entry => entry.nodeId) ?? [])],
+      ...(partial.length === 0 ? {} : { partial: Object.freeze(partial) }),
       ...(restores === undefined ? {} : { restores: [...restores] }),
       ...(rendered === undefined ? {} : { receiptTexts: new Map(rendered) }),
     });

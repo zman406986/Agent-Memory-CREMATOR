@@ -17,7 +17,8 @@ export type {
 } from './types/telemetry.js';
 export type {
   Thresholds, FreshZoneConfig, ProtocolConfig, RacoonsConfig, AnchorMode,
-  EntryAskTriggerConfig, EntryAskTriggerMode, EntryAskGrammar, PruneAskGrammar, DedupeConfig,
+  EntryAskTriggerConfig, EntryAskTriggerMode, EntryAskGrammar, PruneAskGrammar,
+  PrunePlanGrammar, DedupeConfig,
 } from './config.js';
 export {
   DEFAULT_CONFIG, DEFAULT_FLOOR_BYTES, FLOOR_BYTES_BY_MODEL, floorForModel, validateConfig,
@@ -311,7 +312,8 @@ export {
 // its shipped re-export list unchanged.
 export type { PruneAskRenderOptions } from './prune/ask-message.js';
 export {
-  PRUNE_ASK_NOKEEPALL_FINAL_LINE, pruneAskFinalLineOf, pruneAskSystemPromptOf,
+  isTwoVerdictGrammar, PRUNE_ASK_NOKEEPALL_FINAL_LINE, pruneAskFinalLineOf,
+  pruneAskSystemPromptOf,
 } from './prune/ask-message.js';
 
 // big-prune correction turn (ISSUE-113): exactly one retry per pass, over the

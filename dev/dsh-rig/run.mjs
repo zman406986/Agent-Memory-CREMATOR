@@ -1265,11 +1265,23 @@ async function main() {
     const racoonsDir = join(evidenceDir, 'racoons');
     const eventsPath = join(racoonsDir, 'cremator-events.jsonl');
     let journal = [];
+    let journalUnparsable = 0;
     try {
-      journal = readFileSync(eventsPath, 'utf8').split(/\r?\n/u).filter((line) => line !== '')
-        .map((line) => JSON.parse(line));
+      // Line by line: one torn line (a killed child's tail) must not erase the
+      // lines that did parse (ISSUE-581).
+      for (const line of readFileSync(eventsPath, 'utf8').split(/\r?\n/u)) {
+        if (line === '') continue;
+        try {
+          journal.push(JSON.parse(line));
+        } catch {
+          journalUnparsable += 1;
+        }
+      }
     } catch {
       // Missing journal: the checks below fail by name with an empty list.
+    }
+    if (journalUnparsable > 0) {
+      process.stderr.write(`notice: ${journalUnparsable} journal line(s) did not parse and were skipped\n`);
     }
     const kinds = (kind) => journal.filter((line) => line.kind === kind);
     // ADR-0013: one ledger per session under `<racoons>/storage/sessions/<id>/`.

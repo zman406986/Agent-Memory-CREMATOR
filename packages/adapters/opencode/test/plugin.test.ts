@@ -1062,12 +1062,6 @@ const REGISTRATION_ROWS: readonly Row[] = [
       assert.equal(mount.tool.input['type'], 'object', at('the tool carries JSON Schema'));
       assert.deepEqual(mount.tool.options, { codemode: false },
         at('the tool opts out of code mode, so the host names it in the request'));
-      assert.equal((mount.tool as unknown as Record<string, unknown>)['forget'], undefined,
-        at('the recall tool carries no forget handler'));
-      assert.equal(mount.forgetTool?.name, 'forget',
-        at('the declared forget tool has its own registration and handler'));
-      assert.equal(mount.forgetTool?.options?.codemode, false,
-        at('the forget tool is a direct request entry too'));
     } finally {
       void mount.close();
       cleanup(scratchDir);
@@ -1082,12 +1076,10 @@ const REGISTRATION_ROWS: readonly Row[] = [
       try {
         assert.equal(typeof host.contextHook, 'function', at('the context hook is registered'));
         assert.equal(typeof host.afterHook, 'function', at('the after hook is registered'));
-        assert.deepEqual(host.added.map(tool => tool.name), ['necromancy', 'forget'],
-          at('both declared tools are added through the editor'));
+        assert.deepEqual(host.added.map(tool => tool.name), ['necromancy'],
+          at('the one declared tool is added through the editor'));
         assert.deepEqual(host.added[0]?.options, { codemode: false },
           at('the editor receives the direct-tool flag, not a catalog-only tool'));
-        assert.deepEqual(host.added[1]?.options, { codemode: false },
-          at('the forget tool is a direct request entry too'));
         const messages = hostMessages();
         const untouched = structuredClone(messages);
         await host.contextHook?.(sessionContext(messages));
@@ -1480,7 +1472,8 @@ const ASK_ROWS: readonly Row[] = [
         assert.equal(ask[0]?.['answered'], 0, at('no row was answered'));
         assert.equal(ask[0]?.['refused'], 1, at('the keepall row was refused'));
         assert.deepEqual(ask[0]?.['parsed'], [
-          { index: 1, status: 'refused', code: 'action-not-in-grammar' },
+          { index: 1, status: 'refused', code: 'action-not-in-grammar',
+            detail: 'action-not-in-grammar' },
         ], at('the journal names the grammar refusal, never an offered keep'));
         const shownUnitId = (ask[0]?.['unitIds'] as string[] | undefined)?.[0];
         assert.deepEqual(ask[0]?.['terminal'], [{
@@ -1984,7 +1977,7 @@ const ASK_ROWS: readonly Row[] = [
       assert.deepEqual(ask['parsed'], [
         { index: 1, status: 'answered', action: 'forgetall' },
         { index: 2, status: 'answered', action: 'keepall' },
-        { index: 3, status: 'refused', code: 'malformed-row' },
+        { index: 3, status: 'refused', code: 'malformed-row', detail: 'summary-missing' },
       ], at('the keep is recorded as the offered keep, and the malformed row keeps'));
       assert.equal(entry.askVerdicts.size, 1, at('only the readable forgetall is stored'));
       const stored = entry.askVerdicts.get(firstUnit);
@@ -3681,67 +3674,6 @@ test('ISSUE-431: a crossing with no tableable unit journals no-eligible', async 
   } finally { await mount.close(); }
 });
 
-test('a deferred pass whose bytes the forget lane removed re-arms from the host reading',
-  async () => {
-    /*
-     * ISSUE-300 F4: the at-rest/forget lane can remove the unit the deferred
-     * verdict names, leaving the prune apply with nothing to do. The commit is
-     * what completes the pass, so the baseline is again the first host reading
-     * after the removal.
-     */
-    const lines = journalLines();
-    const calls: OpencodeGenerateInput[] = [];
-    const mount = createOpencodeMount({
-      storage: { databasePath: ':memory:' },
-      contextWindowTokens: 400_000,
-      pruneThresholdTokens: 60_000,
-      askGrammar: 'prune-two-option',
-      askGenerate: async (input) => {
-        calls.push(input);
-        const prompt = String(input.prompt ?? '');
-        return { text: /^2\. \[/mu.test(prompt)
-          ? '{"2":{"forgetall":true,"summary":"the doomed read"}}' : '{}' };
-      },
-      journal: record => lines.records.push(record),
-    });
-    try {
-      const { messages } = await rearmSetup(mount);
-      assert.equal(calls.length, 0, 'the shipped request is below the bar');
-      await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
-      assert.equal(calls.length, 1, 'the idle fire stores the verdict');
-      const entry = mount.sessions.get(sessionId);
-      assert.ok(entry !== undefined, 'the context hook built the session');
-      assert.equal(entry.deferredApply, true, 'the idle verdict is deferred');
-      // The manual forget names the same unit the deferred verdict names. The
-      // transform drains it after the at-rest pass; the prune apply then finds
-      // no unit to remove.
-      await mount.forget(sessionId, { path: 'DOOMED.md' });
-      const before = lines.of('ask-apply').length;
-      await mount.transform(sessionId, messages);
-      assert.equal(messages.some(message => message.id === 'msg_doomed'), false,
-        'the forget lane removed the unit');
-      assert.equal(lines.of('ask-apply').length, before,
-        'the prune apply removed nothing');
-      assert.equal(entry.deferredApply, false, 'the commit completed the deferred pass');
-      // The baseline is the first host reading after that removal.
-      await mount.event(stepUsage('msg_forget_baseline', 214_000));
-      await mount.transform(sessionId, messages);
-      const baseline = lines.of('prune-threshold').at(-1);
-      assert.equal(baseline?.['estimatedTokens'], 214_000,
-        'the first host reading after the removal is the baseline');
-      assert.equal(baseline?.['barReading'], 'host-meter',
-        'the baseline is the host reading, not a local estimate');
-      assert.equal(baseline?.['crossed'], false, 'the baseline reading does not fire');
-      await mount.event(stepUsage('msg_forget_short', 273_999));
-      await mount.transform(sessionId, messages);
-      assert.equal(calls.length, 1, '273,999 is under 214,000 + 60,000 and does not fire');
-      await mount.event(stepUsage('msg_forget_fire', 274_000));
-      await mount.transform(sessionId, messages);
-      assert.equal(calls.length, 2, 'exactly 214,000 + 60,000 fires');
-      assert.equal(lines.of('prune-threshold').at(-1)?.['crossed'], true);
-    } finally { await mount.close(); }
-  });
-
 test('a fractional 75% line is journalled as the first integer at or above it', async () => {
   /*
    * ISSUE-300 audit bug 8: 333,333 × 0.75 = 249,999.75, which the bench's
@@ -4088,7 +4020,7 @@ test('a summary past the reader tolerance is refused, retried once, then exclude
     assert.equal(ask[0]?.['answered'], 0, 'no row was answered');
     assert.equal(ask[0]?.['refused'], 1, 'the over-cap row was refused');
     assert.deepEqual(ask[0]?.['parsed'], [
-      { index: 1, status: 'refused', code: 'malformed-row' },
+      { index: 1, status: 'refused', code: 'malformed-row', detail: 'summary-too-long' },
     ], 'the wire parser names the cap refusal, never a stored verdict');
     const entry = mount.sessions.get(sessionId);
     assert.ok(entry !== undefined, 'the context hook built the session');
@@ -4483,7 +4415,7 @@ test('a cancelled l2 verdict releases the retry claim, so the unit is tabled and
     } finally { await mount.close(); }
   });
 
-test('the ask fires only on a readable reply; prose and an empty reply are errors', async () => {
+test('an unreadable reply is an error that still spends a fire (ISSUE-522)', async () => {
   for (const [label, unreadable] of [['prose', 'The file is large and stale.'],
     ['empty', '']] as const) {
     const lines = journalLines();
@@ -4515,7 +4447,9 @@ test('the ask fires only on a readable reply; prose and an empty reply are error
         `${label}: every row was unreadable`);
       assert.equal(errors[0]?.['applied'], false, `${label}: the error applied nothing`);
       const entry = mount.sessions.get(sessionId);
-      assert.equal(entry?.askFires, 0, `${label}: the error consumed no fire`);
+      // ISSUE-522: the request left the seam, so the fire is counted even though
+      // the reply could not be read; the next ask states the repeat share line.
+      assert.equal(entry?.askFires, 1, `${label}: the spent request is a fire`);
       assert.equal(entry?.askedUnitIds.size, 0, `${label}: the unit was released for retry`);
       assert.equal(entry?.retriedUnitIds.size, 1, `${label}: one retry was granted`);
       // The failed revision itself stays claimed, so idle re-entry is quiet.
@@ -4530,8 +4464,8 @@ test('the ask fires only on a readable reply; prose and an empty reply are error
       assert.equal(ask.length, 1, `${label}: the readable retry is one fire`);
       assert.equal(ask[0]?.['answered'], 1, `${label}: the retry answered its row`);
       assert.equal(ask[0]?.['applied'], false, `${label}: the fire is record-only`);
-      assert.equal(entry?.askFires, 1, `${label}: one fire is counted`);
-      assert.ok((entry?.askFires ?? 0) >= 1, `${label}: the readable retry is a fire`);
+      assert.equal(entry?.askFires, 2, `${label}: the unreadable request and the retry are two fires`);
+      assert.ok((entry?.askFires ?? 0) >= 2, `${label}: the readable retry is a fire`);
       // The unit used its retry, so a later revision never releases it again.
       messages.push(assistantMessage('msg_a4', [text('another turn')]));
       await mount.transform(sessionId, messages);
@@ -4564,7 +4498,7 @@ test('a valid table with one answered row still fires and records the refused ro
     assert.equal(ask[0]?.['refused'], 1, 'the unanswered row is counted as refused');
     assert.deepEqual(ask[0]?.['parsed'], [
       { index: 1, status: 'answered', action: 'forgetall' },
-      { index: 2, status: 'refused', code: 'missing-index' },
+      { index: 2, status: 'refused', code: 'missing-index', detail: 'missing-index' },
     ], 'both verdicts ride the ask line');
     assert.equal(ask[0]?.['applied'], false, 'the ask applied nothing');
     assert.deepEqual(ask[0]?.['carried'], [{

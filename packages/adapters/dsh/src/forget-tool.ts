@@ -2,6 +2,9 @@ import type {
   EventId, ForgetRequest, LineRange, SessionId, SessionSnapshot, UnitId,
 } from '@cremator/core';
 import { canonicalBytesWithByteArrays, resolveForget, sha256Sync } from '@cremator/core';
+import type { DshTranscriptItem } from './envelope.js';
+import { dshRetentionOf } from './retention.js';
+import type { DshRetentionCode, DshRetentionVerdict } from './retention.js';
 
 /**
  * The manual forget tool (PRD §6.2 "Mistakes are recoverable: manual forget, or
@@ -49,14 +52,17 @@ export interface DshForgetScheduled {
 /**
  * The refusal a forget answers before any guard run. `code` is the guard's own
  * validation code for this refusal, so the agent reads one vocabulary:
- * `unresolved-request` when the lookup names no single held unit, and
- * `unsupported-capability` when the mount cannot apply a removal at all.
- * `detail` is core's own sentence, never a rephrasing.
+ * `unresolved-request` when the lookup names no single held unit,
+ * `unsupported-capability` when the mount cannot apply a removal at all, and the
+ * two retention markers (ISSUE-519) when the resolved unit may not be removed.
+ * `detail` is core's own sentence, never a rephrasing, except the retention
+ * sentences this adapter states.
  */
 export interface DshForgetRefusal {
   readonly status: 'refused';
-  readonly code: 'unresolved-request' | 'unsupported-capability';
-  readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam' | 'not-durable';
+  readonly code: 'unresolved-request' | 'unsupported-capability' | DshRetentionCode;
+  readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam'
+    | 'not-durable' | 'retained';
   readonly detail: string;
 }
 
@@ -109,11 +115,18 @@ export function readForgetArgs(args: unknown): ForgetRequest {
  * nothing (the failure `prune-apply.ts` documents for its round). The same
  * request over the same unit is the same event; the unit is content-addressed,
  * so two different requests cannot share one.
+ *
+ * A resolved unit still clears the two retention rules before it is scheduled
+ * (ISSUE-519): a manual forget never targets the recall tool's own answer, and
+ * never targets a result another live result already contains. The refusal
+ * carries the marker, so the model reads why the bytes stay.
  */
 export function decideForget(input: {
   readonly snapshot: SessionSnapshot;
   readonly sessionId: SessionId;
   readonly request: ForgetRequest;
+  /** The mount's live items: the retention rules read them (ISSUE-519). */
+  readonly live: readonly DshTranscriptItem[];
 }): DshForgetDecision {
   const resolution = resolveForget({
     snapshot: input.snapshot, sessionId: input.sessionId, request: input.request,
@@ -122,11 +135,23 @@ export function decideForget(input: {
     return { status: 'refused', code: 'unresolved-request',
       reason: resolution.reason, detail: resolution.detail };
   }
+  const retention = dshRetentionOf(resolution.unit.nodeId, input.live);
+  if (retention !== null) return retentionRefusal(retention);
   return { status: 'scheduled', unitId: resolution.unit.id,
     eventId: forgetEventId(input.sessionId, resolution.unit.id, input.request),
     request: { ...input.request,
       ranges: input.request.ranges.map(range => ({ ...range })) },
     ranges: input.request.ranges.map(range => ({ ...range })) };
+}
+
+/** The refusal one retention verdict answers a manual forget with (ISSUE-519). */
+export function retentionRefusal(verdict: DshRetentionVerdict): DshForgetRefusal {
+  return { status: 'refused', code: verdict.code, reason: 'retained',
+    detail: verdict.code === 'recall-answer-retained'
+      ? "the unit is the necromancy tool's own answer; the product never removes its"
+        + ' restore payload'
+      : "the unit's exact result text is contained in the live result "
+        + `${String(verdict.containedInNodeId)}` };
 }
 /** The one engine event id for a resolved forget request. */
 export function forgetEventId(
@@ -167,9 +192,9 @@ export type DshForgetValue =
     }
   | {
       readonly status: 'refused';
-      readonly code: 'unresolved-request' | 'unsupported-capability';
+      readonly code: 'unresolved-request' | 'unsupported-capability' | DshRetentionCode;
       readonly reason: 'malformed-request' | 'absent' | 'ambiguous' | 'no-revert-seam'
-        | 'not-durable';
+        | 'not-durable' | 'retained';
       readonly detail: string;
     };
 

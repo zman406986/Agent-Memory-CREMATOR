@@ -20,14 +20,6 @@ export type {
   OpencodeAskBatch, OpencodeAskDropped, OpencodeAskGrammar, OpencodeAskInput, OpencodeAskPort,
 } from './ask.js';
 export {
-  decideOpencodeForget, forgetAnswer, forgetAnswerText, opencodeForgetEventId,
-  readOpencodeForgetArgs,
-} from './forget.js';
-export type {
-  OpencodeForgetDecision, OpencodeForgetRefused, OpencodeForgetScheduled,
-  OpencodeForgetValue,
-} from './forget.js';
-export {
   OPENCODE_CAPABILITIES, OPENCODE_INACTIVE_L1_RULES, OPENCODE_L1_FACT_RESIDUALS,
   OPENCODE_L1_FACTS, createOpencodeCapabilities,
 } from './capabilities.js';
@@ -71,7 +63,7 @@ export {
 export type {
   MountRootHolder, MountRootLock, OpencodeJournalKind, OpencodeJournalRecord, OpencodeJournalSink,
   OpencodeModelRef, OpencodeMount, OpencodeMountOptions, OpencodeMountPort, OpencodeRequestEstimate,
-  OpencodeSessionEntry, PendingForget,
+  OpencodeSessionEntry,
 } from './plugin.js';
 export { OpencodeApplicationPort, createOpencodePort } from './port.js';
 export type {
@@ -93,7 +85,7 @@ export type {
   OpencodeStorageErrorCode, OpencodeStorageOptions, StorageSelection, StorageTarget,
 } from './storage.js';
 export {
-  OPENCODE_RECALL_TOOL_NAME, OPENCODE_TOOL_SPECS, createOpencodeForgetTool,
+  OPENCODE_RECALL_TOOL_NAME, OPENCODE_TOOL_SPECS,
   createOpencodeTool, opencodeToolSpecs, recallOutputText, recallText,
 } from './tools.js';
 export type {
