@@ -34,8 +34,11 @@
  * `lineCounts` is the per-row `L` the ask's table showed. It is required for a
  * `keeplines` row: its bounds are checked against that row's own count, and a
  * missing count is a caller bug (a `RangeError`), never a silently unchecked
- * range. The reader tolerates a summary up to 30 words while the prompt asks
- * for under 20; the tolerance is wider than the ask on purpose.
+ * range. A count that is present but unprovable — the zero, negative or
+ * non-integer the ask already tables as `[0 lines]` — is not missing: that row
+ * refuses `spans-outside-result` and keeps, so one such row never ends the whole
+ * answer (ISSUE-562). The reader tolerates a summary up to 30 words while the
+ * prompt asks for under 20; the tolerance is wider than the ask on purpose.
  *
  * The action KEY is read case- and plural-insensitively (ISSUE-515):
  * `KEEPLINES`, `keepline`, `KEEPline` and `keepLines` are one action, through
@@ -531,7 +534,9 @@ function readingOfValue(
  * `keeplines`' payload: pairs of positive integers, strictly ascending and
  * non-overlapping, each inside 1..L. Shape and type are `bad-range`, a bound
  * past L is `spans-outside-result`, and order or overlap is `ranges-unordered`.
- * An all-lines pair is legal: it keeps the whole row.
+ * An all-lines pair is legal: it keeps the whole row. A row whose count the ask
+ * tabled as `[0 lines]` (a zero, a negative or a non-integer) has no span inside
+ * `1..0`, so it is `spans-outside-result` and keeps (ISSUE-562).
  */
 function readingOfKeeps(
   payload: unknown,
@@ -550,6 +555,10 @@ function readingOfKeeps(
     pairs.push({ from: from as number, to: to as number });
   }
   const total = lineCountOf(lineCounts, index);
+  // A count the ask tabled as `[0 lines]` proves no span: nothing lies inside
+  // `1..0`, so this row refuses and keeps, never ends the whole answer
+  // (ISSUE-562).
+  if (!Number.isSafeInteger(total) || total < 1) return { code: "spans-outside-result" };
   for (const pair of pairs) {
     if (pair.from > total || pair.to > total) return { code: "spans-outside-result" };
   }
@@ -563,11 +572,18 @@ function readingOfKeeps(
   return { answer: { action: "keeplines", ranges: pairs, summary } };
 }
 
-/** One row's L, or a caller bug: the reader never guesses a line count. */
+/**
+ * One row's L, or a caller bug: a row with NO count at all throws, because the
+ * reader never guesses a count. A count that is present but unprovable — a
+ * zero, a negative from an inverted `lineRange`, or a non-integer — is NOT a
+ * missing one: the ask tabled that row as `[0 lines]` (ISSUE-334, ISSUE-369), so
+ * `readingOfKeeps` refuses the row instead of ending the whole answer
+ * (ISSUE-562).
+ */
 function lineCountOf(lineCounts: ReadonlyMap<number, number>, index: number): number {
   const total = lineCounts.get(index);
-  if (!Number.isSafeInteger(total) || (total as number) < 1) {
+  if (total === undefined) {
     throw new RangeError(`the jsonl-20 reader needs index ${String(index)}'s line count`);
   }
-  return total as number;
+  return total;
 }

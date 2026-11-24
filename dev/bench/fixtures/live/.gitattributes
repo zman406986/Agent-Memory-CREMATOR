@@ -1,0 +1,12 @@
+# This directory's pins are byte pins. `sha256.txt` hashes three files exactly as
+# they sit on disk, and `dev/bench/multiturn/live-gate.test.mjs` recomputes those
+# hashes, so a checkout that turned LF into CRLF would fail that gate and leave
+# `manifest.json` dirty forever.
+#
+# The repo is authored on Windows with `core.autocrlf=true`, which is exactly the
+# setting that rewrites an unattributed file on checkout. This rule is therefore
+# load-bearing, not tidiness. The two sibling fixture directories carry the same
+# rule for the same reason.
+#
+# No `-diff`: a mutated transcript must stay reviewable as text.
+* text eol=lf

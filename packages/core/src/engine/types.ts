@@ -192,6 +192,15 @@ export interface ApplicationPort {
   lookupReceipt(intentId: IntentId): Promise<ReceiptLookup>;
 }
 
+/**
+ * A host receipt read that threw for an intent the ledger records as applied.
+ * The fault blocks the pass and is named, never swallowed (ADR-0065; ISSUE-556).
+ */
+export interface ReceiptReadFailure {
+  readonly intentId: IntentId;
+  readonly message: string;
+}
+
 /** The committed seal state rebuilt from the durable ledger (ADR-0015). */
 export interface CommittedState {
   readonly sealedEpisodeIds: readonly string[];
@@ -199,6 +208,7 @@ export interface CommittedState {
   readonly notices: Set<string>;
   readonly blocked: boolean;
   readonly conflicts: readonly ReceiptConflict[]; // R4 journal input
+  readonly unread: readonly ReceiptReadFailure[]; // a throw is not a conflict
 }
 
 /**

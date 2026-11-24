@@ -62,15 +62,15 @@ export type {
 } from './meter.js';
 export {
   OPENCODE_ASK_REFUSED_RETRY, OPENCODE_ASK_RETRY, OPENCODE_ASK_TIMEOUT_MS,
-  OPENCODE_DUPLICATE_MOUNT_CODE, OPENCODE_MOUNT_SEAMS, OPENCODE_PLUGIN_NAME,
-  OpencodeDuplicateMountError,
+  OPENCODE_MOUNT_DIRECTORY, OPENCODE_MOUNT_SEAMS, OPENCODE_PLUGIN_NAME,
   OPENCODE_PRUNE_COMMAND, OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
   createFileJournalSink, createOpencodeMount,
-  createOpencodePlugin, mountOptionsFromHost,
+  createOpencodePlugin, joinMountRoot, mountOptionsFromHost, readMountRootHolders,
+  releaseMountRoot,
 } from './plugin.js';
 export type {
-  OpencodeJournalKind, OpencodeJournalRecord, OpencodeJournalSink, OpencodeModelRef,
-  OpencodeMount, OpencodeMountOptions, OpencodeMountPort, OpencodeRequestEstimate,
+  MountRootHolder, MountRootLock, OpencodeJournalKind, OpencodeJournalRecord, OpencodeJournalSink,
+  OpencodeModelRef, OpencodeMount, OpencodeMountOptions, OpencodeMountPort, OpencodeRequestEstimate,
   OpencodeSessionEntry, PendingForget,
 } from './plugin.js';
 export { OpencodeApplicationPort, createOpencodePort } from './port.js';

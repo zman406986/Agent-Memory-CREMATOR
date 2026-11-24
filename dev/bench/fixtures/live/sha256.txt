@@ -1,0 +1,3 @@
+582f233c904d457e0ce30b19b60ea5d382a88cd3f2a77e3a6c9b37134399d309  manifest.json
+45b994e1aeff46e4cd81ad1d887d28beb9b25aaddddbdeb9dd5e76d1573089ac  racoons.session.v4.jsonl
+c6bec8611bab45a95fa30cc70efdc934aff7cb406759e97b73391dd68cb3dddd  vanilla.session.v4.jsonl

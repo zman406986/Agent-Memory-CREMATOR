@@ -1,0 +1,62 @@
+{
+  "slug": "tool-roundtrip",
+  "task": "Read the file notes.txt in this directory and report its first line.",
+  "timeoutMs": 90000,
+  "perturbation": "change expect.tools.finalText to a string the second turn never sent; the run must fail by name 'second turn cites the tool result'",
+  "workFiles": {
+    "notes.txt": "RACOONS RIG TOOL ROUNDTRIP\nsecond line\n"
+  },
+  "script": {
+    "title": "Tool round-trip",
+    "replies": [
+      {
+        "name": "ask-for-read",
+        "match": { "tools_length": "present", "tool_results_count": 0 },
+        "reply": {
+          "type": "tool_use",
+          "text": "Reading the file.",
+          "calls": [
+            { "id": "rig_tool_1", "name": "read", "input": { "file_path": "notes.txt" } }
+          ]
+        }
+      },
+      {
+        "name": "cite-the-result",
+        "match": { "tools_length": "present", "tool_results_count": 1, "last_assistant_tool_names": ["read"] },
+        "reply": {
+          "type": "text",
+          "text": "The first line is RACOONS RIG TOOL ROUNDTRIP."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "notes.txt",
+      "titleRequests": { "max": 1 },
+      "titleRequestsHaveNoTools": true,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 1,
+      "results": 1,
+      "failedResults": 0,
+      "callIds": ["rig_tool_1"],
+      "names": ["read"],
+      "resultContains": ["RACOONS RIG TOOL ROUNDTRIP"],
+      "resultAbsent": ["recorded shell command withheld"],
+      "finalText": "The first line is RACOONS RIG TOOL ROUNDTRIP."
+    },
+    "session": {
+      "userTextContains": "notes.txt",
+      "eventTypesPresent": ["tool/call", "tool/result"]
+    },
+    "stdout": { "finalText": "The first line is RACOONS RIG TOOL ROUNDTRIP." }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "title": "Bench smoke",
+  "bench": {
+    "readNeedle": "Taskworld Project"
+  },
+  "replies": [
+    {
+      "name": "summon-a-denied-subagent",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 0
+      },
+      "reply": {
+        "type": "tool_use",
+        "text": "Delegating the reading to a subagent.",
+        "calls": [
+          {
+            "id": "bench_deny_1",
+            "name": "subagent",
+            "input": {
+              "description": "reply READY",
+              "prompt": "reply READY"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "read-the-arm-agents-file",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 1,
+        "last_assistant_tool_names": [
+          "subagent"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "text": "The summon failed. Reading the repository rules directly.",
+        "calls": [
+          {
+            "id": "bench_read_1",
+            "name": "read",
+            "input": {
+              "file_path": "AGENTS.md"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "report-deny-and-read",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 2,
+        "last_assistant_tool_names": [
+          "read"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "text": "DENY-CONFIRMED: the subagent tool returned an error, so I read AGENTS.md myself and it names Taskworld Project."
+      }
+    }
+  ]
+}

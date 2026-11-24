@@ -1,0 +1,520 @@
+{
+  "model": "mock-model",
+  "title": "opencode removal bench",
+  "task": "Read the large file, then read it again. Then read the three batch files in one reply and read each of them again. Then read the stale file, write the same path, and read it again. Finish by reading the two small files, then reply with exactly: DONE",
+  "fixture": {
+    "readerCapBytes": 51200,
+    "productBarBytes": 512,
+    "files": [
+      {
+        "name": "big-single.txt",
+        "sentinel": "RACOONS-FIXTURE-SINGLE-9f1c7a",
+        "bytes": 200000
+      },
+      {
+        "name": "big-batch-a.txt",
+        "sentinel": "RACOONS-FIXTURE-BATCH-A-2b8d4e",
+        "bytes": 200000
+      },
+      {
+        "name": "big-batch-b.txt",
+        "sentinel": "RACOONS-FIXTURE-BATCH-B-5c6f0a",
+        "bytes": 200000
+      },
+      {
+        "name": "big-batch-c.txt",
+        "sentinel": "RACOONS-FIXTURE-BATCH-C-8e3d1b",
+        "bytes": 200000
+      },
+      {
+        "name": "big-stale.txt",
+        "sentinel": "RACOONS-FIXTURE-STALE-7d4e2c",
+        "bytes": 200000,
+        "markers": [
+          "RACOONS-PREWRITE-STALE-7c31af"
+        ]
+      },
+      {
+        "name": "small-restore.txt",
+        "sentinel": "RACOONS-FIXTURE-RESTORE-3a7e5c",
+        "bytes": 12000
+      }
+    ],
+    "auxiliary": [
+      {
+        "name": "keepalive-1.txt",
+        "text": "small keepalive one\n"
+      },
+      {
+        "name": "keepalive-2.txt",
+        "text": "small keepalive two\n"
+      }
+    ],
+    "lanes": [
+      {
+        "name": "single",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_single_1_RS-SINGLE-UNIT"
+        ],
+        "supersedingCalls": [
+          "call_single_2"
+        ],
+        "unitFiles": [
+          "big-single.txt"
+        ],
+        "markerSentinels": [
+          "RS-SINGLE-UNIT"
+        ]
+      },
+      {
+        "name": "multi-unit-pass",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_batch_a1_RS-BATCH-A",
+          "call_batch_b1_RS-BATCH-B",
+          "call_batch_c1_RS-BATCH-C"
+        ],
+        "supersedingCalls": [
+          "call_batch_a2",
+          "call_batch_b2",
+          "call_batch_c2"
+        ],
+        "unitFiles": [
+          "big-batch-a.txt",
+          "big-batch-b.txt",
+          "big-batch-c.txt"
+        ],
+        "markerSentinels": [
+          "RS-BATCH-A",
+          "RS-BATCH-B",
+          "RS-BATCH-C"
+        ]
+      },
+      {
+        "name": "stale",
+        "rule": "stale-read",
+        "unitCalls": [
+          "call_stale_1_RS-STALE"
+        ],
+        "triggerCalls": [
+          "call_stale_write"
+        ],
+        "supersedingCalls": [
+          "call_stale_2"
+        ],
+        "unitFiles": [
+          "big-stale.txt"
+        ],
+        "markerSentinels": [
+          "RS-STALE"
+        ],
+        "contentMarkers": [
+          "RACOONS-PREWRITE-STALE-7c31af"
+        ]
+      },
+      {
+        "name": "restore-small",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_small_1_RS-SMALL"
+        ],
+        "supersedingCalls": [
+          "call_small_2"
+        ],
+        "unitFiles": [
+          "small-restore.txt"
+        ],
+        "markerSentinels": [
+          "RS-SMALL"
+        ]
+      }
+    ]
+  },
+  "replies": [
+    {
+      "name": "read-single-1",
+      "match": {
+        "main_turn": 0,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The task names a large file and asks for it twice. Read the single fixture file first; the host will truncate the result at its reader cap, which is the condition the product is meant to prune.",
+        "text": "Reading the large file once.",
+        "calls": [
+          {
+            "id": "call_single_1_RS-SINGLE-UNIT",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-single.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "reread-single",
+      "match": {
+        "main_turn": 1,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-SINGLE-9f1c7a"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The first read is in the transcript. Read the same path again so the earlier copy is exactly superseded: the later copy carries identical bytes and stays, the earlier copy becomes the prunable unit.",
+        "text": "Reading the same large file again.",
+        "calls": [
+          {
+            "id": "call_single_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-single.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "batch-read",
+      "match": {
+        "main_turn": 2,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-SINGLE-9f1c7a"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Now the batch variant: issue three reads in one reply, one per batch file. All three are above the reader cap, so each is one whole-result unit, and a later reply can supersede all three in one pass.",
+        "text": "Reading the three batch files in one reply.",
+        "calls": [
+          {
+            "id": "call_batch_a1_RS-BATCH-A",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-a.txt"
+            }
+          },
+          {
+            "id": "call_batch_b1_RS-BATCH-B",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-b.txt"
+            }
+          },
+          {
+            "id": "call_batch_c1_RS-BATCH-C",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-c.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "batch-reread",
+      "match": {
+        "main_turn": 3,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-BATCH-C-8e3d1b"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Read the same three paths again so every first copy is superseded by an identical later copy. The next request holds all six reads, which is where one pass can remove the three earlier units together.",
+        "text": "Reading the same three batch files again.",
+        "calls": [
+          {
+            "id": "call_batch_a2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-a.txt"
+            }
+          },
+          {
+            "id": "call_batch_b2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-b.txt"
+            }
+          },
+          {
+            "id": "call_batch_c2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-batch-c.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stale-read",
+      "match": {
+        "main_turn": 4,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-BATCH-C-8e3d1b"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Now the stale-read lane: read the stale file whole. A later write of the same path will make these bytes stale, which is a different proof from a second read of unchanged bytes.",
+        "text": "Reading the stale file once.",
+        "calls": [
+          {
+            "id": "call_stale_1_RS-STALE",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-stale.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stale-write",
+      "match": {
+        "main_turn": 5,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-STALE-7d4e2c"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Write the same path the read observed. The write's path evidence is the fact the stale-read rule needs: the file changed after the read, so the read's bytes are provably not what the file holds now.",
+        "text": "Writing the same path.",
+        "calls": [
+          {
+            "id": "call_stale_write",
+            "name": "write",
+            "input": {
+              "path": "{{WORK}}/big-stale.txt",
+              "content": "RACOONS-FIXTURE-STALE-7d4e2c\nafter the write\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stale-reread",
+      "match": {
+        "main_turn": 6,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Read the same path after the write. This later read is the surviving twin: it proves the request still carries the file after the stale read was removed, so an absent first read cannot be the host dropping the tail.",
+        "text": "Reading the rewritten stale file.",
+        "calls": [
+          {
+            "id": "call_stale_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-stale.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "keepalive-1",
+      "match": {
+        "main_turn": 7,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-STALE-7d4e2c"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The removals are in the last request's array. One more main request is needed after that request, and the host only asks again after a tool call, so read a small file that is below the product's bar and can never become a unit.",
+        "text": "Reading a small file to keep the run moving.",
+        "calls": [
+          {
+            "id": "call_keepalive_1",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/keepalive-1.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "keepalive-2",
+      "match": {
+        "main_turn": 8,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "small keepalive one"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "One more request after the first keepalive, so the rebuilt array must carry every removal a second time. Read the second small file, which is still below the bar.",
+        "text": "Reading the second small file.",
+        "calls": [
+          {
+            "id": "call_keepalive_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/keepalive-2.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "small-read-1",
+      "match": {
+        "main_turn": 9,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "One more unit, this time deliberately below the host reader cap: its restore can reach the model whole, which is the byte-for-byte restore proof the larger units cannot give (their restore is saved to a file and the model sees a pointer).",
+        "text": "Reading a small removable file.",
+        "calls": [
+          {
+            "id": "call_small_1_RS-SMALL",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/small-restore.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "small-read-2",
+      "match": {
+        "main_turn": 10,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-RESTORE-3a7e5c"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Read the same small file again: the earlier copy is superseded, and because this result is under the cap its archived bytes can come back whole.",
+        "text": "Reading the small file again.",
+        "calls": [
+          {
+            "id": "call_small_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/small-restore.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "restore-lanes",
+      "match": {
+        "main_turn": 11,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-RESTORE-3a7e5c"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Every lane has been removed and carried for at least one later request. The receipts name the recall ids; ask the product's own necromancy tool for each one. The returned bytes are the archive's, and the next request carries them back to the model \u2014 that is the restore this bench has to prove, not assume.",
+        "text": "Restoring every removed unit by its receipt id.",
+        "calls": [
+          {
+            "id": "call_recall_single",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_single_1_RS-SINGLE-UNIT}}"
+            }
+          },
+          {
+            "id": "call_recall_batch_a",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_batch_a1_RS-BATCH-A}}"
+            }
+          },
+          {
+            "id": "call_recall_batch_b",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_batch_b1_RS-BATCH-B}}"
+            }
+          },
+          {
+            "id": "call_recall_batch_c",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_batch_c1_RS-BATCH-C}}"
+            }
+          },
+          {
+            "id": "call_recall_stale",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_stale_1_RS-STALE}}"
+            }
+          },
+          {
+            "id": "call_recall_small",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_small_1_RS-SMALL}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "done",
+      "match": {
+        "main_turn": 12,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-RESTORE-3a7e5c"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "reasoning": "Every removal has been restored from its receipt id and the restore results are on the wire. Every read the task asked for is finished, so reply with the exact word the task names.",
+        "text": "DONE"
+      }
+    }
+  ]
+}

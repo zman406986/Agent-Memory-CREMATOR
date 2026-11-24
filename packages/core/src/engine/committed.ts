@@ -1,5 +1,7 @@
 import type { ApplyReceipt, LedgerEntry, LedgerEvent } from '../ledger/types.js';
-import type { ApplicationPort, CommittedState, ReceiptConflict } from './types.js';
+import type {
+  ApplicationPort, CommittedState, ReceiptConflict, ReceiptReadFailure,
+} from './types.js';
 import { metadata, receiptMatches } from './journal.js';
 
 type PreparedEvent = Extract<LedgerEvent, { readonly kind: 'prepared' }>;
@@ -18,6 +20,9 @@ export async function committedState(
   const events = new Map<string, ApplyReceipt | null>();
   const notices = new Set<string>();
   const conflicts: ReceiptConflict[] = [];
+  // A lookup that throws is the host failing to answer, not refusing: it blocks
+  // and is named, because a silent block gives the operator no reason (ADR-0065).
+  const unread: ReceiptReadFailure[] = [];
   // The same intent can have two prepared entries (prepare()'s and the engine's
   // enriched one); one contradiction is journaled once per intent and host.
   const journaled = new Set<string>();
@@ -86,7 +91,11 @@ export async function committedState(
       events.set(details.intent.eventId, committed);
       for (const id of details.sealedEpisodeIds) sealed.add(id);
       if (details.noticeRecordId !== null) notices.add(details.noticeRecordId);
-    } catch { blocked = true; }
+    } catch (error: unknown) {
+      blocked = true;
+      unread.push({ intentId: event.intentId,
+        message: error instanceof Error ? error.message : 'the receipt read failed' });
+    }
   }
-  return { sealedEpisodeIds: [...sealed], events, notices, blocked, conflicts };
+  return { sealedEpisodeIds: [...sealed], events, notices, blocked, conflicts, unread };
 }

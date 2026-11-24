@@ -124,8 +124,9 @@ export async function checkEvidenceRecalls(c: CheckContext, ledger: Ledger, repo
     } catch (error) {
       // A ledger I/O fault is transient storage trouble, not a manifest defect:
       // let the guard classify it distinctly and keep it off the breaker
-      // (ISSUE-313). Any other throw is still an unavailable or invalid recall.
-      if (error instanceof LedgerError) throw error;
+      // (ISSUE-313). Only a storage fault qualifies; a missing row or a hash
+      // mismatch is a manifest defect and is refused by name (ISSUE-561).
+      if (error instanceof LedgerError && error.code === "storage") throw error;
       report("recall-manifest-mismatch", "Evidence recall is unavailable or invalid", node.id);
     }
   }

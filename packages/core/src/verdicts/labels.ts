@@ -27,14 +27,16 @@ export function normalizeLabel(label: string): string {
 }
 
 /**
- * The length verdict for one label. Reported only after normalisation. An
+ * The length verdict for one label. Reported only after normalisation, and
+ * counted in characters (code points), so one emoji is one character. An
  * empty normalised label is not a length failure: it means the floor receipt
  * line ships without a label.
  */
 export function labelIssue(
   label: string, configured: number = RECEIPT_LABEL_CHAR_LIMIT,
 ): "label-too-long" | null {
-  return normalizeLabel(label).length > enforcedLabelLimit(configured) ? "label-too-long" : null;
+  return [...normalizeLabel(label)].length > enforcedLabelLimit(configured)
+    ? "label-too-long" : null;
 }
 
 /**

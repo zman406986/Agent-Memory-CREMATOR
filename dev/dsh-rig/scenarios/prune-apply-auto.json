@@ -1,0 +1,317 @@
+{
+  "slug": "prune-apply-auto",
+  "task": "Run the PowerShell command in this directory and tell me how many lines its output has.",
+  "secondLaunch": [
+    {
+      "task": "/prune"
+    },
+    {
+      "task": "Run the third PowerShell command in this directory and tell me how many lines its output has."
+    }
+  ],
+  "timeoutMs": 120000,
+  "notes": "The apply leg end to end (ISSUE-022 chunk 6; ADR-0009 amendment; ISSUE-074; ISSUE-073 moved the counts). Three launches on one session, one big pwsh result each, every entry ask answered keepall. Launch 1 crosses the half window on its own first request (20301 estimated tokens at threshold 20000: the system+tools prefix counts, 425a9da), so EACH launch runs one pass: rounds [1,2,3], the ordinals continued from disk. Since ISSUE-073 a settled entry keep is final, so the pass never re-lists the unit the checkpoint just kept — only the launch's EARLIER results are listable. Round 1 therefore plans one in-memory unit and numbers no row (askRows 0, settledWithheld 1); round 2 plans two and forgets launch 1's result, which applies as one shaped turn; round 3 plans two and numbers one row, keeping it. So askRows is [0,1,1] and tableUnits is [1,1] (two answered tables, not three), and round 2's table names only index 1 — the kept result is not in it. Since ADR-0028 the bulk prune is the ONE table asker: every table ask is this lane, whatever its row count. The entry lane asks every over-floor result, so the script carries an `answers.entry` keepall queue.",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "perturbation": "delete contextWindowTokens from the scenario's racoons block: the latch is disabled, no crossing is ever journaled and nothing reaches the engine, and the run must fail by name 'the half-window trigger fired once per crossing' (and 'the prune apply reached the engine')",
+  "workFiles": {
+    "big.txt": ""
+  },
+  "racoons": {
+    "barBytes": 2048,
+    "anchors": "off",
+    "contextWindowTokens": 40000,
+    "entryAskTrigger": { "mode": "count" }
+  },
+  "script": {
+    "title": "Prune apply leg",
+    "answers": {
+      "entry": {
+        "type": "text",
+        "text": "{{shapeAnswer}}",
+        "shape": {
+          "keepall": true
+        }
+      }
+    },
+    "replies": [
+      {
+        "name": "prune-table-forget-first-result",
+        "match": {
+          "last_user_text_matches": "Units still in memory[\\s\\S]*ends with \"x+",
+          "body_text_contains": "/prune"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"1\":{\"forgetall\":\"an earlier oversized shell listing\"}}"
+        }
+      },
+      {
+        "name": "table-one-row-keepall",
+        "match": {
+          "last_user_text_matches": "maps every index above to its verdict"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{{tableAnswer}}"
+        }
+      },
+      {
+        "name": "ask-for-first-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running it.",
+          "calls": [
+            {
+              "id": "rig_apply_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-first-count",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows."
+        }
+      },
+      {
+        "name": "ask-for-second-pwsh",
+        "match": {
+          "tools_length": "present",
+          "last_assistant_tool_names": [],
+          "body_text_contains": "row 600 x"
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Pruning.",
+          "calls": [
+            {
+              "id": "rig_apply_pwsh_2",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit another forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('y' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-third-count",
+        "match": {
+          "tools_length": "present",
+          "last_assistant_tool_names": [
+            "pwsh"
+          ],
+          "body_text_contains": "row 600 z"
+        },
+        "reply": {
+          "type": "text",
+          "text": "Nothing else to report."
+        }
+      },
+      {
+        "name": "report-after-prune",
+        "match": {
+          "tools_length": "present",
+          "last_assistant_tool_names": [
+            "pwsh"
+          ],
+          "body_text_contains": "row 600 y"
+        },
+        "reply": {
+          "type": "text",
+          "text": "Nothing to report."
+        }
+      },
+      {
+        "name": "ask-for-third-pwsh",
+        "match": {
+          "tools_length": "present",
+          "last_assistant_tool_names": [],
+          "body_text_contains": "row 600 y"
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the third.",
+          "calls": [
+            {
+              "id": "rig_apply_pwsh_3",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit a third forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('z' * 96) }"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 6,
+      "pruneRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "PowerShell",
+      "titleRequests": {
+        "max": 0
+      },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true,
+      "lastMainBodyContains": [
+        "row 600 y",
+        "row 600 z"
+      ],
+      "lastMainBodyAbsent": [
+        "row 600 x"
+      ]
+    },
+    "tools": {
+      "calls": 3,
+      "results": 3,
+      "failedResults": 0,
+      "callIds": [
+        "rig_apply_pwsh_1",
+        "rig_apply_pwsh_2",
+        "rig_apply_pwsh_3"
+      ],
+      "names": [
+        "pwsh",
+        "pwsh",
+        "pwsh"
+      ]
+    },
+    "session": {
+      "userTextContains": "/prune",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "mounted": 3,
+      "ledger": true,
+      "storageSessions": 1,
+      "durableStorage": true,
+      "entries": 3,
+      "mountedRecord": {
+        "prune": "command+threshold",
+        "window": 40000,
+        "nativeCompactionBackstop": true
+      },
+      "surfaceApply": {
+        "replacements": 1,
+        "recallIds": 1
+      }
+    },
+    "prune": {
+      "requested": 1,
+      "recorded": 3,
+      "reasonNull": true,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "resumedRounds": [
+        1,
+        2
+      ],
+      "asks": 2,
+      "asksPerPass": [
+        0,
+        1,
+        1
+      ],
+      "tableUnits": [
+        1,
+        1
+      ],
+      "planUnits": [
+        1,
+        2,
+        2
+      ],
+      "planAskRows": [
+        0,
+        1,
+        1
+      ],
+      "settledWithheld": [
+        1,
+        1,
+        1
+      ],
+      "l2RemovalCounts": [
+        {
+          "keeplines": 0,
+          "forgetall": 0,
+          "forgetlines": 0
+        },
+        {
+          "keeplines": 0,
+          "forgetall": 1,
+          "forgetlines": 0
+        },
+        {
+          "keeplines": 0,
+          "forgetall": 0,
+          "forgetlines": 0
+        }
+      ],
+      "refusedTotal": 0,
+      "rejectedCount": 0,
+      "keeplinesSummaries": 0,
+      "thresholds": 3,
+      "threshold": 20000,
+      "crossingsPerLaunch": [
+        1,
+        1,
+        1
+      ],
+      "passesPerLaunch": [
+        1,
+        1,
+        1
+      ],
+      "applies": 1,
+      "applyStatus": "applied",
+      "applyRemovals": 1,
+      "applyEnforcement": "apply",
+      "applyRevertHistory": true,
+      "applySkipReasons": [
+        "no-removals",
+        "no-removals"
+      ],
+      "surfaceOps": 4,
+      "noPublish": true,
+      "noPruneError": true
+    },
+    "stdout": {
+      "finalText": "Nothing else to report."
+    }
+  }
+}

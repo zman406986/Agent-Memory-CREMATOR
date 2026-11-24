@@ -1,0 +1,1 @@
+Prune aggressively: forget unless the next step must read it; keep nothing else, and dropped results can be restored later.

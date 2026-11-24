@@ -84,7 +84,41 @@ export function readPruneRound(target: ResolvedRacoonsStorage,
     nameReadRefusal(journal, sessionId, 'round', read.reason);
     return 0;
   }
-  const round = read.doc['round'];
+  return roundOf(read.doc, journal, sessionId);
+}
+
+/**
+ * The header facts a fork clear needs, and whether the read was refused
+ * (ISSUE-572). A refused read is not "the file is absent": the two-fact
+ * readers answer their fail-open default, and the fork clear would read that as
+ * "the parent owes nothing". `refused` lets it treat the fact as still owed
+ * instead, so only a successful write retires it (ADR-0067).
+ */
+export interface PruneHeaderFacts {
+  readonly round: number;
+  readonly trigger: PruneWindowTriggerState | null;
+  readonly refused: boolean;
+}
+
+/** One read of the file for the round and the latch, naming a refusal per fact. */
+export function readPruneHeaderFacts(target: ResolvedRacoonsStorage,
+  journal?: MountJournal, sessionId?: string): PruneHeaderFacts {
+  const dir = sessionDirOf(target);
+  if (dir === null) return { round: 0, trigger: null, refused: false };
+  const read = readDoc(dir);
+  if (read.reason !== undefined) {
+    nameReadRefusal(journal, sessionId, 'round', read.reason);
+    nameReadRefusal(journal, sessionId, 'trigger', read.reason);
+    return { round: 0, trigger: null, refused: true };
+  }
+  return { round: roundOf(read.doc, journal, sessionId),
+    trigger: triggerOf(read.doc, journal, sessionId), refused: false };
+}
+
+/** The round a document names; a present bad value is refused, never trusted. */
+function roundOf(doc: Record<string, unknown>, journal: MountJournal | undefined,
+  sessionId: string | undefined): number {
+  const round = doc['round'];
   if (round === undefined) return 0;
   if (typeof round === 'number' && Number.isSafeInteger(round) && round >= 0) return round;
   nameReadRefusal(journal, sessionId, 'round',
@@ -341,7 +375,13 @@ export function readPruneTriggerState(target: ResolvedRacoonsStorage,
     nameReadRefusal(journal, sessionId, 'trigger', read.reason);
     return null;
   }
-  const trigger = read.doc['trigger'];
+  return triggerOf(read.doc, journal, sessionId);
+}
+
+/** The latch a document names; a present bad value is refused, never trusted. */
+function triggerOf(doc: Record<string, unknown>, journal: MountJournal | undefined,
+  sessionId: string | undefined): PruneWindowTriggerState | null {
+  const trigger = doc['trigger'];
   if (trigger === undefined) return null;
   if (typeof trigger !== 'object' || trigger === null) {
     nameReadRefusal(journal, sessionId, 'trigger',

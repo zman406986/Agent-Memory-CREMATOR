@@ -15,14 +15,26 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 // `tsconfig.json` is the repo's own declaration of where a workspace name lives in
 // source. Reading it keeps one owner for the mapping instead of a second table here.
-const PATHS = (() => {
+// A read or parse failure is thrown, not swallowed into `{}`: an empty table sends
+// every workspace name to package `exports`, which point at `./dist/`, and the lane
+// then tests stale build output while reporting green (ISSUE-593).
+const TSCONFIG = join(ROOT, 'tsconfig.json');
+
+function readPaths() {
+  let raw;
   try {
-    const raw = readFileSync(join(ROOT, 'tsconfig.json'), 'utf8');
-    return JSON.parse(raw).compilerOptions?.paths ?? {};
-  } catch {
-    return {};
+    raw = readFileSync(TSCONFIG, 'utf8');
+  } catch (error) {
+    throw new Error(`ts-resolve: cannot read ${TSCONFIG} (${error.message}); refused to fall back to dist/`);
   }
-})();
+  try {
+    return JSON.parse(raw).compilerOptions?.paths ?? {};
+  } catch (error) {
+    throw new Error(`ts-resolve: cannot parse ${TSCONFIG} (${error.message}); refused to fall back to dist/`);
+  }
+}
+
+const PATHS = readPaths();
 
 // A name mapping is used only when its target exists: a missing source file must not
 // turn into a silent resolution failure of the built package that might be present.

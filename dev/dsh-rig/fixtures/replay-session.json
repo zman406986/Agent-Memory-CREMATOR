@@ -1,0 +1,158 @@
+{
+  "title": "Replay session",
+  "replies": [
+    {
+      "name": "turn-01-tr0",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 0
+      },
+      "reply": {
+        "type": "tool_use",
+        "text": "",
+        "calls": [
+          {
+            "id": "rig_0_0",
+            "name": "read",
+            "input": {
+              "file_path": "replay/file-1.md"
+            }
+          },
+          {
+            "id": "rig_0_1",
+            "name": "read",
+            "input": {
+              "file_path": "replay/file-2.md"
+            }
+          }
+        ],
+        "stop_reason": "tool_use"
+      },
+      "meta": {
+        "source_iteration": 0,
+        "prompt_tail": {
+          "role": "system",
+          "chars": 5847
+        },
+        "source_stop_reason": "tool-calls"
+      }
+    },
+    {
+      "name": "turn-02-tr2",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 2,
+        "last_assistant_tool_names": [
+          "read",
+          "read"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "text": "<replay turn 2: 186 chars>",
+        "calls": [
+          {
+            "id": "rig_1_0",
+            "name": "pwsh",
+            "input": {
+              "command": "Write-Output 'replay: recorded shell command withheld'",
+              "description": "replay pwsh call"
+            }
+          },
+          {
+            "id": "rig_1_1",
+            "name": "pwsh",
+            "input": {
+              "command": "Write-Output 'replay: recorded shell command withheld'",
+              "description": "replay pwsh call"
+            }
+          }
+        ],
+        "stop_reason": "tool_use"
+      },
+      "meta": {
+        "source_iteration": 1,
+        "prompt_tail": {
+          "role": "tool",
+          "chars": 56589
+        },
+        "source_stop_reason": "tool-calls"
+      }
+    },
+    {
+      "name": "turn-03-tr4",
+      "match": {
+        "tools_length": "present",
+        "tool_results_count": 4,
+        "last_assistant_tool_names": [
+          "pwsh",
+          "pwsh"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "text": "<replay turn 3: 8252 chars>",
+        "stop_reason": "end_turn"
+      },
+      "meta": {
+        "source_iteration": 1,
+        "prompt_tail": {
+          "role": "tool",
+          "chars": 492
+        },
+        "source_stop_reason": "stop"
+      }
+    }
+  ],
+  "meta": {
+    "converter": "dev/dsh-rig/replay.mjs",
+    "converter_version": 2,
+    "source": {
+      "name": "transcript.jsonl",
+      "bytes": 1471748,
+      "lines": 2896,
+      "sha256": "00a529c7645428e73c979f15938c70af7e433f5c254d8e6684a15f1bb0bb3fd6"
+    },
+    "caps": {
+      "text_chars": 4000,
+      "max_replies": 24
+    },
+    "text_mode": "placeholder",
+    "turns": [
+      {
+        "turn": "01",
+        "tool_results": 0,
+        "tool_names": [],
+        "calls": 2,
+        "reply": "tool_use"
+      },
+      {
+        "turn": "02",
+        "tool_results": 2,
+        "tool_names": [
+          "read",
+          "read"
+        ],
+        "calls": 2,
+        "reply": "tool_use"
+      },
+      {
+        "turn": "03",
+        "tool_results": 4,
+        "tool_names": [
+          "pwsh",
+          "pwsh"
+        ],
+        "calls": 0,
+        "reply": "text"
+      }
+    ],
+    "skipped": {
+      "no_completion": 0,
+      "bad_completion": 0,
+      "empty_reply": 0,
+      "duplicate_key": 0,
+      "unmappable_tools": 0
+    }
+  }
+}

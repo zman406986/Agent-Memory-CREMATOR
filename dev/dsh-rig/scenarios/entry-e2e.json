@@ -1,0 +1,135 @@
+{
+  "slug": "entry-e2e",
+  "task": "Run each PowerShell command I ask for, in order, and report when all are done.",
+  "timeoutMs": 90000,
+  "notes": "ISSUE-058 chunk P3d. One session proves the entry lane end to end: floor gate, keep-all rewind, forgetall and keeplines as one atomic rewind+append each, byte-exact recall of a forgotten body, and prefix discipline across every apply.",
+  "perturbation": "two hooks, each driven by run-entry-e2e.test.mjs: E2E_FLOOR_BYTES=40000 moves every result under the floor, so nothing is asked and the runner must fail by name on \"exactly the over-floor results were asked\"; E2E_ENTRY_REFUSE=1 scripts an invalid first entry answer, so the runner must assert that refusal by name, the result whole and the task running to its last step (ISSUE-181 4a)",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "workFiles": {},
+  "racoons": {
+    "floorBytes": 512,
+    "barBytes": 200000,
+    "anchors": "off",
+    "entryAskTrigger": { "mode": "count" }
+  },
+  "script": {
+    "title": "Entry lane E2E",
+    "answers": {
+      "entry": [
+        {
+          "type": "text",
+          "text": "{\"1\":{\"keepall\":true}}"
+        },
+        {
+          "type": "text",
+          "text": "{\"1\":{\"forgetall\":true,\"summary\":\"an old numbered listing\"}}"
+        },
+        {
+          "type": "text",
+          "text": "{\"1\":{\"keeplines\":[[1,4]],\"summary\":\"kept the head of the listing\"}}"
+        }
+      ]
+    },
+    "replies": [
+      {
+        "name": "step-1-two-results",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the two small ones.",
+          "calls": [
+            {
+              "id": "rig_small_1",
+              "name": "pwsh",
+              "input": {
+                "description": "three short lines",
+                "command": "1..3 | ForEach-Object { \"small $_ \" + ('x' * 78) }"
+              }
+            },
+            {
+              "id": "rig_middle_1",
+              "name": "pwsh",
+              "input": {
+                "description": "twenty-four lines",
+                "command": "1..24 | ForEach-Object { \"middle $_ \" + ('x' * 78) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "step-2-big",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the big one.",
+          "calls": [
+            {
+              "id": "rig_big_1",
+              "name": "pwsh",
+              "input": {
+                "description": "two hundred forty lines",
+                "command": "1..240 | ForEach-Object { \"big $_ \" + ('x' * 78) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "step-3-middle-again",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 3
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running one more.",
+          "calls": [
+            {
+              "id": "rig_middle_2",
+              "name": "pwsh",
+              "input": {
+                "description": "twenty-four lines",
+                "command": "1..24 | ForEach-Object { \"again $_ \" + ('x' * 78) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "step-4-report",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 4
+        },
+        "reply": {
+          "type": "text",
+          "text": "All four commands ran."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 4,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "racoons": {
+      "entryAsks": {
+        "accepted": 3,
+        "refused": 0
+      }
+    }
+  }
+}

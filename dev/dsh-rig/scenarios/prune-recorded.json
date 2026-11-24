@@ -1,0 +1,172 @@
+{
+  "slug": "prune-recorded",
+  "task": "Run the PowerShell command in this directory and tell me how many lines its output has.",
+  "secondLaunch": {
+    "task": "/prune"
+  },
+  "timeoutMs": 120000,
+  "notes": "Since ADR-0028 the bulk prune is the ONE table asker: an ask is a fork of main's wire state, so it keeps the tools array and ends with the shipped final line. The table row answers it with keepall for every index the ask assigned. The title row is disabled because the main-wire capture can seed a fork from dsh's session-title call. KNOWN RED (pre-existing, ISSUE-073 follow-up): the entry lane now asks every over-floor result and this script names no `answers.entry`, so the mock answers each entry ask with a loud 500; the run still reaches the prune legs. The scenario needs an entry answer queue and a re-scripted table row before it is green again.",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "perturbation": "delete the 'table-ask-keepall' reply row: the table ask falls through to the tool-use row, the reply is not one JSON object, and the run must fail by name 'the prune pass asked every batch'",
+  "workFiles": {
+    "big.txt": ""
+  },
+  "racoons": {
+    "barBytes": 2048,
+    "anchors": "off"
+  },
+  "script": {
+    "title": "Prune round-trip",
+    "replies": [
+      {
+        "name": "table-ask-keepall",
+        "match": {
+          "tools_length": "present",
+          "last_user_text_matches": "maps every index above to its verdict"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{{tableAnswer}}"
+        }
+      },
+      {
+        "name": "ask-for-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running it.",
+          "calls": [
+            {
+              "id": "rig_prune_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-line-count",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows."
+        }
+      },
+      {
+        "name": "reply-to-prune",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": []
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Pruning.",
+          "calls": [
+            {
+              "id": "rig_prune_pwsh_2",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit another forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('y' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-after-prune",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "Nothing to report."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 4,
+      "pruneRequests": 1,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "PowerShell",
+      "titleRequests": {
+        "max": 0
+      },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 2,
+      "results": 2,
+      "failedResults": 0,
+      "callIds": [
+        "rig_prune_pwsh_1",
+        "rig_prune_pwsh_2"
+      ],
+      "names": [
+        "pwsh",
+        "pwsh"
+      ]
+    },
+    "session": {
+      "userTextContains": "/prune",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "mounted": 2,
+      "ledger": true
+    },
+    "prune": {
+      "requested": 1,
+      "recorded": 1,
+      "reasonNull": true,
+      "round": 1,
+      "asks": 1,
+      "tableUnits": 2,
+      "planUnits": 2,
+      "planAskRows": 2,
+      "l2RemovalCount": {
+        "keeplines": 0,
+        "forgetall": 0,
+        "forgetlines": 0
+      },
+      "refusedTotal": 0,
+      "rejectedCount": 0,
+      "keeplinesSummaries": 0,
+      "noPublish": true,
+      "surfaceOps": 0,
+      "noPruneError": true
+    },
+    "stdout": {
+      "finalText": "Nothing to report."
+    }
+  }
+}

@@ -27,16 +27,24 @@
  * republishes the whole file atomically (temp + rename, the ISSUE-347 pattern),
  * so a kill mid-write tears only the temp and every other fact is preserved.
  *
+ * ISSUE-578: two mounts of one durable root (two terminals, ADR-0075) now share
+ * this file, sometimes across processes. The read-modify-write therefore runs
+ * under the session ledger's own cross-process write lock, so neither mount can
+ * publish a document built from a read that missed the other's fact.
+ *
  * A failed read is not an absent file (ISSUE-499): an absent document reads as
  * "the in-memory state is the whole truth", but a present document that cannot
  * be read or parsed is named, and a writer refuses to republish a merged empty
  * document over it — merging into `{}` would durably erase every sibling fact
  * (ADR-0065 decision 4; the opencode ISSUE-484 refused-document protection). A
  * malformed record inside a readable document is named too, instead of reading
- * as an empty list with no cause; the read itself still fails open.
+ * as an empty list with no cause; the read itself still fails open, and a
+ * writer refuses to republish over the record it could not parse (ISSUE-568),
+ * so a valid sibling receipt is never erased by a row this build cannot read.
  */
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { ApplyReceipt } from '@cremator/core';
 import type { ResolvedRacoonsStorage } from './storage.js';
 import type { MountJournal } from './journal-kinds.js';
@@ -168,6 +176,61 @@ function publishDoc(dir: string, doc: MountDoc, journal: MountJournal, sessionId
   }
 }
 
+/**
+ * How long one state write waits for the session ledger's write lock. The value
+ * is the ledger's own (`sqlite-ledger.ts` opens every ledger with
+ * `busy_timeout = 5000`), so a held lock is waited out for exactly as long as a
+ * ledger append is, and no state write is lost to contention it could have
+ * waited out. No new cap: the bound is the ledger's own (ADR-0060).
+ */
+const STATE_LOCK_TIMEOUT_MS = 5000;
+
+/**
+ * Run one read-modify-write under the ledger's cross-process write lock
+ * (ISSUE-578). Two mounts of one root in different processes write this file;
+ * without a lock each could publish a document whose read missed the other's
+ * fact, silently dropping a receipt, a pending forget or the ask state.
+ * `BEGIN IMMEDIATE` on this session's own `ledger.sqlite` is the mutex every
+ * mount of the session already shares, and SQLite serializes it across
+ * processes. The lock covers a synchronous section only, so no mount ever waits
+ * on another mount's ledger work while holding it, and this process's own
+ * ledger handle is never inside a transaction when a state write runs
+ * (JavaScript is single-threaded). A lock that cannot be taken fails the write
+ * by name, which the caller journals.
+ */
+function withLedgerLock(target: ResolvedRacoonsStorage, journal: MountJournal,
+  sessionId: string, fields: Record<string, unknown>, write: () => boolean): boolean {
+  const databasePath = target.databasePath;
+  // No ledger file means no mount has opened this session here, so there is no
+  // other writer of this session's state to interleave with.
+  if (databasePath === ':memory:' || !fs.existsSync(databasePath)) return write();
+  let db: DatabaseSync;
+  try { db = new DatabaseSync(databasePath); }
+  catch (error) { return lockFailure(journal, sessionId, fields, databasePath, error); }
+  try {
+    db.exec(`PRAGMA busy_timeout = ${String(STATE_LOCK_TIMEOUT_MS)}`);
+    db.exec('BEGIN IMMEDIATE');
+    const result = write();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* the write never started */ }
+    return lockFailure(journal, sessionId, fields, databasePath, error);
+  } finally {
+    try { db.close(); } catch { /* the write's own result stands */ }
+  }
+}
+
+/** The named failure of a state write that could not take the ledger lock. */
+function lockFailure(journal: MountJournal, sessionId: string,
+  fields: Record<string, unknown>, databasePath: string, error: unknown): false {
+  const reason = error instanceof Error ? error.message : String(error);
+  journal('mount-state-error', { sessionId, ...fields, refused: true,
+    reason: `refusing to write ${join(dirname(databasePath), MOUNT_STATE_FILE)} without the `
+      + `ledger's cross-process lock: ${reason}` });
+  return false;
+}
+
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -210,10 +273,12 @@ export function writeInstall(target: ResolvedRacoonsStorage, install: DurableIns
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const read = readDoc(dir);
   const fields = { fact: 'install', generation: install.generation };
-  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
-  return publishDoc(dir, { ...read.doc, install }, journal, sessionId, fields);
+  return withLedgerLock(target, journal, sessionId, fields, () => {
+    const read = readDoc(dir);
+    if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+    return publishDoc(dir, { ...read.doc, install }, journal, sessionId, fields);
+  });
 }
 
 function readForgetsOf(doc: MountDoc): DurableForget[] {
@@ -270,29 +335,44 @@ export function writePendingForgets(target: ResolvedRacoonsStorage,
   forgets: readonly DurableForget[], journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const read = readDoc(dir);
   const fields = { fact: 'forgets', pending: forgets.length };
-  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
-  const { forgets: _prior, ...rest } = read.doc;
-  return publishDoc(dir, { ...rest, ...(forgets.length === 0 ? {} : { forgets }) },
-    journal, sessionId, fields);
+  return withLedgerLock(target, journal, sessionId, fields, () => {
+    const read = readDoc(dir);
+    if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+    const { forgets: _prior, ...rest } = read.doc;
+    return publishDoc(dir, { ...rest, ...(forgets.length === 0 ? {} : { forgets }) },
+      journal, sessionId, fields);
+  });
 }
 
-function readReceiptsOf(doc: MountDoc): ApplyReceipt[] {
+/** The receipts fact as read, and why a readable document's copy was unusable. */
+interface ReceiptsRead {
+  readonly rows: ApplyReceipt[];
+  readonly rejected?: string;
+}
+
+function readReceiptsOf(doc: MountDoc): ReceiptsRead {
   const receipts = doc.receipts;
-  if (!Array.isArray(receipts)) return [];
+  if (!Array.isArray(receipts)) {
+    return receipts === undefined ? { rows: [] }
+      : { rows: [], rejected: 'the receipts record is not an array' };
+  }
   const out: ApplyReceipt[] = [];
   for (const value of receipts) {
-    if (typeof value !== 'object' || value === null) return [];
+    if (typeof value !== 'object' || value === null) {
+      return { rows: [], rejected: 'the receipts record holds a structurally invalid row' };
+    }
     const receipt = value as { readonly intentId?: unknown; readonly sessionId?: unknown;
       readonly baseRevision?: unknown; readonly resultRevision?: unknown;
       readonly applicationSha256?: unknown; readonly appliedAtMs?: unknown };
     if (typeof receipt.intentId !== 'string' || typeof receipt.sessionId !== 'string'
       || typeof receipt.baseRevision !== 'string' || typeof receipt.resultRevision !== 'string'
-      || typeof receipt.applicationSha256 !== 'string' || !isCount(receipt.appliedAtMs)) return [];
+      || typeof receipt.applicationSha256 !== 'string' || !isCount(receipt.appliedAtMs)) {
+      return { rows: [], rejected: 'the receipts record holds a structurally invalid row' };
+    }
     out.push(value as ApplyReceipt);
   }
-  return out;
+  return { rows: out };
 }
 
 /**
@@ -307,16 +387,9 @@ export function readDurableReceipts(target: ResolvedRacoonsStorage, journal?: Mo
   const read = readDoc(dir);
   const reject = rejectionOf(journal, sessionId, 'receipts');
   if (read.reason !== undefined) { reject(read.reason); return []; }
-  const receipts = read.doc.receipts;
-  if (receipts !== undefined && !Array.isArray(receipts)) {
-    reject('the receipts record is not an array; reading it as absent');
-    return [];
-  }
   const rows = readReceiptsOf(read.doc);
-  if (rows.length === 0 && (receipts?.length ?? 0) > 0) {
-    reject('the receipts record is structurally invalid; reading it as absent');
-  }
-  return rows;
+  if (rows.rejected !== undefined) { reject(`${rows.rejected}; reading it as absent`); }
+  return rows.rows;
 }
 
 /**
@@ -329,12 +402,18 @@ export function writeDurableReceipt(target: ResolvedRacoonsStorage, receipt: App
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const read = readDoc(dir);
   const fields = { fact: 'receipts', intentId: receipt.intentId };
-  if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
-  const prior = readReceiptsOf(read.doc).filter(row => row.intentId !== receipt.intentId);
-  return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] }, journal, sessionId,
-    { ...fields, count: prior.length + 1 });
+  return withLedgerLock(target, journal, sessionId, fields, () => {
+    const read = readDoc(dir);
+    if (read.reason !== undefined) return refuseWrite(dir, read.reason, journal, sessionId, fields);
+    const prior = readReceiptsOf(read.doc);
+    if (prior.rejected !== undefined) {
+      return refuseWrite(dir, prior.rejected, journal, sessionId, fields);
+    }
+    const kept = prior.rows.filter(row => row.intentId !== receipt.intentId);
+    return publishDoc(dir, { ...read.doc, receipts: [...kept, receipt] }, journal, sessionId,
+      { ...fields, count: kept.length + 1 });
+  });
 }
 
 /**
@@ -349,15 +428,22 @@ export function removeDurableReceipt(target: ResolvedRacoonsStorage, intentId: s
   journal: MountJournal, sessionId: string): boolean {
   const dir = sessionDirOf(target);
   if (dir === null) return true;
-  const read = readDoc(dir);
-  if (read.reason !== undefined) {
-    return refuseWrite(dir, read.reason, journal, sessionId,
-      { fact: 'receipts', collected: intentId });
-  }
-  const prior = readReceiptsOf(read.doc);
-  const remaining = prior.filter(row => row.intentId !== intentId);
-  if (remaining.length === prior.length) return true;
-  const { receipts: _prior, ...rest } = read.doc;
-  return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) },
-    journal, sessionId, { fact: 'receipts', collected: intentId, count: remaining.length });
+  return withLedgerLock(target, journal, sessionId,
+    { fact: 'receipts', collected: intentId }, () => {
+      const read = readDoc(dir);
+      if (read.reason !== undefined) {
+        return refuseWrite(dir, read.reason, journal, sessionId,
+          { fact: 'receipts', collected: intentId });
+      }
+      const prior = readReceiptsOf(read.doc);
+      if (prior.rejected !== undefined) {
+        return refuseWrite(dir, prior.rejected, journal, sessionId,
+          { fact: 'receipts', collected: intentId });
+      }
+      const remaining = prior.rows.filter(row => row.intentId !== intentId);
+      if (remaining.length === prior.rows.length) return true;
+      const { receipts: _prior, ...rest } = read.doc;
+      return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) },
+        journal, sessionId, { fact: 'receipts', collected: intentId, count: remaining.length });
+    });
 }

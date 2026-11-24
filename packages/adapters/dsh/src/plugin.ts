@@ -64,7 +64,7 @@ import { createCremateCommand, cremateMarkerOf } from './cremate-command.js';
 import type { CrematePassResult, CremateWait, DshCommandRegistry }
   from './cremate-command.js';
 import { PRUNE_ROUND_FILE, readEntryAskFired, readPendingAppends,
-  readPruneRound, readPruneTriggerState, readTableAskFired,
+  readPruneHeaderFacts, readPruneRound, readPruneTriggerState, readTableAskFired,
   writeEntryAskFired, writePendingAppends,
   writePruneRound, writeTableAskFired } from './prune-round-store.js';
 import type { DurableAppendRecord } from './prune-round-store.js';
@@ -85,6 +85,9 @@ import {
 import type { RacoonsStorageOptions, ResolvedRacoonsStorage } from './storage.js';
 import { RacoonsStorageError, RacoonsStorageRetryError } from './storage.js';
 import { createRefusingLedger } from './refusing-ledger.js';
+import {
+  type MountRecordFile, joinMountRecords, readMountRecords, releaseMountRecord,
+} from './mount-records.js';
 
 export { resolveStorage } from './storage.js';
 export {
@@ -1418,8 +1421,10 @@ export function resultFactsFromMeta(
     }
     const hits = files.flatMap((file) => (isRecord(file) && typeof file['path'] === 'string'
       && file['path'].length > 0
+      // A file entry without a `matches` array carries no count: omit it, so the
+      // observation stays `unknown` instead of proving zero (ISSUE-571).
       ? [{ path: file['path'], pathKey: file['path'],
-        matchCount: Array.isArray(file['matches']) ? file['matches'].length : 0 }] : []));
+        ...(Array.isArray(file['matches']) ? { matchCount: file['matches'].length } : {}) }] : []));
     return { complete: true, failed: false, paths: hits.length > 0 ? hits
       : [{ path: fallback, pathKey: fallback, matchCount: meta['total'] }] };
   }
@@ -2552,16 +2557,22 @@ export function createRacoonsMount(options: {
         readonly trigger: PruneWindowTriggerState | null;
         readonly entryAskFired: boolean;
         readonly tableAskFired: boolean;
+        /** ISSUE-572: the header read was refused; the fact is owed, not absent. */
+        readonly headerRefused: boolean;
       }
       let forkFacts: ForkFactsSnapshot | null = null;
-      const captureForkFacts = (): ForkFactsSnapshot => ({
-        forgets: readPendingForgets(durable, journal, sessionId),
-        appends: readPendingAppends(durable, journal, sessionId),
-        round: readPruneRound(durable, journal, sessionId),
-        trigger: readPruneTriggerState(durable, journal, sessionId),
-        entryAskFired: readEntryAskFired(durable, journal, sessionId),
-        tableAskFired: readTableAskFired(durable, journal, sessionId),
-      });
+      const captureForkFacts = (): ForkFactsSnapshot => {
+        const header = readPruneHeaderFacts(durable, journal, sessionId);
+        return {
+          forgets: readPendingForgets(durable, journal, sessionId),
+          appends: readPendingAppends(durable, journal, sessionId),
+          round: header.round,
+          trigger: header.trigger,
+          headerRefused: header.refused,
+          entryAskFired: readEntryAskFired(durable, journal, sessionId),
+          tableAskFired: readTableAskFired(durable, journal, sessionId),
+        };
+      };
       // The header facts are value-shaped, so "the parent's" cannot be told from
       // "the child's" by reading the file after the child has written. The
       // owed state is therefore carried across calls: a fact the mount-time
@@ -2569,7 +2580,8 @@ export function createRacoonsMount(options: {
       let owedHeader: { round: boolean; askFired: boolean; tableAskFired: boolean } | null = null;
       const clearForkFacts = (): boolean => {
         const facts = forkFacts ??= captureForkFacts();
-        owedHeader ??= { round: facts.round > 0 || facts.trigger !== null,
+        owedHeader ??= { round: facts.round > 0 || facts.trigger !== null
+          || facts.headerRefused,
           askFired: facts.entryAskFired, tableAskFired: facts.tableAskFired };
         // Forgets: remove only the records the mount-time snapshot holds.
         const currentForgets = readPendingForgets(durable, journal, sessionId);
@@ -2600,23 +2612,34 @@ export function createRacoonsMount(options: {
         // still holds the snapshot's value, so a child that advanced one keeps
         // it (ISSUE-475).
         let droppedRound = false;
+        let droppedLatch = false;
+        let currentRound = 0;
         let roundLeft = 0;
         if (owedHeader.round) {
-          const currentRound = readPruneRound(durable, journal, sessionId);
-          if (currentRound !== facts.round) {
+          currentRound = readPruneRound(durable, journal, sessionId);
+          // ISSUE-572: a refused snapshot read is not proof the child advanced.
+          // The fact stays owed and only a successful write retires it, so a
+          // failed clear withholds the identity (ADR-0067).
+          if (!facts.headerRefused && currentRound !== facts.round) {
             // The child advanced the ordinal: the parent's header is gone.
             owedHeader.round = false;
           } else {
             const currentTrigger = readPruneTriggerState(durable, journal, sessionId);
-            // ISSUE-475: a latch the child wrote is kept even when the snapshot
-            // held none; only the value the fork captured may be cleared.
-            const keepTrigger = sameTriggerState(currentTrigger, facts.trigger)
-              ? undefined : (currentTrigger ?? undefined);
+            // ISSUE-475: a latch the snapshot could read and the child wrote is
+            // kept; only the value the fork captured may be cleared. ISSUE-572:
+            // a latch the snapshot could not read is the parent's by position —
+            // it sits in the copied file — so it is dropped with the round.
+            const keepTrigger = facts.headerRefused ? undefined
+              : sameTriggerState(currentTrigger, facts.trigger)
+                ? undefined : (currentTrigger ?? undefined);
             if (writePruneRound(durable, 0, journal, sessionId, keepTrigger)) {
-              droppedRound = true;
+              droppedRound = facts.headerRefused || facts.round > 0 || facts.trigger !== null;
+              droppedLatch = facts.headerRefused
+                ? currentTrigger !== null : facts.trigger !== null;
               owedHeader.round = false;
             } else {
-              roundLeft = (facts.round > 0 ? 1 : 0) + (facts.trigger !== null ? 1 : 0);
+              roundLeft = facts.headerRefused ? 1
+                : (facts.round > 0 ? 1 : 0) + (facts.trigger !== null ? 1 : 0);
             }
           }
         }
@@ -2652,7 +2675,8 @@ export function createRacoonsMount(options: {
           || droppedTableAsk) {
           journal('fork-state-dropped', { sessionId, parentSessionId: forkFrom,
             forgets: droppedForgets, appends: droppedAppends,
-            ...(droppedRound ? { round: facts.round, latch: facts.trigger !== null } : {}),
+            ...(droppedRound ? { round: facts.headerRefused ? currentRound : facts.round,
+              latch: droppedLatch } : {}),
             ...(droppedAsk ? { entryAskFired: true } : {}),
             ...(droppedTableAsk ? { tableAskFired: true } : {}) });
         }
@@ -2716,7 +2740,12 @@ export function createRacoonsMount(options: {
         // fork's copied rows carry the parent's id, so they never count). Trust
         // the ledger over the missing file: classify a restart, record the
         // inherited set, and name the fallback.
-        if (await ledgerHasRows(ledger, sessionId)) {
+        // ISSUE-573: a ledger that could not be read is not proof of absence.
+        // The only two answers left are restart or refuse, so it takes the
+        // restart path (recovery stays on, nothing is promoted) and the journal
+        // names the failed read instead of reporting a fresh install.
+        const ledgerEvidence = await ledgerRowEvidence(ledger, sessionId);
+        if (ledgerEvidence !== 'none') {
           // ISSUE-477: the inherited set the first mount computed is durable
           // proof independent of the install identity, so a death before that
           // identity lands still records the same set. Without that proof the
@@ -2730,7 +2759,8 @@ export function createRacoonsMount(options: {
           identity = { generation: 1, installedAtMs: clock.nowMs(),
             preInstallNodeIds: ids, sessionId };
           recoveredFromLedger = true;
-          journal('install-fallback', { sessionId, reason: 'ledger-rows',
+          journal('install-fallback', { sessionId,
+            reason: ledgerEvidence === 'rows' ? 'ledger-rows' : 'ledger-unreadable',
             source: ownPreinstall !== null ? 'preinstall-record' : 'surface-unsafe',
             preInstall: ids.length });
           if (ownPreinstall === null) {
@@ -3130,6 +3160,11 @@ export function createRacoonsMount(options: {
           journal('native-compaction-deferred', { sessionId: entry.sessionId,
             seq: event.seq, phase, generation, window, armed });
         } else if (phase === 'end' && armed) {
+          // ISSUE-567: the billed prompt names the request the host compacted
+          // away. The fresh latch's first reading must describe the surface
+          // that is left, so the row is dropped and the boundary falls back to
+          // its own estimate of the compacted surface.
+          entry.billedPromptTokens = null;
           entry.pruneTrigger.noteNativeCompaction();
           rearmed = true;
           // The re-arm is durable too (ISSUE-336): a restart after a native
@@ -4141,6 +4176,9 @@ export function createRacoonsMount(options: {
     if (!entry.compactionRearmDeferred || openAskWindow(entry) !== null) return;
     entry.compactionRearmDeferred = false;
     if (!config.nativeCompactionBackstop) return;
+    // ISSUE-567: same rule as the direct observation above — the pre-compaction
+    // billed row does not describe the surface the host left behind.
+    entry.billedPromptTokens = null;
     entry.pruneTrigger.noteNativeCompaction();
     const target = targets.get(entry.sessionId);
     if (target !== undefined) {
@@ -5354,18 +5392,21 @@ function durableForgetOf(decision: DshForgetScheduled): DurableForget {
 }
 
 /**
- * Whether this session's own ledger already holds a row (ISSUE-460). A fork's
- * copied rows carry the parent's id, so only this session's own past can answer
- * true. A read failure is fail-open to the caller's previous classification.
+ * What this session's own ledger says about whether it already ran here
+ * (ISSUE-460). A fork's copied rows carry the parent's id, so only this
+ * session's own past reads `rows`. ISSUE-573: a read failure answers
+ * `unreadable`, never `none` — the caller must not read a ledger it could not
+ * read as "no history" and classify a restart as a fresh install.
  */
-async function ledgerHasRows(ledger: Ledger, sessionId: string): Promise<boolean> {
+async function ledgerRowEvidence(ledger: Ledger, sessionId: string):
+Promise<'rows' | 'none' | 'unreadable'> {
   try {
     for await (const row of ledger.events(sessionId)) {
-      if (row !== null) return true;
+      if (row !== null) return 'rows';
     }
-    return false;
+    return 'none';
   } catch {
-    return false;
+    return 'unreadable';
   }
 }
 
@@ -5434,7 +5475,10 @@ export function publishAppend(session: DshMountSession, request: RacoonsApplicat
     if (event?.type !== 'user/message') continue;
     const data = isRecord(event.data) ? event.data : {};
     const source = isRecord(data['source']) ? data['source'] : {};
-    if (source['kind'] === config.recordName && typeof source['recordId'] === 'string') {
+    // ISSUE-574: the row was stamped with whatever `recordName` was in force
+    // when it landed, and a replay may mount under a different one; recordId
+    // alone is the stable identity the dedupe promises.
+    if (typeof source['recordId'] === 'string') {
       landed.add(source['recordId']);
     }
   }
@@ -5699,36 +5743,33 @@ function recallBodyText(value: unknown): string {
     byteLength: value['byteLength'], parts });
 }
 
-/** The named refusal a second apply of one durable root raises (ISSUE-424). */
-export const CREMATOR_DUPLICATE_MOUNT_CODE = 'duplicate-mount';
-
 /**
- * A second live `apply` for one durable root (ISSUE-424, narrowed by ADR-0066
- * and ISSUE-498). Two mounts would open two ledgers for the same session and
- * publish duplicate asks and cards; the refusal is by name and names the root
- * it collides on, so a host log line says what happened.
+ * One live mount in this process and how many applies hold it (ISSUE-424,
+ * ISSUE-577; ADR-0075).
  */
-export class RacoonsDuplicateMountError extends Error {
-  readonly code = CREMATOR_DUPLICATE_MOUNT_CODE;
-  readonly key: string;
-
-  constructor(key: string) {
-    super(`cremator: a plugin for the durable root ${JSON.stringify(key)} is already mounted; `
-      + 'refusing the second apply rather than open a second ledger');
-    this.name = 'RacoonsDuplicateMountError';
-    this.key = key;
-  }
+interface ActivePluginMount {
+  readonly mount: RacoonsMount;
+  /**
+   * The config the mount was constructed with. A joined apply wires its own
+   * ctx's hooks, but its append flushing must follow the plan the mount was
+   * built with, never the options it passed and could not change.
+   */
+  readonly config: ResolvedRacoonsConfig;
+  /** Live applies on this mount; it closes when the last one releases. */
+  shares: number;
 }
 
 /**
- * The process-level registry (ISSUE-424, narrowed by ADR-0066 and ISSUE-498):
- * one live plugin per durable root. A mount's ledger paths depend on the
- * resolved root and the session id only — never on the journal, the knobs or the
- * bar — so two applies over one root would eventually open the same ledger
- * whatever their configuration says. `':memory:'` has no durable identity and is
- * not tracked, so tests may apply as many memory mounts as they need.
+ * The process-level registry (ISSUE-424, ISSUE-577; ADR-0075 decision 3): one
+ * live mount per durable root, joined by every later apply. A mount's ledger
+ * paths depend on the resolved root and the session id only — never on the
+ * journal, the knobs or the bar — so two mounts over one root would open two
+ * ledgers and two mount-state writers for the same session. A second apply
+ * therefore gets the live mount, never a second one, and the mount closes when
+ * its last holder releases. `':memory:'` has no durable identity and is not
+ * tracked, so tests may apply as many memory mounts as they need.
  */
-const activePluginApplies = new Map<string, true>();
+const activePluginMounts = new Map<string, ActivePluginMount>();
 
 /**
  * The identity "same durable root" means for the registry (ADR-0066 decisions 1
@@ -5765,20 +5806,15 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         { hostModelInfo: typeof ctx.llm?.resolveModelInfo === 'function' });
       const storage = resolveStorage(options.storage, config.crematorStorageRoot);
       /**
-       * ISSUE-424 / ADR-0066 / ISSUE-498: one live apply per durable root. The
-       * claim runs before any session opens a ledger, so a second apply can
-       * never construct a second ledger for the same session. Cancelled when
-       * this apply fails and when the host unloads the plugin's fiber.
+       * ISSUE-424 / ISSUE-577 / ADR-0075: one live mount per durable root. The
+       * registry is read before any session opens a ledger, so a second apply
+       * can never construct a second ledger for the same session; the second
+       * apply JOINS the live mount instead of being refused (ADR-0075 decision
+       * 2: never refuse or block). The host's fiber unload releases this
+       * holder, and the last release closes the mount.
        */
       const registryKey = pluginApplyKey(storage);
-      if (registryKey !== null) {
-        if (activePluginApplies.has(registryKey)) {
-          // The refusal names the root this caller passed, not its normalized
-          // form, so the host log line echoes the configuration it read.
-          throw new RacoonsDuplicateMountError(storage.root ?? registryKey);
-        }
-        activePluginApplies.set(registryKey, true);
-      }
+      const joined = registryKey === null ? undefined : activePluginMounts.get(registryKey);
       // A host-supplied ledger wins; otherwise the default plan is durable
       // (ADR-0013) and `':memory:'` only appears when a test asks for it.
       const ledgerSource = options.openLedger !== undefined ? 'host'
@@ -5791,62 +5827,135 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       const warn = (message: string): void => {
         try { ctx.logger?.warn?.(`racoons: ${message}`); } catch { /* logging only */ }
       };
-      let mount: ReturnType<typeof createRacoonsMount>;
-      try {
+      let mount: RacoonsMount;
+      /**
+       * The plan the wiring below flushes against: the live mount's own when
+       * this apply joined, the resolved config when it created the mount. A
+       * joined apply's options cannot change a mount that already exists; the
+       * `mount-shared` line names that they were not adopted.
+       */
+      let wiringConfig: ResolvedRacoonsConfig;
+      if (joined !== undefined) {
+        joined.shares += 1;
+        mount = joined.mount;
+        wiringConfig = joined.config;
+      } else {
         mount = createRacoonsMount({ config, storage, clock: { nowMs },
           ...llm === undefined ? {} : { llm },
           ...options.judgeRoute === undefined ? {} : { judgeRoute: options.judgeRoute },
           ...options.openLedger === undefined ? {} : { openLedger: options.openLedger },
           ...options.journal === undefined ? {} : { journal: options.journal },
           warn });
-      } catch (error) {
-        if (registryKey !== null) activePluginApplies.delete(registryKey);
-        throw error;
+        wiringConfig = config;
+        if (registryKey !== null) {
+          activePluginMounts.set(registryKey, { mount, config, shares: 1 });
+        }
       }
-      if (registryKey !== null) {
-        ctx.effect?.(() => () => { activePluginApplies.delete(registryKey); },
-          'racoons.mount-registry');
+      /**
+       * ISSUE-578 / ADR-0075: record this mount under the root's `mounts/`
+       * folder, so another process on the same folder can see it exists. The
+       * create never collides and never refuses; an unwritable folder is
+       * journaled and the mount continues without a record — no mount is
+       * admitted on the strength of a record, and the shared ledger's own
+       * write lock (`mount-state.ts`) is what keeps two mounts' facts apart.
+       */
+      let mountRecord: MountRecordFile | null = null;
+      if (storage.root !== undefined) {
+        mountRecord = joinMountRecords(storage.root);
+        if (mountRecord === null) {
+          mount.emitJournal('mount-record-error', { storageRoot: storage.root,
+            reason: 'the mounts folder or its record could not be written; '
+              + 'mounting without a record' });
+        }
       }
-      // Typed, not cast: `kind` must be a member of the closed journal
-      // vocabulary, so the mount line can never drift from the union
-      // (CRITIC-022 P3 #14).
-      const mountedLine: RacoonsJournalRecord = Object.freeze({
-        kind: 'mounted', atMs: nowMs(),
-        episodeNoNewPathSteps: config.episodeNoNewPathSteps, barBytes: config.barBytes,
-        enforcement: config.enforcement,
-        // The mount line names the configured ROOT, never a derived path: the
-        // literal `<sessionId>` is not a path any session uses (critic fix
-        // P3#10). Each session's effective plan is journaled as `storage-plan`
-        // where the refinement happens.
-        ...storage.root === undefined
-          ? { storage: storage.databasePath } : { storageRoot: storage.root },
-        // ADR-0013 ruling 8: runtime evidence comes from inside the mount.
-        ledgerSource, node: process.version,
-        judgeTimeoutMs: config.judgeTimeoutMs,
-        // ISSUE-022 chunks 5–6; ADR-0050 decision 2: both entry points are wired.
-        // `command` is the `/cremate` message; `threshold` is the automatic trigger,
-        // armed by an explicit `pruneThresholdTokens` bar or, on the deprecated
-        // compatibility path, by the window's half. The two flags below name what
-        // the apply leg will actually do with a pass, so an `unchanged` in a later
-        // line is readable from this one (CRITIC-022 P2 #8, P2 #11).
-        prune: config.contextWindowTokens === null && config.pruneThresholdTokens === null
-          ? 'command' : 'command+threshold',
-        window: config.contextWindowTokens,
-        windowSource: config.contextWindowTokens === null ? 'unresolved' : 'config',
-        pruneThreshold: config.pruneThresholdTokens,
-        // What the threshold counts (ISSUE-092): the host's own billed prompt
-        // from the last `usage` row (`input + cacheRead + cacheWrite`), one step
-        // stale, because the local estimate omitted tool-call arguments and ran
-        // at ~0.56 of the host meter on the 078 run. Before the first usage row
-        // the local whole-request estimate is the fallback, and each
-        // `prune-threshold` line says which reading it took.
-        estimate: 'host-billed-prompt',
-        nativeCompactionBackstop: config.nativeCompactionBackstop,
-      });
-      // The mounted line rides the mount's swallowing wrapper (ISSUE-430): a
-      // throwing sink is contained exactly as every other line is, so it cannot
-      // reject the plugin apply.
-      mount.emitJournal(mountedLine.kind, { ...mountedLine });
+      /** Live mount records this process can see on the root, this one included. */
+      const liveMountRecords = storage.root === undefined
+        ? 0 : readMountRecords(storage.root).length;
+      /**
+       * ISSUE-577: a second apply of one root holds the same mount, so its
+       * unload must not close the ledgers the other holder is still using —
+       * only the last release closes anything. Registered before the wiring, so
+       * an apply that throws partway still releases its holder when the host
+       * unloads the fiber (ISSUE-424's cleanup rule). ISSUE-578: this holder's
+       * own mount record goes with it, whatever the share count says.
+       */
+      ctx.effect?.(() => async () => {
+        try {
+          if (registryKey !== null) {
+            const held = activePluginMounts.get(registryKey);
+            if (held !== undefined && held.mount === mount) {
+              held.shares -= 1;
+              if (held.shares > 0) return;
+              activePluginMounts.delete(registryKey);
+            }
+          }
+          await mount.close();
+        } finally {
+          if (mountRecord !== null) releaseMountRecord(mountRecord);
+        }
+      }, 'racoons.close()');
+      if (joined !== undefined) {
+        // ISSUE-577 / ADR-0075: name the join and that this apply's options
+        // were not adopted, so a differing knob reads as a join, never as a
+        // mount that silently followed the second configuration.
+        mount.emitJournal('mount-shared', {
+          status: 'reused', scope: 'process',
+          shares: joined.shares,
+          // The line names the configured ROOT, never a derived path (the
+          // `mounted` line's rule).
+          ...storage.root === undefined
+            ? { storage: storage.databasePath } : { storageRoot: storage.root },
+          // ISSUE-578: the mount records this process can see, this one
+          // included, and this mount's own record when it has one.
+          mounts: liveMountRecords,
+          ...mountRecord === null ? {} : { record: mountRecord.path },
+        });
+      } else {
+        // Typed, not cast: `kind` must be a member of the closed journal
+        // vocabulary, so the mount line can never drift from the union
+        // (CRITIC-022 P3 #14).
+        const mountedLine: RacoonsJournalRecord = Object.freeze({
+          kind: 'mounted', atMs: nowMs(),
+          episodeNoNewPathSteps: config.episodeNoNewPathSteps, barBytes: config.barBytes,
+          enforcement: config.enforcement,
+          // The mount line names the configured ROOT, never a derived path: the
+          // literal `<sessionId>` is not a path any session uses (critic fix
+          // P3#10). Each session's effective plan is journaled as `storage-plan`
+          // where the refinement happens.
+          ...storage.root === undefined
+            ? { storage: storage.databasePath } : { storageRoot: storage.root },
+          // ISSUE-578: the mount records this process can see, this one
+          // included, and this mount's own record when it has one.
+          mounts: liveMountRecords,
+          ...mountRecord === null ? {} : { record: mountRecord.path },
+          // ADR-0013 ruling 8: runtime evidence comes from inside the mount.
+          ledgerSource, node: process.version,
+          judgeTimeoutMs: config.judgeTimeoutMs,
+          // ISSUE-022 chunks 5–6; ADR-0050 decision 2: both entry points are wired.
+          // `command` is the `/cremate` message; `threshold` is the automatic trigger,
+          // armed by an explicit `pruneThresholdTokens` bar or, on the deprecated
+          // compatibility path, by the window's half. The two flags below name what
+          // the apply leg will actually do with a pass, so an `unchanged` in a later
+          // line is readable from this one (CRITIC-022 P2 #8, P2 #11).
+          prune: config.contextWindowTokens === null && config.pruneThresholdTokens === null
+            ? 'command' : 'command+threshold',
+          window: config.contextWindowTokens,
+          windowSource: config.contextWindowTokens === null ? 'unresolved' : 'config',
+          pruneThreshold: config.pruneThresholdTokens,
+          // What the threshold counts (ISSUE-092): the host's own billed prompt
+          // from the last `usage` row (`input + cacheRead + cacheWrite`), one step
+          // stale, because the local estimate omitted tool-call arguments and ran
+          // at ~0.56 of the host meter on the 078 run. Before the first usage row
+          // the local whole-request estimate is the fallback, and each
+          // `prune-threshold` line says which reading it took.
+          estimate: 'host-billed-prompt',
+          nativeCompactionBackstop: config.nativeCompactionBackstop,
+        });
+        // The mounted line rides the mount's swallowing wrapper (ISSUE-430): a
+        // throwing sink is contained exactly as every other line is, so it cannot
+        // reject the plugin apply.
+        mount.emitJournal(mountedLine.kind, { ...mountedLine });
+      }
 
       // Both handlers need a session, resolved lazily at call time: the
       // registration must not depend on a session existing when the plugin
@@ -5881,6 +5990,11 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           });
           mount.emitJournal('tool-registration', { status: 'registered',
             registered: offered.length, offered });
+          // ISSUE-577: the tools belong to THIS apply's ctx, so they are
+          // unregistered by this apply's own unload. The effect is registered
+          // after `racoons.close()`, and Cordis runs effects in reverse, so the
+          // tools go before the mount's last holder may close it.
+          ctx.effect?.(() => () => { unregisterTools?.(); }, 'racoons.tools');
         } catch (error) {
           // ISSUE-443: registration is all-or-nothing, so a host refusal leaves
           // NEITHER tool advertised while the `mounted` line above reads as a
@@ -6014,7 +6128,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
             { turn: Number(payload.turn ?? 0), step: Number(payload.step ?? 0) },
             signal, marker?.id);
           if (stepResult.appendRequest !== null) {
-            try { flushAppends(session, stepResult.entry, config); }
+            try { flushAppends(session, stepResult.entry, wiringConfig); }
             catch (error) {
               warn(`append publish: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -6054,7 +6168,7 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           try {
             const turnResult = await mount.runTurnEnd(session, Number(payload.turn ?? 0));
             if (turnResult.appendRequest !== null) {
-              try { flushAppends(session, turnResult.entry, config); }
+              try { flushAppends(session, turnResult.entry, wiringConfig); }
               catch (error) {
                 warn(`turn-end append publish: ${error instanceof Error ? error.message : String(error)}`);
               }
@@ -6066,14 +6180,6 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           }
         }
       });
-
-      // Cordis owns plugin teardown through `ctx.effect`: the returned function
-      // runs when the plugin's fiber unloads, which is where the mount closes
-      // each ledger it owns (the durable file stays on disk, unmodified).
-      ctx.effect?.(() => async () => {
-        unregisterTools?.();
-        await mount.close();
-      }, 'racoons.close()');
     },
   };
 }

@@ -1,0 +1,112 @@
+{
+  "slug": "seal-failed-search",
+  "task": "Search this directory for the literal string ZZZ_NOT_PRESENT_ZZZ in two files at once, then reply DONE.",
+  "timeoutMs": 120000,
+  "perturbation": "add the needle to alpha.txt so the episode has a hit; the run must fail by name 'seal plans one episode'",
+  "workFiles": {
+    "alpha.txt": "alpha body\nno needle here\n",
+    "beta.txt": "beta body\nstill nothing\n"
+  },
+  "racoons": {
+    "episodeNoNewPathSteps": 1,
+    "barBytes": 2048
+  },
+  "script": {
+    "title": "Seal a failed search",
+    "replies": [
+      {
+        "name": "two-zero-match-greps-in-one-step",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Searching both files at once.",
+          "calls": [
+            {
+              "id": "rig_grep_1",
+              "name": "grep",
+              "input": {
+                "pattern": "ZZZ_NOT_PRESENT_ZZZ",
+                "path": "alpha.txt"
+              }
+            },
+            {
+              "id": "rig_grep_2",
+              "name": "grep",
+              "input": {
+                "pattern": "ZZZ_NOT_PRESENT_ZZZ",
+                "path": "beta.txt"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-done",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2,
+          "last_assistant_tool_names": [
+            "grep",
+            "grep"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "DONE"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "titleRequests": {
+        "max": 1
+      },
+      "titleRequestsHaveNoTools": true,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 2,
+      "results": 2,
+      "failedResults": 0,
+      "callIds": [
+        "rig_grep_1",
+        "rig_grep_2"
+      ],
+      "names": [
+        "grep",
+        "grep"
+      ]
+    },
+    "session": {
+      "userTextContains": "ZZZ_NOT_PRESENT_ZZZ",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "ledger": true,
+      "sealEpisodes": 1,
+      "negativeFacts": 1,
+      "negativeFactPrefix": "[search: ZZZ_NOT_PRESENT_ZZZ]",
+      "surfaceSealed": 1,
+      "ledgerSeals": {
+        "episodes": 1
+      },
+      "secondPassAddsNothing": 1
+    },
+    "stdout": {
+      "finalText": "DONE"
+    }
+  }
+}

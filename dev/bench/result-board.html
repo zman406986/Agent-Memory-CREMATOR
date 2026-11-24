@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RACOONS test result board — template v1</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f4f2;
+    --surface: #ffffff;
+    --fg: #1b1d20;
+    --fg-soft: #3c3f44;
+    --muted: #6a6f76;
+    --line: #e3e4e6;
+    --line-strong: #c7cacf;
+    --zebra: #f8f8f7;
+    --hover: #edf2f7;
+    --head-bg: #fbfbfa;
+    --note-bg: #f7f8f8;
+    --focus: #2f6f9f;
+    --pair-rule: #9db3c7;
+    --product-bg: #e9f1f8;
+    --product-fg: #214d72;
+    --product-line: #c7d9e9;
+    --vanilla-bg: #f4f0e8;
+    --vanilla-fg: #5b5242;
+    --vanilla-line: #e1d9ca;
+    --test-fg: #6a6f76;
+    --test-line: #d5d8db;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1114;
+      --surface: #16191d;
+      --fg: #e7e8ea;
+      --fg-soft: #c4c7cb;
+      --muted: #969ca4;
+      --line: #272b30;
+      --line-strong: #3b4047;
+      --zebra: #191c20;
+      --hover: #1f2832;
+      --head-bg: #121518;
+      --note-bg: #191c20;
+      --focus: #8ec2ea;
+      --pair-rule: #506b83;
+      --product-bg: #16283a;
+      --product-fg: #a9cce9;
+      --product-line: #28415a;
+      --vanilla-bg: #262219;
+      --vanilla-fg: #d8ccb7;
+      --vanilla-line: #3e382a;
+      --test-fg: #969ca4;
+      --test-line: #34383d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 28px 24px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .board { max-width: 1440px; margin: 0 auto; display: grid; gap: 18px; }
+  .board-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.25; }
+  h2 { margin: 0; font-size: 15px; font-weight: 650; }
+  .sub { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .rule { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+  .badge {
+    flex: none; padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--surface); color: var(--muted); font-size: 11.5px; white-space: nowrap;
+  }
+  .legend {
+    list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 28px;
+    color: var(--muted); font-size: 12.5px; line-height: 1.55;
+  }
+  .legend li { margin: 0; }
+  .legend strong { color: var(--fg-soft); font-weight: 600; }
+  .viewbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .view-toggle {
+    font: inherit; font-size: 12.5px; font-weight: 600; color: var(--fg);
+    background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .view-toggle:hover { background: var(--hover); }
+  .view-toggle[aria-pressed="true"] { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  .view-toggle.is-partial { border-style: dashed; }
+  .hint { margin: 0; color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1 1 24px; }
+  .groups { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font: inherit; font-size: 12px; color: var(--muted); background: transparent;
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .chip:hover { color: var(--fg); border-color: var(--line-strong); }
+  .chip[aria-pressed="true"] { color: var(--fg); background: var(--head-bg); border-color: var(--line-strong); }
+  .chip.is-partial { border-style: dashed; color: var(--muted); }
+  .run-selector { margin: 10px 0; }
+  .table-scroll {
+    position: relative; min-width: 0;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .table-scroll.scroll-x .results th[data-col="task"],
+  .table-scroll.scroll-x .results td[data-col="task"] { min-width: 140px; }
+  .table-scroll.scroll-x .results th[data-col="outcome"],
+  .table-scroll.scroll-x .results td[data-col="outcome"] { min-width: 190px; }
+  .table-scroll.scroll-x .results th[data-col="model"],
+  .table-scroll.scroll-x .results td[data-col="model"] { min-width: 105px; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  table.results { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13.5px; }
+  .results th, .results td {
+    padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle;
+  }
+  .results thead th {
+    position: sticky; top: 0; z-index: 3; padding: 0;
+    background: var(--head-bg); border-bottom: 1px solid var(--line-strong);
+    color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: 0.04em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .results thead th.notes-head { padding: 9px 10px; text-align: right; }
+  .col-toggle {
+    display: block; width: 100%; padding: 9px 10px; margin: 0;
+    background: none; border: 0; font: inherit; color: inherit; text-align: left;
+    letter-spacing: inherit; text-transform: inherit; white-space: nowrap; cursor: pointer;
+  }
+  .col-toggle:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 3px; }
+  .results thead th.num .col-toggle { text-align: right; }
+  .results thead th.is-collapsed { width: 1%; padding: 0; }
+  .results thead th.is-collapsed .col-toggle { padding-left: 7px; padding-right: 7px; color: var(--muted); }
+  .results .run-head, .results .run-cell {
+    position: sticky; left: 0; width: 200px; min-width: 200px; max-width: 200px;
+    border-right: 1px solid var(--line);
+  }
+  .results .run-head { z-index: 4; padding: 9px 10px; }
+  .results .run-cell { z-index: 2; font-size: 12px; font-weight: 500; line-height: 1.4; overflow-wrap: anywhere; }
+  .results tbody { --row-bg: var(--surface); }
+  .results tbody:nth-of-type(even) { --row-bg: var(--zebra); }
+  .results tr.result > * { background: var(--row-bg); }
+  .results tr.result:hover > * { background: var(--hover); }
+  .results tr.result > :first-child { border-left: 3px solid transparent; }
+  .results tbody.pair tr.result > :first-child { border-left-color: var(--pair-rule); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .results td[data-col="task"] { color: var(--muted); text-wrap: pretty; }
+  .results td[data-col="outcome"] { color: var(--fg-soft); font-size: 13px; text-wrap: pretty; }
+  .results td[data-col="compactions"], .results td[data-col="removed"] { white-space: normal; }
+  .unit { white-space: nowrap; }
+  .arm {
+    display: inline-block; padding: 2px 8px; border: 1px solid; border-radius: 4px;
+    font-size: 11.5px; font-weight: 600; line-height: 1.45; white-space: nowrap;
+  }
+  .arm-product { background: var(--product-bg); border-color: var(--product-line); color: var(--product-fg); }
+  .arm-vanilla { background: var(--vanilla-bg); border-color: var(--vanilla-line); color: var(--vanilla-fg); }
+  .arm-test { background: transparent; border-color: var(--test-line); color: var(--test-fg); }
+  .cost { white-space: nowrap; }
+  .cost .money { display: block; font-size: 15.5px; font-weight: 650; line-height: 1.25; color: var(--fg); }
+  .cost .qual { display: block; font-size: 10.5px; font-weight: 400; line-height: 1.35; color: var(--muted); }
+  .note-toggle-cell { width: 58px; text-align: right; }
+  .note-toggle {
+    font: inherit; font-size: 11.5px; font-weight: 500; color: var(--muted);
+    background: none; border: 0; padding: 4px 2px; cursor: pointer; white-space: nowrap;
+  }
+  .note-toggle::before { content: "+ "; }
+  .note-toggle[aria-expanded="true"] { color: var(--fg); font-weight: 600; }
+  .note-toggle[aria-expanded="true"]::before { content: "− "; }
+  .note-toggle:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 3px; }
+  .note-row > .note-cell {
+    padding: 0; background: var(--note-bg);
+    border-left: 3px solid transparent; border-bottom: 1px solid var(--line);
+  }
+  .results tbody.pair .note-row > .note-cell { border-left-color: var(--pair-rule); }
+  .note-body {
+    padding: 12px 16px 14px 14px; max-width: 122ch;
+    font-size: 13px; line-height: 1.65; color: var(--fg-soft); text-wrap: pretty;
+  }
+  .guide {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+    padding: 0 14px; color: var(--muted); font-size: 12.5px;
+  }
+  .guide summary { padding: 11px 0; color: var(--fg-soft); font-size: 13px; font-weight: 500; cursor: pointer; }
+  .guide ul { margin: 0 0 12px; padding-left: 18px; }
+  .guide li { margin: 5px 0; line-height: 1.55; }
+  .guide strong { color: var(--fg-soft); font-weight: 600; }
+  .charts { display: grid; gap: 10px; }
+  .charts-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+  .chart-key { list-style: none; margin: 0; padding: 0; display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 12px; }
+  .chart-key li { display: flex; align-items: center; gap: 5px; }
+  .chart-key .swatch { width: 9px; height: 9px; border-radius: 2px; border: 1px solid var(--line-strong); }
+  .swatch-product { background: var(--product-fg); }
+  .swatch-vanilla { background: var(--vanilla-fg); }
+  .swatch-ask { background: var(--product-line); }
+  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+  .chart-card {
+    margin: 0; padding: 12px 14px 10px; min-width: 0;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  }
+  .chart-card svg { display: block; width: 100%; height: auto; font-family: inherit; }
+  .chart-card figcaption { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .chart-card .grid-line { stroke: var(--line); stroke-width: 0.7; }
+  .chart-card .axis-line { stroke: var(--line-strong); stroke-width: 0.8; }
+  .chart-card .limit { stroke: var(--muted); stroke-width: 0.8; stroke-dasharray: 3 3; }
+  .chart-card .tick { fill: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
+  .chart-card .val { fill: var(--fg-soft); font-size: 8px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .chart-card .cat { fill: var(--muted); font-size: 8.5px; }
+  .chart-card .bar-product, .chart-card .bar-main { fill: var(--product-fg); }
+  .chart-card .bar-vanilla { fill: var(--vanilla-fg); }
+  .chart-card .bar-ask { fill: var(--product-line); stroke: var(--surface); stroke-width: 0.8; }
+  .scope-tag {
+    display: inline-block; padding: 2px 8px; border: 1px solid var(--line-strong);
+    border-radius: 999px; color: var(--muted); font-size: 11px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .scope-tag-warn {
+    background: var(--vanilla-bg); border-color: var(--vanilla-line); color: var(--vanilla-fg);
+  }
+  .control-note { margin: 10px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+  .chart-wide { padding-bottom: 12px; }
+  .rate-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+  .rate-table th, .rate-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .rate-table thead th {
+    background: var(--head-bg); color: var(--muted); font-size: 11px; font-weight: 650;
+    letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--line-strong);
+    white-space: nowrap;
+  }
+  .rate-table tbody th { color: var(--fg-soft); font-weight: 600; white-space: nowrap; }
+  .rate-table th.num, .rate-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .rate-table .basis { color: var(--muted); }
+  .rate-table tbody tr:last-child th, .rate-table tbody tr:last-child td { border-bottom: 0; }
+  .takeaway {
+    margin: 0; padding: 10px 12px; border-left: 3px solid var(--pair-rule);
+    background: var(--note-bg); color: var(--fg-soft); font-size: 13px; line-height: 1.55;
+  }
+  @media (max-width: 700px) {
+    .chart-grid { grid-template-columns: 1fr; }
+  }
+  [hidden] { display: none !important; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .checkpoints { display: grid; gap: 10px; }
+  .checkpoints .table-scroll { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  table.checkpoint { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+  .checkpoint th, .checkpoint td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .checkpoint thead th {
+    background: var(--head-bg); color: var(--muted); font-size: 11px; font-weight: 650;
+    letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--line-strong);
+  }
+  .checkpoint thead tr:first-child th:first-child { text-align: right; }
+  .checkpoint thead tr:first-child th[colspan] { text-align: center; color: var(--fg-soft); }
+  .checkpoint thead tr:last-child th { text-align: right; }
+  .checkpoint tbody th { text-align: right; width: 48px; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .checkpoint tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .checkpoint tbody tr:nth-child(even) td, .checkpoint tbody tr:nth-child(even) th { background: var(--zebra); }
+  .checkpoint tbody tr:hover td, .checkpoint tbody tr:hover th { background: var(--hover); }
+  .checkpoint .deliverable { white-space: nowrap; }
+  .checkpoint code { color: var(--fg-soft); }
+  .checkpoint tbody tr:last-child td, .checkpoint tbody tr:last-child th { border-bottom: 0; }
+  button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--focus); outline-offset: 2px;
+  }
+</style>
+</head>
+<body>
+<main class="board" id="racoons-result-board">
+  <header class="board-head">
+    <div>
+      <h1>RACOONS test result board</h1>
+      <p class="sub">One row per arm · run to the brief's file count · a run that hit its token grant is censored, not completed</p>
+      <p class="sub">dsh 36/36: one continued session per arm, 32 carried + 4 new · product 0 vs vanilla 1/2/1 compactions</p>
+      <p class="sub">final-shape 105-task results (2026-11-19): dsh three pairs, opencode two descriptive lanes · old 36/48-record sections kept below</p>
+      <p class="sub"><a href="#final105">final-shape 105-task results ↓</a> · <a href="#dsh36">dsh 36-record results ↓</a> · <a href="#cost36">Full 36-record cost at four model rates ↓</a> · <a href="#dsh48">fresh 48-record check ↓</a></p>
+    </div>
+    <span class="badge">template v1 · 105-task results</span>
+  </header>
+
+  <ul class="legend">
+    <li><strong>Cost USD is the claim.</strong> It is the host's recorded price where available, otherwise computed from token counts at $0.15 / $0.003 / $0.60 per M uncached / cached / output (official off-peak rates).</li>
+    <li><strong>Token totals</strong> and dollars move apart because the ask lane is priced by its cache split: 83–86% of the ask prompt is cached at $0.003/M, the rest at $0.15/M.</li>
+    <li><strong>Ask triggers</strong> count threshold-crossing passes, not files. Compare a continuation with its own predecessor row, not with an earlier campaign.</li>
+    <li><strong>Tokens removed (est.)</strong> is one estimated-token number per row. Product rows are ledger bytes divided by 4; vanilla rows are the host pruner's own shadowed-token count. The two are estimates on the same token scale but not the same measurement. Exact figures and their sources are in Notes.</li>
+    <li><strong>Token columns are sums over every request.</strong> The context at one moment is one request's billed prompt: product peaks 247–255k, vanilla 319.7–319.8k. The host compacts near 320k.</li>
+    <li><strong>The vanilla pruner</strong> drops old results in bursts: 42 events in 2 bursts (206k tokens) in r1. Each burst rewrites the cached prefix, so the next request pays 159.7k and 100.8k uncached. Roughly a wash in dollars; its value is delayed compaction.</li>
+  </ul>
+
+  <section class="charts" id="final105" aria-labelledby="final105-title">
+    <div class="charts-head">
+      <div>
+        <h2 id="final105-title">Final-shape 105-task campaign — dsh, three pairs; opencode, two descriptive lanes</h2>
+        <p class="rule">105 SWE tasks, 400k window, deepseek-flash official endpoint; dsh uses six batches per arm, opencode eleven segments; final trigger (60k above the post-removal reading; no automatic ask at/above 300k); corrected cache-aware cost.</p>
+      </div>
+      <span class="scope-tag">dsh 6 batches · opencode 11 segments · n=1 per cell</span>
+    </div>
+    <p class="rule">dsh, three pairs.</p>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">dsh final-shape 105-task campaign, three pairs.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Pair</th>
+            <th scope="col">Arm</th>
+            <th scope="col" class="num">Solved</th>
+            <th scope="col" class="num">Tasks before 1st compaction</th>
+            <th scope="col" class="num">Median ctx at task write</th>
+            <th scope="col" class="num">True tokens</th>
+            <th scope="col" class="num">Cost USD</th>
+            <th scope="col" class="num">1st compaction (turn)</th>
+            <th scope="col" class="num">Compactions</th>
+            <th scope="col" class="num">1st-batch peak</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Pair 1</th><td><span class="arm arm-product">L · product</span></td><td class="num">73/105 (67/99 adjusted)</td><td class="num">61</td><td class="num">120,795</td><td class="num">139.08M</td><td class="num">$1.152</td><td class="num">548</td><td class="num">2</td><td class="num">121,320</td></tr>
+          <tr><th scope="row">Pair 1</th><td><span class="arm arm-vanilla">V · vanilla</span></td><td class="num">64/105 (64/99)</td><td class="num">29</td><td class="num">203,933</td><td class="num">225.54M</td><td class="num">$1.544</td><td class="num">243</td><td class="num">5</td><td class="num">237,840</td></tr>
+          <tr><th scope="row">Pair 2</th><td><span class="arm arm-product">L · product</span></td><td class="num">72/105 (74/105 hypothetical)</td><td class="num">44</td><td class="num">153,031</td><td class="num">156.33M</td><td class="num">$1.408</td><td class="num">415</td><td class="num">2</td><td class="num">138,297</td></tr>
+          <tr><th scope="row">Pair 2</th><td><span class="arm arm-vanilla">V · vanilla</span></td><td class="num">70/105</td><td class="num">29</td><td class="num">202,796</td><td class="num">251.71M</td><td class="num">$1.518</td><td class="num">288</td><td class="num">4</td><td class="num">246,762</td></tr>
+          <tr><th scope="row">Pair 3</th><td><span class="arm arm-product">L · product</span></td><td class="num">76/105 (77/105 if tamper credited)</td><td class="num">57</td><td class="num">177,740</td><td class="num">162.73M</td><td class="num">$1.285</td><td class="num">448</td><td class="num">2</td><td class="num">123,042</td></tr>
+          <tr><th scope="row">Pair 3</th><td><span class="arm arm-vanilla">V · vanilla</span></td><td class="num">77/105</td><td class="num">33</td><td class="num">220,378</td><td class="num">238.64M</td><td class="num">$1.439</td><td class="num">339</td><td class="num">4</td><td class="num">225,645</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="rule">opencode, two descriptive product lanes (n=1, n=3).</p>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">opencode final-shape n=1 and n=3 descriptive lanes.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Run</th>
+            <th scope="col" class="num">Solved</th>
+            <th scope="col" class="num">Trigger fires</th>
+            <th scope="col" class="num">75% skips</th>
+            <th scope="col" class="num">Ask calls</th>
+            <th scope="col" class="num">Ask errors</th>
+            <th scope="col" class="num">Segment count</th>
+            <th scope="col">Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row"><span class="arm arm-product">product n=1</span></th><td class="num">76/105</td><td class="num">29</td><td class="num">58</td><td class="num">23</td><td class="num">0</td><td class="num">11</td><td>shared ledger, cumulative intents, no reset.</td></tr>
+          <tr><th scope="row"><span class="arm arm-product">product n=3</span></th><td class="num">73/105</td><td class="num">31</td><td class="num">37</td><td class="num">24</td><td class="num">0</td><td class="num">11</td><td>final five-task batch rerun after an operator interruption; partial edits were present.</td></tr>
+          <tr><th scope="row"><span class="arm arm-vanilla">vanilla (earlier lane)</span></th><td class="num">76/105</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">11</td><td>same synthetic starting workspace; no shell.</td></tr>
+          <tr><th scope="row"><span class="arm arm-vanilla">vanilla (new lane)</span></th><td class="num">78/105</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">11</td><td>same runner; segment 11 repair; its result failed the seed-row integrity assertion. Clean through 10: 75/100.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="control-note">Two product runs and two vanilla controls (76, 78); descriptive, not a paired estimate; the old per-revision product lane scored 75/105. A third product run stopped at segment 9 on a provider connection reset and is not counted; a new-session retry reset the same way.</p>
+    <div class="takeaway">
+      <strong>Caveats.</strong>
+      <ul>
+        <li>One run per cell; no intervals or causal claim.</li>
+        <li>Pair 1: six vanilla rows are pre-fix evaluation-scorer errors, all six solved by the library; adjusted 67/99 vs 64/99.</li>
+        <li>Pair 2: two tamper-flagged library rows counted non-pass; 74/105 is hypothetical.</li>
+        <li>Pair 3: one tamper-flagged row (towncrier temporary files) counted non-pass; 77/105 if credited.</li>
+        <li>Cost uses each lane's reported cache split, not all-uncached.</li>
+        <li>"Tasks before first compaction" counts report writes (pass or fail) and is mechanically related to delayed compaction; it is consistent with, not independent of, the context result.</li>
+        <li>Opencode: synthetic starting workspace, no shell, two product runs and two vanilla controls; no cost/delay claim. Both product runs used repair continuations in some batches (n=1 batches 4–6; n=3 batches 5 and 7). The n=3 final five-task batch was rerun after an operator interruption with partial edits already in the shared work tree. The new vanilla lane's segment 11 needed a repair and its result failed the seed-row integrity assertion; its clean prefix through 10 is 75/100.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="charts" id="dsh36" aria-labelledby="dsh36-title">
+    <div class="charts-head">
+      <div>
+        <h2 id="dsh36-title">dsh — 36 records, one continued session per arm</h2>
+        <p class="rule">32 records carried from a fresh run plus 4 new, 36/36 per arm. Full-session totals only; the four new records are part of the 36 and are not a separate claim.</p>
+      </div>
+      <span class="scope-tag">continued sessions · n=3</span>
+    </div>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">dsh full 36-record per-run totals.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Run</th>
+            <th scope="col" class="num">True tokens</th>
+            <th scope="col" class="num">Cost USD</th>
+            <th scope="col" class="num">Peak prompt</th>
+            <th scope="col" class="num">Compactions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>P1</td><td class="num">34,595,236</td><td class="num">$0.4066</td><td class="num">247,207</td><td class="num">0</td></tr>
+          <tr><td>P2</td><td class="num">32,388,446</td><td class="num">$0.3926</td><td class="num">254,646</td><td class="num">0</td></tr>
+          <tr><td>P3</td><td class="num">28,427,049</td><td class="num">$0.3900</td><td class="num">248,988</td><td class="num">0</td></tr>
+          <tr><td>V1</td><td class="num">32,783,288</td><td class="num">$0.3508</td><td class="num">319,744</td><td class="num">1</td></tr>
+          <tr><td>V2</td><td class="num">43,492,471</td><td class="num">$0.4826</td><td class="num">319,706</td><td class="num">2</td></tr>
+          <tr><td>V3b</td><td class="num">40,318,565</td><td class="num">$0.3590</td><td class="num">319,802</td><td class="num">1</td></tr>
+          <tr><th scope="row">Product median</th><td class="num">32,388,446</td><td class="num">$0.3926</td><td class="num">248,988</td><td class="num">0</td></tr>
+          <tr><th scope="row">Vanilla median</th><td class="num">40,318,565</td><td class="num">$0.3590</td><td class="num">319,744</td><td class="num">1</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="control-note">Full-session totals: prior 32-record <code>round-1/result.json</code> plus resumed 4-record <code>result.json</code>. Cost includes main prompt/output, ask prompt/output and compaction prompt/output. No separate 4-record claim is made.</p>
+    <p class="takeaway"><strong>Limitation.</strong> Each arm started from its own 32-record session. First resumed prompt: P1 242,081, P2 178,386, P3 243,451 tokens (product, 178–243k) against V1 316,426, V2 297,731, V3b 305,572 (vanilla, 298–316k). The lower product peak is partly inherited, so the 0-vs-1/2/1 compaction result is an observation, not a controlled causal claim. Restore is not exercised.</p>
+  </section>
+
+
+  <section class="charts" id="dsh48" aria-labelledby="dsh48-title">
+    <div class="charts-head">
+      <div>
+        <h2 id="dsh48-title">dsh — fresh 48 records, one pair</h2>
+        <p class="rule">Both arms start from the same pristine image (1,787 files, digest <code>9087422d…</code>); one fresh session per arm, no carried context. This is an exploratory n=1 check, not part of the 36-record n=3 claim.</p>
+      </div>
+      <span class="scope-tag">fresh sessions · n=1</span>
+    </div>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">Fresh 48-record dsh pair, full-session totals.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Arm</th>
+            <th scope="col" class="num">True tokens</th>
+            <th scope="col" class="num">Main only</th>
+            <th scope="col" class="num">Peak prompt</th>
+            <th scope="col" class="num">Compactions</th>
+            <th scope="col" class="num">Removals</th>
+            <th scope="col" class="num">Turns</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Product</th><td class="num">34,152,748</td><td class="num">30,285,785</td><td class="num">252,090</td><td class="num">0</td><td class="num">102</td><td class="num">209</td></tr>
+          <tr><th scope="row">Vanilla</th><td class="num">39,406,005</td><td class="num">39,200,413</td><td class="num">319,470</td><td class="num">1</td><td class="num">0</td><td class="num">179</td></tr>
+          <tr><th scope="row">Delta</th><td class="num">−13.3%</td><td class="num">−22.7%</td><td class="num">−21.1%</td><td class="num">0 vs 1</td><td class="num">—</td><td class="num">+16.8%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="control-note">True tokens include main prompt/output, the ask lane and native compaction; product main-only is 30,285,785 plus a 3,866,963 ask lane; vanilla adds a 205,592 compaction lane. Both arms wrote 48/48 and printed BENCH-DONE; both passed, exit 0. The product peak is 4.2x its 60,000-token prune trigger, so this does not show context held at 60k.</p>
+    <p class="takeaway"><strong>Start contexts are level.</strong> First prompts: product 14,444, vanilla 14,166 (+278 tokens, 2.0%), against the 36 pair's 178–243k vs 298–316k. The 36 pair's inherited-context limitation does not apply here. Limits: n=1; the product arm bundles pruner-off, mount and ask lane, so this is not a removal-only effect; read boundary judged 0 and reasoning wire was not measured; product 48/48 is the run-end result (the live arm was reset after the run). The set doubles read bytes (1,361 → 3,112 reads; 16.6 → 33.1 MB) but not true tokens (36 medians 32.39M/40.32M → 34.15M/39.41M, 1.05x/0.98x): it is an extension in task breadth, not a 2x token workload. Evidence: <code>docs/research/2026-11-12-fresh-48-pair.md</code>.</p>
+  </section>
+  <section class="charts" id="cost36" aria-labelledby="cost36-title">
+    <div class="charts-head">
+      <div>
+        <h2 id="cost36-title">Full 36-record cost at four model rates</h2>
+        <p class="rule">dsh: one continued session per arm, 32 carried + 4 new, 36/36. Cost includes main, ask and compaction lanes. The four new records are part of the 36 and are not a separate claim.</p>
+      </div>
+      <span class="scope-tag scope-tag-warn">assumed rates, not vendor quotes</span>
+    </div>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">dsh full 36-record cost at four model rates.</caption>
+        <thead>
+          <tr>
+            <th scope="col">dsh arm</th>
+            <th scope="col" class="num">True tokens</th>
+            <th scope="col" class="num">DeepSeek official</th>
+            <th scope="col" class="num">GPT-6.1 Sol (Astra placeholder)</th>
+            <th scope="col" class="num">GPT-6 Astra</th>
+            <th scope="col" class="num">Claude Opus 5.5</th>
+            <th scope="col" class="num">GLM 5.3</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Product median</th><td class="num">32,388,446</td><td class="num">$0.3926</td><td class="num">$7.10</td><td class="num">$7.10</td><td class="num">$78.50</td><td class="num">$10.82</td></tr>
+          <tr><th scope="row">Vanilla median</th><td class="num">40,318,565</td><td class="num">$0.3590</td><td class="num">$7.71</td><td class="num">$7.71</td><td class="num">$85.34</td><td class="num">$12.44</td></tr>
+          <tr><th scope="row">Product / vanilla</th><td class="num">0.80x</td><td class="num">1.09x</td><td class="num">0.92x</td><td class="num">0.92x</td><td class="num">0.92x</td><td class="num">0.87x</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="control-note"><strong>Full 36, one session per arm.</strong> The product median uses 20% fewer true tokens and is cheaper at the premium cards, but its ask lane's uncached share makes it 9% more expensive at the official rates. P1 used 5.5% more tokens than its vanilla, so the 20% is a median, not a per-pair rule. The vanilla full-session cost is an upper bound: the full-36 cost prices the vanilla compaction prompt uncached because result.json has no cache split; the product's DeepSeek disadvantage is therefore at least 9%, and if compaction were cached the gap is larger. The full-session compaction count is product 0 vs vanilla 1/2/1; the full-session peak is product 247–255k vs vanilla 319.7–319.8k. The 36/36 record count is one continued session per arm: 32 carried, 4 new, no new session; the four new records are part of the 36 and are not a separate claim. Sol is the Astra placeholder, not an independent rate card. See <code>docs/research/2026-11-10-resumed-36-pair.md</code> § full 36.</p>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">dsh per-run full 36-record cost at four model rates.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Run</th>
+            <th scope="col" class="num">True tokens</th>
+            <th scope="col" class="num">DeepSeek</th>
+            <th scope="col" class="num">Sol (Astra)</th>
+            <th scope="col" class="num">Astra</th>
+            <th scope="col" class="num">Opus 5.5</th>
+            <th scope="col" class="num">GLM 5.3</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>P1</td><td class="num">34,595,236</td><td class="num">$0.4066</td><td class="num">$7.51</td><td class="num">$7.51</td><td class="num">$82.76</td><td class="num">$11.46</td></tr>
+          <tr><td>P2</td><td class="num">32,388,446</td><td class="num">$0.3926</td><td class="num">$7.10</td><td class="num">$7.10</td><td class="num">$78.50</td><td class="num">$10.82</td></tr>
+          <tr><td>P3</td><td class="num">28,427,049</td><td class="num">$0.3900</td><td class="num">$6.68</td><td class="num">$6.68</td><td class="num">$73.43</td><td class="num">$9.86</td></tr>
+          <tr><td>V1</td><td class="num">32,783,288</td><td class="num">$0.3508</td><td class="num">$6.98</td><td class="num">$6.98</td><td class="num">$75.71</td><td class="num">$10.61</td></tr>
+          <tr><td>V2</td><td class="num">43,492,471</td><td class="num">$0.4826</td><td class="num">$9.12</td><td class="num">$9.12</td><td class="num">$101.07</td><td class="num">$14.17</td></tr>
+          <tr><td>V3b</td><td class="num">40,318,565</td><td class="num">$0.3590</td><td class="num">$7.71</td><td class="num">$7.71</td><td class="num">$85.34</td><td class="num">$12.44</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="control-note">Per-run full-session totals: prior 32 <code>round-1/result.json</code> plus resumed 4 <code>result.json</code>; cost includes main prompt/output, ask prompt/output and compaction prompt/output. Full-session compaction: P1–P3 0/0/0; V1/V2/V3b 1/2/1. Full-session peaks: product 247,207 / 254,646 / 248,988; vanilla 319,744 / 319,706 / 319,802. The four new records are part of the 36 and are not a separate claim.</p>
+    <div class="table-scroll">
+      <table class="rate-table">
+        <caption class="sr-only">Rate cards used in the full 36-record extrapolation.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Rate card</th>
+            <th scope="col" class="num">Uncached / M</th>
+            <th scope="col" class="num">Cached / M</th>
+            <th scope="col" class="num">Output / M</th>
+            <th scope="col">Basis</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">DeepSeek official</th><td class="num">$0.15</td><td class="num">$0.003</td><td class="num">$0.60</td><td class="basis">measured rates</td></tr>
+          <tr><th scope="row">GPT-6.1 Sol</th><td class="num">$1.25</td><td class="num">$0.125</td><td class="num">$10.00</td><td class="basis">no Sol rate in the repo; placeheld at the Astra card — not a vendor quote</td></tr>
+          <tr><th scope="row">GPT-6 Astra</th><td class="num">$1.25</td><td class="num">$0.125</td><td class="num">$10.00</td><td class="basis">assumed — not a vendor quote</td></tr>
+          <tr><th scope="row">Claude Opus 5.5</th><td class="num">$15.00</td><td class="num">$1.50</td><td class="num">$75.00</td><td class="basis">assumed — not a vendor quote</td></tr>
+          <tr><th scope="row">GLM 5.3</th><td class="num">$1.40</td><td class="num">$0.26</td><td class="num">$5.60</td><td class="basis">input/cached from the 2026-10-26 floor-calibration note; output at q = 4, assumed</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="takeaway">Full 36: the product median uses fewer tokens and is cheaper at the premium cards, but at the official DeepSeek rates it is at least 9% more expensive.</p>
+  </section>
+
+  <div class="charts-head">
+    <div>
+      <h2 id="history-title">Historical 13-file results</h2>
+      <p class="rule">Older 13-file runs, one row per arm. These are not part of the 36-record claim.</p>
+    </div>
+  </div>
+
+  <div class="viewbar">
+    <button type="button" class="view-toggle" id="more-numbers" aria-pressed="false" aria-controls="results-table">More numbers</button>
+    <p class="hint">Pair rows share the run id · click a header to hide a column</p>
+    <span class="spacer" aria-hidden="true"></span>
+    <div class="groups" role="group" aria-label="Column groups">
+      <button type="button" class="chip group-toggle is-partial" data-group="identity" aria-pressed="false">Identity</button>
+      <button type="button" class="chip group-toggle is-partial" data-group="totals" aria-pressed="false">Token totals</button>
+      <button type="button" class="chip group-toggle" data-group="breakdown" aria-pressed="false">Token breakdown</button>
+      <button type="button" class="chip group-toggle" data-group="shape" aria-pressed="true">Run shape</button>
+      <button type="button" class="chip group-toggle is-partial" data-group="removal" aria-pressed="false">Removal</button>
+      <button type="button" class="chip group-toggle" data-group="notes" aria-pressed="false">Notes</button>
+      <button type="button" class="chip" id="reset-columns">Show all columns</button>
+    </div>
+  </div>
+
+  <div class="table-scroll" id="results-scroll">
+    <table class="results" id="results-table">
+      <caption class="sr-only">Historical benchmark results, one row per arm. Pair rows share the run id.</caption>
+      <thead>
+        <tr>
+          <th scope="col" class="run-head">Run</th>
+          <th scope="col" data-col="class" data-group="identity" hidden><button type="button" class="col-toggle" data-col="class" data-group="identity" data-label="Class" aria-pressed="false">Class</button></th>
+          <th scope="col" data-col="arm" data-group="identity"><button type="button" class="col-toggle" data-col="arm" data-group="identity" data-label="Arm" aria-pressed="true">Arm</button></th>
+          <th scope="col" data-col="model" data-group="identity" hidden><button type="button" class="col-toggle" data-col="model" data-group="identity" data-label="Model" aria-pressed="false">Model</button></th>
+          <th scope="col" data-col="task" data-group="identity"><button type="button" class="col-toggle" data-col="task" data-group="identity" data-label="Task" aria-pressed="true">Task</button></th>
+          <th scope="col" data-col="outcome" data-group="identity"><button type="button" class="col-toggle" data-col="outcome" data-group="identity" data-label="Outcome" aria-pressed="true">Outcome</button></th>
+          <th scope="col" data-col="billed" data-group="totals" class="num" hidden><button type="button" class="col-toggle" data-col="billed" data-group="totals" data-label="Billed prompt" aria-pressed="false">Billed prompt</button></th>
+          <th scope="col" data-col="cost" data-group="totals" class="num"><button type="button" class="col-toggle" data-col="cost" data-group="totals" data-label="Cost USD" aria-pressed="true">Cost USD</button></th>
+          <th scope="col" data-col="raw" data-group="breakdown" class="num" hidden><button type="button" class="col-toggle" data-col="raw" data-group="breakdown" data-label="Raw input (sum over requests)" aria-pressed="false">Raw input (sum)</button></th>
+          <th scope="col" data-col="cached" data-group="breakdown" class="num" hidden><button type="button" class="col-toggle" data-col="cached" data-group="breakdown" data-label="Cached input" aria-pressed="false">Cached input</button></th>
+          <th scope="col" data-col="cachewrite" data-group="breakdown" class="num" hidden><button type="button" class="col-toggle" data-col="cachewrite" data-group="breakdown" data-label="Cache write" aria-pressed="false">Cache write</button></th>
+          <th scope="col" data-col="output" data-group="breakdown" class="num" hidden><button type="button" class="col-toggle" data-col="output" data-group="breakdown" data-label="Output (sum)" aria-pressed="false">Output (sum)</button></th>
+          <th scope="col" data-col="reasoning" data-group="breakdown" class="num" hidden><button type="button" class="col-toggle" data-col="reasoning" data-group="breakdown" data-label="Reasoning" aria-pressed="false">Reasoning</button></th>
+          <th scope="col" data-col="compactions" data-group="shape" class="num"><button type="button" class="col-toggle" data-col="compactions" data-group="shape" data-label="Compactions" aria-pressed="true">Compactions</button></th>
+          <th scope="col" data-col="ask" data-group="shape" class="num"><button type="button" class="col-toggle" data-col="ask" data-group="shape" data-label="Ask triggers" aria-pressed="true">Ask triggers</button></th>
+          <th scope="col" data-col="keep" data-group="removal" class="num" hidden><button type="button" class="col-toggle" data-col="keep" data-group="removal" data-label="Keep lines" aria-pressed="false">Keep lines</button></th>
+          <th scope="col" data-col="forget" data-group="removal" class="num" hidden><button type="button" class="col-toggle" data-col="forget" data-group="removal" data-label="Forget lines" aria-pressed="false">Forget lines</button></th>
+          <th scope="col" data-col="ratio" data-group="removal" class="num" hidden><button type="button" class="col-toggle" data-col="ratio" data-group="removal" data-label="Keep / forget" aria-pressed="false">Keep / forget</button></th>
+          <th scope="col" data-col="removed" data-group="removal" class="num"><button type="button" class="col-toggle" data-col="removed" data-group="removal" data-label="Tokens removed (est.)" aria-pressed="true">Tokens removed (est.)</button></th>
+          <th scope="col" class="notes-head">Notes</th>
+        </tr>
+      </thead>
+        <tbody class="pair">
+          <tr class="result">
+            <th scope="row" class="run-cell">2026-11-09-dsh-13-pair</th>
+            <td data-col="class" data-group="identity" hidden>measurement</td>
+            <td data-col="arm" data-group="identity"><span class="arm arm-product">racoons (product)</span></td>
+            <td data-col="model" data-group="identity" hidden>deepseek-flash</td>
+            <td data-col="task" data-group="identity">extended 13-file audit</td>
+            <td data-col="outcome" data-group="identity">13/13 · BENCH-DONE · exit 0</td>
+            <td data-col="billed" data-group="totals" class="num" hidden>22,979,066</td>
+            <td data-col="cost" data-group="totals" class="num cost"><span class="money">0.3217</span> <span class="qual">(computed)</span></td>
+            <td data-col="raw" data-group="breakdown" class="num" hidden>1,241,466</td>
+            <td data-col="cached" data-group="breakdown" class="num" hidden>21,737,600</td>
+            <td data-col="cachewrite" data-group="breakdown" class="num" hidden>0</td>
+            <td data-col="output" data-group="breakdown" class="num" hidden>117,039</td>
+            <td data-col="reasoning" data-group="breakdown" class="num" hidden>—</td>
+            <td data-col="compactions" data-group="shape" class="num">0</td>
+            <td data-col="ask" data-group="shape" class="num">35</td>
+            <td data-col="keep" data-group="removal" class="num" hidden>1,545</td>
+            <td data-col="forget" data-group="removal" class="num" hidden>11,157</td>
+            <td data-col="ratio" data-group="removal" class="num" hidden>0.138</td>
+            <td data-col="removed" data-group="removal" class="num" title="231,080 estimated tokens: 924,318 bytes ÷ 4">≈231k tokens</td>
+            <td class="note-toggle-cell"><button type="button" class="note-toggle" aria-expanded="false" aria-controls="note-3">Notes</button></td>
+          </tr>
+          <tr class="note-row" id="note-3" hidden>
+            <td data-col="notes" data-group="notes" class="notes note-cell" colspan="9"><div class="note-body">Pruner off; ask lane 3.24M; cost computed; removal over 150 verdicts; gross 950,486 incl 7 proof rows; session net 910,641; 924,318 ledger bytes ÷ 4 ≈ 231,080 estimated tokens; true total 23,096,105. includes the 3,239,904-token ask lane.</div></td>
+          </tr>
+          <tr class="result">
+            <th scope="row" class="run-cell">2026-11-09-dsh-13-pair</th>
+            <td data-col="class" data-group="identity" hidden>measurement</td>
+            <td data-col="arm" data-group="identity"><span class="arm arm-vanilla">vanilla</span></td>
+            <td data-col="model" data-group="identity" hidden>deepseek-flash</td>
+            <td data-col="task" data-group="identity">extended 13-file audit</td>
+            <td data-col="outcome" data-group="identity">13/13 · BENCH-DONE · exit 0</td>
+            <td data-col="billed" data-group="totals" class="num" hidden>18,604,896 ≥</td>
+            <td data-col="cost" data-group="totals" class="num cost"><span class="money">0.1723 ≥</span> <span class="qual">(computed)</span></td>
+            <td data-col="raw" data-group="breakdown" class="num" hidden>477,280</td>
+            <td data-col="cached" data-group="breakdown" class="num" hidden>18,127,616</td>
+            <td data-col="cachewrite" data-group="breakdown" class="num" hidden>0</td>
+            <td data-col="output" data-group="breakdown" class="num" hidden>77,283</td>
+            <td data-col="reasoning" data-group="breakdown" class="num" hidden>—</td>
+            <td data-col="compactions" data-group="shape" class="num">1</td>
+            <td data-col="ask" data-group="shape" class="num">0</td>
+            <td data-col="keep" data-group="removal" class="num" hidden>—</td>
+            <td data-col="forget" data-group="removal" class="num" hidden>—</td>
+            <td data-col="ratio" data-group="removal" class="num" hidden>—</td>
+            <td data-col="removed" data-group="removal" class="num" title="0 tokens removed">0 tokens</td>
+            <td class="note-toggle-cell"><button type="button" class="note-toggle" aria-expanded="false" aria-controls="note-4">Notes</button></td>
+          </tr>
+          <tr class="note-row" id="note-4" hidden>
+            <td data-col="notes" data-group="notes" class="notes note-cell" colspan="9"><div class="note-body">0 tokens removed; pruner off; compaction call of 226,311 tokens not in the usage rows, hence lower bound; true total 18,682,179 (lower bound).</div></td>
+          </tr>
+        </tbody>
+        <tbody class="pair">
+          <tr class="result">
+            <th scope="row" class="run-cell">2026-11-09-dsh-13-pair-b</th>
+            <td data-col="class" data-group="identity" hidden>measurement</td>
+            <td data-col="arm" data-group="identity"><span class="arm arm-product">racoons (product)</span></td>
+            <td data-col="model" data-group="identity" hidden>deepseek-flash</td>
+            <td data-col="task" data-group="identity">extended 13-file audit</td>
+            <td data-col="outcome" data-group="identity">13/13 · BENCH-DONE · exit 0</td>
+            <td data-col="billed" data-group="totals" class="num" hidden>17,210,284</td>
+            <td data-col="cost" data-group="totals" class="num cost"><span class="money">0.2513</span> <span class="qual">(computed)</span></td>
+            <td data-col="raw" data-group="breakdown" class="num" hidden>972,076</td>
+            <td data-col="cached" data-group="breakdown" class="num" hidden>16,238,208</td>
+            <td data-col="cachewrite" data-group="breakdown" class="num" hidden>0</td>
+            <td data-col="output" data-group="breakdown" class="num" hidden>94,547</td>
+            <td data-col="reasoning" data-group="breakdown" class="num" hidden>—</td>
+            <td data-col="compactions" data-group="shape" class="num">0</td>
+            <td data-col="ask" data-group="shape" class="num">18</td>
+            <td data-col="keep" data-group="removal" class="num" hidden>0</td>
+            <td data-col="forget" data-group="removal" class="num" hidden>2,996</td>
+            <td data-col="ratio" data-group="removal" class="num" hidden>0.000</td>
+            <td data-col="removed" data-group="removal" class="num" title="113,933 estimated tokens: 455,730 bytes ÷ 4">≈114k tokens</td>
+            <td class="note-toggle-cell"><button type="button" class="note-toggle" aria-expanded="false" aria-controls="note-5">Notes</button></td>
+          </tr>
+          <tr class="note-row" id="note-5" hidden>
+            <td data-col="notes" data-group="notes" class="notes note-cell" colspan="9"><div class="note-body">Pruner off; all forgetall; 455,730 ledger bytes ÷ 4 ≈ 113,933 estimated tokens; true total 17,304,831. includes the 1,794,241-token ask lane.</div></td>
+          </tr>
+          <tr class="result">
+            <th scope="row" class="run-cell">2026-11-09-dsh-13-pair-b</th>
+            <td data-col="class" data-group="identity" hidden>measurement</td>
+            <td data-col="arm" data-group="identity"><span class="arm arm-vanilla">vanilla</span></td>
+            <td data-col="model" data-group="identity" hidden>deepseek-flash</td>
+            <td data-col="task" data-group="identity">extended 13-file audit</td>
+            <td data-col="outcome" data-group="identity">13/13 · BENCH-DONE · exit 0</td>
+            <td data-col="billed" data-group="totals" class="num" hidden>18,826,761</td>
+            <td data-col="cost" data-group="totals" class="num cost"><span class="money">0.1917</span> <span class="qual">(computed)</span></td>
+            <td data-col="raw" data-group="breakdown" class="num" hidden>630,281</td>
+            <td data-col="cached" data-group="breakdown" class="num" hidden>18,196,480</td>
+            <td data-col="cachewrite" data-group="breakdown" class="num" hidden>0</td>
+            <td data-col="output" data-group="breakdown" class="num" hidden>70,964</td>
+            <td data-col="reasoning" data-group="breakdown" class="num" hidden>—</td>
+            <td data-col="compactions" data-group="shape" class="num">0</td>
+            <td data-col="ask" data-group="shape" class="num">0</td>
+            <td data-col="keep" data-group="removal" class="num" hidden>—</td>
+            <td data-col="forget" data-group="removal" class="num" hidden>—</td>
+            <td data-col="ratio" data-group="removal" class="num" hidden>—</td>
+            <td data-col="removed" data-group="removal" class="num" title="234,617 host-reported shadowed tokens">≈235k tokens</td>
+            <td class="note-toggle-cell"><button type="button" class="note-toggle" aria-expanded="false" aria-controls="note-6">Notes</button></td>
+          </tr>
+          <tr class="note-row" id="note-6" hidden>
+            <td data-col="notes" data-group="notes" class="notes note-cell" colspan="9"><div class="note-body">Native pruner on, 61 fires, 234,617 host-reported shadowed tokens (≈235k est.); true total 18,897,725.</div></td>
+          </tr>
+        </tbody>
+    </table>
+  </div>
+
+  <details class="guide">
+    <summary>Column guide</summary>
+    <ul>
+      <li><strong>Columns:</strong> click a column header to hide it; a hidden column shows +. A group chip toggles the whole group; Show all columns restores every column. More numbers reveals class, model, billed prompt, the token breakdown, and the keep/forget/ratio detail. Notes open under the row.</li>
+      <li><strong>Token cost:</strong> cost USD is the headline and stays visible; billed prompt sits behind More numbers. Raw input, cached input, cache write, output and reasoning are the five subcolumns behind Token breakdown. Billed prompt = raw input + cached input + cache write. Cost USD is the host's own cost; leave it blank when the host records no price.</li>
+      <li><strong>Run shape:</strong> compactions are completed host compactions; put the count and request numbers in the cell. Ask triggers are successful ask fires (generate + parse).</li>
+      <li><strong>Removal:</strong> keep and forget lines are counted over answered ask rows. <code>forgetall</code> forgets L; a full-range <code>keeplines</code> keeps L; a partial <code>keeplines</code> keeps its named spans and forgets L minus those spans. Ratio = keep ÷ forget. Tokens removed (est.) is one estimate per row: product rows are ledger bytes ÷ 4 (the applied removal's byte volume at 4 bytes per token), vanilla rows are the host pruner's own shadowed-token count. The exact figure and its source are in Notes.</li>
+      <li><strong>Outcome:</strong> a completed run meets the brief's file count and <code>BENCH-DONE</code>. A budget stop is a censored partial and must say so.</li>
+    </ul>
+  </details>
+
+  <section class="checkpoints" aria-labelledby="checkpoints-title">
+    <div>
+      <h2 id="checkpoints-title">Checkpoints</h2>
+      <p class="rule">k is the first write that creates the deliverable. Record both arms at the same k; the values are comparison points, not stop gates.</p>
+    </div>
+    <div class="groups run-selector" role="group" aria-label="Checkpoint run">
+      <button type="button" class="chip run-toggle" data-run="2026-11-09-dsh-13-pair" aria-pressed="true">Round A — 2026-11-09-dsh-13-pair · racoons / vanilla</button>
+      <button type="button" class="chip run-toggle" data-run="2026-11-09-dsh-13-pair-b" aria-pressed="false">Round B — 2026-11-09-dsh-13-pair-b · racoons / vanilla</button>
+    </div>
+    <div class="table-scroll">
+      <table class="checkpoint">
+        <thead>
+          <tr>
+            <th rowspan="2" scope="col">k</th>
+            <th rowspan="2" scope="col">Deliverable</th>
+            <th colspan="2" scope="colgroup">racoons</th>
+            <th colspan="2" scope="colgroup">vanilla</th>
+          </tr>
+          <tr>
+            <th scope="col">Billed prompt</th>
+            <th scope="col">Peak</th>
+            <th scope="col">Billed prompt</th>
+            <th scope="col">Peak</th>
+          </tr>
+        </thead>
+        <tbody id="checkpoint-rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+  (function () {
+    const root = document.getElementById('racoons-result-board');
+    if (!root) return;
+    const table = document.getElementById('results-table');
+    const scrollBox = document.getElementById('results-scroll');
+    const chips = Array.from(root.querySelectorAll('.group-toggle'));
+    const headerButtons = Array.from(root.querySelectorAll('.col-toggle'));
+    const reset = root.querySelector('#reset-columns');
+    const moreButton = root.querySelector('#more-numbers');
+
+    const DETAIL_COLUMNS = ['class', 'model', 'billed', 'raw', 'cached', 'cachewrite', 'output', 'reasoning', 'keep', 'forget', 'ratio'];
+    const NOTES_GROUP = 'notes';
+
+    headerButtons.forEach((button) => {
+      if (!button.dataset.label) button.dataset.label = button.textContent.trim();
+    });
+    const labelOf = (button) => button.dataset.label || button.textContent;
+
+    const noteToggles = Array.from(root.querySelectorAll('.note-toggle'));
+    const noteRows = noteToggles.map((button) => document.getElementById(button.getAttribute('aria-controls')));
+
+    const syncSpan = () => {
+      if (!table) return;
+      const visible = Array.from(table.querySelectorAll('thead th')).filter((th) => !th.hidden).length;
+      table.querySelectorAll('.note-cell').forEach((cell) => { cell.colSpan = visible; });
+    };
+
+    const syncOverflow = () => {
+      if (!scrollBox || !table) return;
+      const left = scrollBox.scrollLeft;
+      const top = scrollBox.scrollTop;
+      scrollBox.classList.remove('scroll-x');
+      if (table.scrollWidth > scrollBox.clientWidth + 1) {
+        scrollBox.classList.add('scroll-x');
+      }
+      scrollBox.scrollLeft = left;
+      scrollBox.scrollTop = top;
+    };
+
+    const paint = (button, open, hideHeader) => {
+      button.setAttribute('aria-pressed', String(open));
+      const label = labelOf(button);
+      button.textContent = open ? label : '+';
+      if (open) button.removeAttribute('aria-label');
+      else button.setAttribute('aria-label', 'Show ' + label);
+      const th = button.closest('th');
+      if (th) {
+        th.classList.toggle('is-collapsed', !open);
+        if (hideHeader) th.hidden = !open;
+        else if (open) th.hidden = false;
+      }
+    };
+
+    const setColumn = (key, open, hideHeader) => {
+      const button = root.querySelector('.col-toggle[data-col="' + key + '"]');
+      if (button) paint(button, open, hideHeader);
+      root.querySelectorAll('td[data-col="' + key + '"]').forEach((td) => {
+        td.hidden = !open;
+      });
+    };
+
+    const isOpen = (key) => {
+      const button = root.querySelector('.col-toggle[data-col="' + key + '"]');
+      return !!button && button.getAttribute('aria-pressed') === 'true';
+    };
+
+    const buttonsOf = (group) => Array.from(root.querySelectorAll(
+      '.col-toggle[data-group="' + group + '"]'
+    ));
+    const chipOf = (group) => chips.find((chip) => chip.dataset.group === group) || null;
+
+    const refresh = (group) => {
+      const chip = chipOf(group);
+      if (!chip) return;
+      if (group === NOTES_GROUP) {
+        const open = noteToggles.filter((button) => button.getAttribute('aria-expanded') === 'true').length;
+        chip.setAttribute('aria-pressed', String(open === noteToggles.length && noteToggles.length > 0));
+        chip.classList.toggle('is-partial', open > 0 && open < noteToggles.length);
+        return;
+      }
+      const buttons = buttonsOf(group);
+      if (buttons.length === 0) return;
+      const open = buttons.filter((button) => button.getAttribute('aria-pressed') === 'true').length;
+      chip.setAttribute('aria-pressed', String(open === buttons.length));
+      chip.classList.toggle('is-partial', open > 0 && open < buttons.length);
+    };
+
+    const refreshDetail = () => {
+      if (!moreButton) return;
+      const open = DETAIL_COLUMNS.filter(isOpen).length;
+      const all = open === DETAIL_COLUMNS.length;
+      moreButton.setAttribute('aria-pressed', String(all));
+      moreButton.classList.toggle('is-partial', open > 0 && !all);
+      moreButton.textContent = all ? 'Fewer numbers' : 'More numbers';
+    };
+
+    const refreshAll = () => {
+      ['identity', 'totals', 'breakdown', 'shape', 'removal', NOTES_GROUP].forEach(refresh);
+      refreshDetail();
+    };
+
+    const afterLayoutChange = () => {
+      syncSpan();
+      refreshAll();
+      syncOverflow();
+    };
+
+    const setGroup = (group, open) => {
+      buttonsOf(group).forEach((button) => {
+        setColumn(button.dataset.col, open, true);
+      });
+      const chip = chipOf(group);
+      if (chip) {
+        chip.setAttribute('aria-pressed', String(open));
+        chip.classList.remove('is-partial');
+      }
+      afterLayoutChange();
+    };
+
+    const setAllNotes = (open) => {
+      noteToggles.forEach((button, index) => {
+        button.setAttribute('aria-expanded', String(open));
+        if (noteRows[index]) noteRows[index].hidden = !open;
+      });
+      refresh(NOTES_GROUP);
+    };
+
+    chips.forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const group = chip.dataset.group;
+        if (group === NOTES_GROUP) {
+          setAllNotes(chip.getAttribute('aria-pressed') !== 'true');
+          return;
+        }
+        setGroup(group, chip.getAttribute('aria-pressed') !== 'true');
+      });
+    });
+
+    noteToggles.forEach((button, index) => {
+      button.addEventListener('click', () => {
+        const open = button.getAttribute('aria-expanded') !== 'true';
+        button.setAttribute('aria-expanded', String(open));
+        if (noteRows[index]) noteRows[index].hidden = !open;
+        refresh(NOTES_GROUP);
+      });
+    });
+
+    headerButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        setColumn(button.dataset.col, button.getAttribute('aria-pressed') !== 'true', false);
+        refresh(button.dataset.group);
+        refreshDetail();
+        syncSpan();
+        syncOverflow();
+      });
+    });
+
+    if (moreButton) {
+      moreButton.addEventListener('click', () => {
+        const open = moreButton.getAttribute('aria-pressed') !== 'true';
+        DETAIL_COLUMNS.forEach((key) => setColumn(key, open, true));
+        afterLayoutChange();
+      });
+    }
+
+    if (reset) {
+      reset.addEventListener('click', () => {
+        headerButtons.forEach((button) => {
+          setColumn(button.dataset.col, true, false);
+        });
+        afterLayoutChange();
+      });
+    }
+
+    DETAIL_COLUMNS.forEach((key) => setColumn(key, false, true));
+    afterLayoutChange();
+    window.addEventListener('resize', syncOverflow);
+
+    const CHECKPOINT_RUNS = {
+      '2026-11-09-dsh-13-pair': {
+        rows: [
+          { k: 1, file: '00-index.md', racoons: [178565, 178565], vanilla: [32732, 32732] },
+          { k: 2, file: '01-orientation.md', racoons: [149641, 149641], vanilla: [32732, 32732] },
+          { k: 3, file: '02-entry-currency.md', racoons: [150527, 150527], vanilla: [220814, 220814] },
+          { k: 4, file: '03-core-charter.md', racoons: [156234, 156234], vanilla: [270438, 270438] },
+          { k: 5, file: '04-core-tests.md', racoons: [159994, 159994], vanilla: [282655, 282655] },
+          { k: 6, file: '05-shell-quarantine.md', racoons: [163611, 163611], vanilla: [106860, 318745] },
+          { k: 7, file: '06-gate-coverage.md', racoons: [165616, 165616], vanilla: [132959, 318745] },
+          { k: 8, file: '07-plan-traceability.md', racoons: [167423, 167423], vanilla: [148408, 318745] },
+          { k: 9, file: '08-distillation-audit.md', racoons: [169331, 169331], vanilla: [190479, 318745] },
+          { k: 10, file: '09-open-triage.md', racoons: [174644, 174644], vanilla: [200518, 318745] },
+          { k: 11, file: '10-plans-disposition.md', racoons: [176229, 176229], vanilla: [214030, 318745] },
+          { k: 12, file: '11-corpus-en.md', racoons: [177983, 177983], vanilla: [221275, 318745] },
+          { k: 13, file: '12-corpus-zh.md', racoons: [177983, 177983], vanilla: [226242, 318745] }
+        ]
+      },
+      '2026-11-09-dsh-13-pair-b': {
+        rows: [
+          { k: 1, file: '00-index.md', racoons: [45797, 45797], vanilla: [28594, 28594] },
+          { k: 2, file: '01-orientation.md', racoons: [45797, 45797], vanilla: [28594, 28594] },
+          { k: 3, file: '02-entry-currency.md', racoons: [151352, 151813], vanilla: [226960, 226960] },
+          { k: 4, file: '03-core-charter.md', racoons: [157627, 157627], vanilla: [268121, 268121] },
+          { k: 5, file: '04-core-tests.md', racoons: [159424, 159424], vanilla: [280809, 280809] },
+          { k: 6, file: '05-shell-quarantine.md', racoons: [165730, 165730], vanilla: [315087, 315087] },
+          { k: 7, file: '06-gate-coverage.md', racoons: [167755, 167755], vanilla: [202076, 317929] },
+          { k: 8, file: '07-plan-traceability.md', racoons: [169219, 169219], vanilla: [213224, 317929] },
+          { k: 9, file: '08-distillation-audit.md', racoons: [186458, 186458], vanilla: [252735, 317929] },
+          { k: 10, file: '09-open-triage.md', racoons: [151690, 186458], vanilla: [261446, 317929] },
+          { k: 11, file: '10-plans-disposition.md', racoons: [158978, 186458], vanilla: [300172, 317929] },
+          { k: 12, file: '11-corpus-en.md', racoons: [160107, 186458], vanilla: [315004, 317929] },
+          { k: 13, file: '12-corpus-zh.md', racoons: [163566, 186458], vanilla: [267797, 319812] }
+        ]
+      }
+    };
+    const checkpointBody = root.querySelector('#checkpoint-rows');
+    const runChips = Array.from(root.querySelectorAll('.run-toggle'));
+    const formatCount = (value) => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    const checkpointCell = (value) => {
+      const td = document.createElement('td');
+      td.className = 'num';
+      td.textContent = value === null || value === undefined ? '—' : formatCount(value);
+      return td;
+    };
+    const renderCheckpoints = (runId) => {
+      const run = CHECKPOINT_RUNS[runId];
+      if (!checkpointBody || !run) return;
+      checkpointBody.textContent = '';
+      run.rows.forEach((row) => {
+        const tr = document.createElement('tr');
+        const k = document.createElement('th');
+        k.setAttribute('scope', 'row');
+        k.textContent = String(row.k);
+        tr.appendChild(k);
+        const deliverable = document.createElement('td');
+        deliverable.className = 'deliverable';
+        const name = document.createElement('code');
+        name.textContent = row.file;
+        deliverable.appendChild(name);
+        tr.appendChild(deliverable);
+        ['racoons', 'vanilla'].forEach((arm) => {
+          const values = Array.isArray(row[arm]) ? row[arm] : [null, null];
+          tr.appendChild(checkpointCell(values[0]));
+          tr.appendChild(checkpointCell(values[1]));
+        });
+        checkpointBody.appendChild(tr);
+      });
+      runChips.forEach((chip) => {
+        chip.setAttribute('aria-pressed', String(chip.dataset.run === runId));
+      });
+    };
+    runChips.forEach((chip) => {
+      chip.addEventListener('click', () => renderCheckpoints(chip.dataset.run));
+    });
+    if (runChips.length > 0) renderCheckpoints(runChips[0].dataset.run);
+  })();
+</script>
+</body>
+</html>

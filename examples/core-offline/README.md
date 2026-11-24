@@ -21,7 +21,7 @@ recalled 34 bytes byte-exact: true
 ```
 
 A forget needs no cap: the human names a path and the core resolves it to the one unit that holds
-those bytes. The guard needs a real ledger: here an
-in-memory SQLite one; the mounts use a durable per-session file. The host half of the seam
+those bytes (ADR-0014 scrapped the entry-time cap). The guard needs a real ledger: here an
+in-memory SQLite one; the mounts use a durable per-session file (ADR-0013). The host half of the seam
 is the small `InMemoryPort` in the file — it holds the transcript and applies the approved
 checkpoint-revert, which is all any adapter does.

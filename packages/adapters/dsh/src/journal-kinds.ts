@@ -19,6 +19,17 @@
 export const CREMATOR_JOURNAL_KINDS = [
   // mount lifecycle
   'mounted', 'capabilities', 'telemetry',
+  // a second apply of one durable root joined the live mount instead of being
+  // refused (ISSUE-577; ADR-0075: two terminals on one folder must both work).
+  // `status: 'reused'` and `scope: 'process'` name the join, `shares` counts the
+  // holders (this one included), and the root rides as `storageRoot`/`storage`.
+  // The joined apply's own options are not adopted by the live mount.
+  'mount-shared',
+  // this mount could not publish its record under the root's `mounts/` folder
+  // (ISSUE-578): the folder or the record could not be written. The mount
+  // still completes — a record is presence evidence, never an admission gate,
+  // and `reason` names the failure. Other processes simply see one mount fewer.
+  'mount-record-error',
   // a session's clean ending released its open entry (ISSUE-377): the drain
   // flushed owed appends first, then the same per-entry release `close()` uses
   // closed the owned ledger and evicted the per-session maps. `reason` names
@@ -169,14 +180,16 @@ export const CREMATOR_JOURNAL_KINDS = [
   // failed write was for, and the next boundary retries the same identity until
   // it lands (ADR-0065).
   'install-persist-error',
-  // a mount with no readable install record found its own rows in the durable
-  // ledger (ISSUE-460) and classified itself `restart` instead of `inherited`:
-  // `reason` is `ledger-rows`, `source` names where the inherited set came
-  // from (`preinstall-record` when the mount's own durable proof answers,
-  // `surface-unsafe` when no proof exists and the surface's results are
-  // recorded by name), and `preInstall` counts that set (ISSUE-477). Rows under
-  // this session id are its own past; a fork's copied rows carry the parent's id
-  // and do not count.
+  // a mount with no readable install record classified itself `restart`
+  // instead of `inherited` on ledger evidence (ISSUE-460). `reason` says which
+  // evidence: `ledger-rows` when this session's own rows were read (a fork's
+  // copied rows carry the parent's id and do not count), `ledger-unreadable`
+  // when the read itself failed (ISSUE-573) — the mount cannot prove absence,
+  // so it keeps recovery on and promotes nothing. Either way `source` names
+  // where the inherited set came from (`preinstall-record` when the mount's own
+  // durable proof answers, `surface-unsafe` when no proof exists and the
+  // surface's results are recorded by name), and `preInstall` counts that set
+  // (ISSUE-477).
   'install-fallback',
   // a fork mount dropped the parent's owed durable work from the child's copy
   // (ISSUE-437): `parentSessionId` names the session the copied state belongs

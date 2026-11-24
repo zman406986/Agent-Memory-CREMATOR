@@ -7,8 +7,9 @@
 // also picks up gitignored trees such as `scratchpad/` — tests that are not this repo's.
 
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { access, readdir, readFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -63,8 +64,22 @@ export async function discoverTests() {
   const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
   const packages = (await Promise.all((manifest.workspaces ?? []).map(expand))).flat();
 
+  // Counted per package, not once in total: a package whose `test/` directory was
+  // renamed (or whose suites all moved off the extension list) contributes nothing,
+  // and a combined list of other packages' files still looked healthy (ISSUE-593).
   const files = [];
-  for (const dir of packages) files.push(...(await collectTests(join(dir, 'test'))));
+  const withoutTests = [];
+  for (const dir of packages) {
+    const found = await collectTests(join(dir, 'test'));
+    if (found.length === 0) withoutTests.push(relative(ROOT, dir).split(sep).join('/'));
+    files.push(...found);
+  }
+  if (withoutTests.length > 0) {
+    throw new Error(
+      `test runner: no test files under ${withoutTests.join(', ')}. Cannot verify ` +
+      `${withoutTests.length === 1 ? 'that package' : 'those packages'}.`,
+    );
+  }
   // The opencode bench lives outside the workspace packages. Its tests are part of
   // the default run, not only `npm run test:dev` (ISSUE-214 P4). The extension
   // list reaches every nested directory, so `dev/bench/multiturn/` and
@@ -114,7 +129,14 @@ export function runTests(files, { stdio = 'inherit' } = {}) {
 }
 
 async function main() {
-  const files = await discoverTests();
+  let files;
+  try {
+    files = await discoverTests();
+  } catch (error) {
+    // Discovery that cannot see a package is a failed run, not a shorter one.
+    console.error(error.message);
+    process.exit(1);
+  }
 
   // Fail closed: an empty list makes `--test` fall back to the whole-tree walk this
   // script exists to avoid, and reports a vacuous pass.
@@ -133,6 +155,17 @@ async function main() {
   process.exit(await runTests(files));
 }
 
-const invokedDirectly = process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) await main();
+// A junction or symlink leaves argv[1] spelled differently from the real path Node
+// reports in import.meta.url. Comparing the spelling let `main` never run and the
+// process exit 0 with zero tests, so both sides go through realpathSync (ISSUE-593).
+const SELF = fileURLToPath(import.meta.url);
+function isSelf(argvPath) {
+  if (argvPath === undefined) return false;
+  try {
+    return realpathSync(resolve(argvPath)) === realpathSync(SELF);
+  } catch {
+    return false;
+  }
+}
+
+if (isSelf(process.argv[1])) await main();

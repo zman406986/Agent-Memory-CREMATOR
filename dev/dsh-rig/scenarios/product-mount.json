@@ -1,0 +1,74 @@
+{
+  "slug": "product-mount",
+  "task": "Read the file notes.txt in this directory and report its first line.",
+  "timeoutMs": 90000,
+  "perturbation": "delete the scenario's `racoons` block: the driver writes no mount row, so no journal exists and the run must fail by name 'racoons plugin mounted'",
+  "workFiles": {
+    "notes.txt": "RACOONS PRODUCT MOUNT SMOKE\nsecond line\n"
+  },
+  "racoons": {
+    "barBytes": 2048
+  },
+  "script": {
+    "title": "Product mount smoke",
+    "replies": [
+      {
+        "name": "ask-for-read",
+        "match": { "tools_length": "present", "tool_results_count": 0 },
+        "reply": {
+          "type": "tool_use",
+          "text": "Reading the file.",
+          "calls": [
+            { "id": "rig_mount_1", "name": "read", "input": { "file_path": "notes.txt" } }
+          ]
+        }
+      },
+      {
+        "name": "report-first-line",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": ["read"]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The first line is RACOONS PRODUCT MOUNT SMOKE."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "notes.txt",
+      "titleRequests": { "max": 1 },
+      "titleRequestsHaveNoTools": true,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 1,
+      "results": 1,
+      "failedResults": 0,
+      "callIds": ["rig_mount_1"],
+      "names": ["read"],
+      "resultContains": ["RACOONS PRODUCT MOUNT SMOKE"],
+      "finalText": "The first line is RACOONS PRODUCT MOUNT SMOKE."
+    },
+    "session": {
+      "userTextContains": "notes.txt",
+      "eventTypesPresent": ["tool/call", "tool/result"]
+    },
+    "racoons": {
+      "ledger": true,
+      "entries": 1,
+      "surfaceReplacements": 0,
+      "secondPassAddsNothing": 0
+    },
+    "stdout": { "finalText": "The first line is RACOONS PRODUCT MOUNT SMOKE." }
+  }
+}

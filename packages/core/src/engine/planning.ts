@@ -313,12 +313,15 @@ export function planEntryShape(
   const keptLineRanges: readonly LineRange[] = answer.action === "forgetall"
     ? [] : answer.action === "keeplines"
       ? namedLineRanges : complementLineRanges(namedLineRanges, totalLines);
-  if (answer.action === "forgetlines" && keptLineRanges.length === 0) {
-    // Naming every line is a `forgetall` without a descriptor: refused by name
-    // rather than planned as a whole-unit removal the answer never described
-    // (ADR-0026 §5).
+  if (answer.action !== "forgetall" && keptLineRanges.length === 0) {
+    // Naming every line is a `forgetall` without a descriptor, and a `keeplines`
+    // that names no line keeps none: both are refused by name rather than
+    // planned as a whole-unit removal the answer never described (ADR-0026 §5,
+    // ISSUE-558).
     return { action: "refuse", code: "drops-every-line",
-      detail: `the answer names all ${String(totalLines)} line(s); forgetting the whole unit needs forgetall and its descriptor` };
+      detail: answer.action === "forgetlines"
+        ? `the answer names all ${String(totalLines)} line(s); forgetting the whole unit needs forgetall and its descriptor`
+        : "the answer keeps no line; forgetting the whole unit needs forgetall and its descriptor" };
   }
   const keptRanges = mergeRanges(keptLineRanges.map(lines => ({
     startByte: offsets[lines.startLine - 1]?.startByte ?? 0,

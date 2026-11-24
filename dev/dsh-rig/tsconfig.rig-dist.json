@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": "../..",
+    "outDir": "../../scratchpad/dsh-rig/dist",
+    "types": ["node"],
+    "paths": {
+      "@cremator/core": ["../../packages/core/src/index.ts"],
+      "cremator-dsh": ["../../packages/adapters/dsh/src/index.ts"]
+    }
+  },
+  "include": [
+    "../../packages/core/src/**/*.ts",
+    "../../packages/adapters/dsh/src/**/*.ts"
+  ]
+}

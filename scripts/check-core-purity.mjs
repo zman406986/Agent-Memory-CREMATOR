@@ -8,9 +8,10 @@
 // dynamic imports with a template literal (`` await import(`node:fs`) ``), so the
 // gate failed open on both. See issue-tracker/open/ISSUE-071-*.
 
+import { realpathSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join, relative, sep } from 'node:path';
+import { join, posix, relative, sep } from 'node:path';
 import { init, parse } from 'es-module-lexer';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -62,8 +63,11 @@ await init();
  * @returns {{ specs: string[], unverifiable: number }}
  */
 export function specifiers(source) {
-  // A leading BOM makes the lexer treat the first import as text and skip it.
-  const [imports] = parse(source.replace(/^\uFEFF/, ''));
+  // A leading BOM makes the lexer treat the first import as text and skip it. Both
+  // the lexer and the require backstop read this one string, so their offsets agree:
+  // with the BOM kept on one side, `import x = require(...)` counted twice (ISSUE-593).
+  const text = source.replace(/^\uFEFF/, '');
+  const [imports] = parse(text);
   const specs = [];
   // Offsets of every specifier the lexer read, so the require backstop can tell an
   // `import x = require("y")` (already read) from a real CommonJS call.
@@ -82,13 +86,26 @@ export function specifiers(source) {
   // Two identical imports are two imports: no dedupe by text, exactly as before.
   REQUIRE_RE.lastIndex = 0;
   let m;
-  while ((m = REQUIRE_RE.exec(source)) !== null) {
+  while ((m = REQUIRE_RE.exec(text)) !== null) {
     const specStart = m.index + m[0].indexOf(m[1]);
     if (covered.has(specStart)) continue;
     specs.push(m[1]);
   }
 
   return { specs, unverifiable };
+}
+
+/**
+ * True when a relative specifier, resolved from the file at relToCore, names a path
+ * outside the scanned tree. No filesystem lookup: a relative import that climbs out
+ * of the tree is a violation whether or not its target exists (ISSUE-593).
+ *
+ * @param {string} relToCore path relative to the scanned root, forward slashes
+ * @param {string} spec
+ */
+function leavesRoot(relToCore, spec) {
+  const target = posix.normalize(posix.join(posix.dirname(relToCore), spec));
+  return target === '..' || target.startsWith('../');
 }
 
 /**
@@ -113,7 +130,14 @@ export function judge(relToCore, source) {
   }
 
   for (const spec of scanned.specs) {
-    if (spec.startsWith('.')) continue;
+    // A relative specifier used to be skipped outright, so a core file importing the
+    // harness through ../../../ passed as clean (ISSUE-593).
+    if (spec.startsWith('.')) {
+      if (leavesRoot(relToCore, spec)) {
+        out.push(`${relToCore}: relative import "${spec}" leaves packages/core/src`);
+      }
+      continue;
+    }
 
     const forbidden = FORBIDDEN.find((re) => re.test(spec));
     if (forbidden) {
@@ -169,7 +193,20 @@ export async function scan(dir = CORE_SRC) {
 // Only the CLI invocation scans and exits; importing this module (the self-test)
 // gets `specifiers`/`judge` without side effects. An optional path argument exists
 // so the self-test can run the real gate over a fixture tree; the default is core.
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// A junction or symlink leaves argv[1] spelled differently from the real path Node
+// reports in import.meta.url, so both sides are compared after realpathSync: a
+// spelling mismatch must not end the process with status 0 and no scan (ISSUE-593).
+const SELF = fileURLToPath(import.meta.url);
+function isSelf(argvPath) {
+  if (argvPath === undefined) return false;
+  try {
+    return realpathSync(argvPath) === realpathSync(SELF);
+  } catch {
+    return false;
+  }
+}
+
+if (isSelf(process.argv[1])) {
   const result = await scan(process.argv[2] ?? CORE_SRC);
   if (result === null) process.exit(1);
 

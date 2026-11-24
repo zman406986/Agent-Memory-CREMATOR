@@ -1,0 +1,135 @@
+{
+  "model": "mock-model",
+  "title": "opencode workspace replay bench",
+  "task": "Read docs/project/building/ref-gia-build-pipeline.md twice and docs/project/building/ref-gia-file-format.md once, then reply with exactly: DONE",
+  "fixture": {
+    "readerCapBytes": 51200,
+    "productBarBytes": 512,
+    "files": [
+      {
+        "name": "ref-gia-build-pipeline.md",
+        "sentinel": "# building — the `.gia` build pipeline and asset integration",
+        "bytes": 3218
+      },
+      {
+        "name": "ref-gia-file-format.md",
+        "sentinel": "# building — the `.gia` file format",
+        "bytes": 5157
+      }
+    ],
+    "lanes": [
+      {
+        "name": "workspace-building-pair",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_workspace_building_unit_1_RS-WORKSPACE-BUILDING"
+        ],
+        "supersedingCalls": [
+          "call_workspace_building_unit_2"
+        ],
+        "triggerCalls": [
+          "call_workspace_building_unit_2"
+        ],
+        "unitFiles": [
+          "ref-gia-build-pipeline.md"
+        ],
+        "markerSentinels": [
+          "RS-WORKSPACE-BUILDING"
+        ],
+        "twinCalls": [
+          "call_workspace_building_unit_2",
+          "call_workspace_building_twin_1"
+        ],
+        "twinFiles": [
+          "ref-gia-build-pipeline.md",
+          "ref-gia-file-format.md"
+        ]
+      }
+    ]
+  },
+  "expectedReads": {
+    "ref-gia-build-pipeline.md": {
+      "count": 1,
+      "sentinel": "# building — the `.gia` build pipeline and asset integration"
+    },
+    "ref-gia-file-format.md": {
+      "count": 1,
+      "sentinel": "# building — the `.gia` file format"
+    }
+  },
+  "replies": [
+    {
+      "name": "workspace-building-unit-read",
+      "match": {
+        "main_turn": 0,
+        "tools_present": true,
+        "last_user_contains": [
+          "Read docs/project/building/ref-gia-build-pipeline.md twice"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The task names the first building note in the final pass. Read it so its own result is on the wire, then read it again to make the earlier copy the removable unit.",
+        "text": "Reading ref-gia-build-pipeline.md once.",
+        "calls": [
+          {
+            "id": "call_workspace_building_unit_1_RS-WORKSPACE-BUILDING",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/docs/project/building/ref-gia-build-pipeline.md"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "workspace-building-twin-read",
+      "match": {
+        "main_turn": 1,
+        "tools_present": true,
+        "last_user_contains": [
+          "Read docs/project/building/ref-gia-build-pipeline.md twice"
+        ],
+        "last_tool_result_contains": [
+          "# building — the `.gia` build pipeline and asset integration"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The first read is in the history. Read the same path again so the earlier copy is superseded, and read the second building note so the control has a distinct twin whose own result must survive.",
+        "text": "Reading ref-gia-build-pipeline.md again and ref-gia-file-format.md once.",
+        "calls": [
+          {
+            "id": "call_workspace_building_unit_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/docs/project/building/ref-gia-build-pipeline.md"
+            }
+          },
+          {
+            "id": "call_workspace_building_twin_1",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/docs/project/building/ref-gia-file-format.md"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "workspace-building-done",
+      "match": {
+        "main_turn": 2,
+        "tools_present": true,
+        "last_user_contains": [
+          "Read docs/project/building/ref-gia-build-pipeline.md twice"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "reasoning": "Both reads have landed: the unit twice and the twin once. Nothing else is asked for, so reply with the exact word the task names.",
+        "text": "DONE"
+      }
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+{
+  "slug": "failed-result-not-delivered",
+  "task": "Run the PowerShell command, then read the file absent-long-name.txt, and report what happened.",
+  "timeoutMs": 120000,
+  "notes": "S7 restated after ADR-0014: with the cap off the product path there is no cap leg to test, so the surviving rule is the one the old scenario also proved — a failed tool result is observed for the transcript but never delivered to the entry seam, and nothing rewrites the surface. The title row is disabled because a title call can be captured as main's seed.",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "perturbation": "change expect.racoons.skippedFailedResults to 0: the run must fail by name 'failed results are skipped, not delivered'",
+  "racoons": {
+    "barBytes": 2048
+  },
+  "script": {
+    "title": "A failed result is never delivered",
+    "replies": [
+      {
+        "name": "prune-table-keepall",
+        "match": {
+          "tools_length": "present",
+          "last_user_text_matches": "maps every index above to its verdict"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"1\":{\"keepall\":true}}"
+        }
+      },
+      {
+        "name": "one-oversized-success-one-oversized-failure",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the command and reading the file.",
+          "calls": [
+            {
+              "id": "rig_s7_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit an oversized body",
+                "command": "1..600 | ForEach-Object { \"s7 row $_ \" + ('y' * 96) }"
+              }
+            },
+            {
+              "id": "rig_s7_read_missing",
+              "name": "read",
+              "input": {
+                "file_path": "absent-this-name-and-its-not-found-body-are-both-well-over-the-bar.txt"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-outcome",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2,
+          "last_assistant_tool_names": [
+            "pwsh",
+            "read"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows and the file does not exist."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "PowerShell",
+      "titleRequests": {
+        "max": 0
+      },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 2,
+      "results": 2,
+      "callIds": [
+        "rig_s7_pwsh_1",
+        "rig_s7_read_missing"
+      ],
+      "names": [
+        "pwsh",
+        "read"
+      ],
+      "resultContains": [
+        "not found"
+      ]
+    },
+    "session": {
+      "userTextContains": "PowerShell",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "ledger": true,
+      "entries": 1,
+      "skippedFailedResults": 1,
+      "surfaceReplacements": 0,
+      "requestTextAbsent": "[Capped: ",
+      "secondPassAddsNothing": 0
+    },
+    "stdout": {
+      "finalText": "The command printed 600 rows and the file does not exist."
+    }
+  }
+}

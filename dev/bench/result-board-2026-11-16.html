@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CREMATOR test result board — dsh post-cap</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f4f2;
+    --surface: #ffffff;
+    --fg: #1b1d20;
+    --fg-soft: #3c3f44;
+    --muted: #6a6f76;
+    --line: #e3e4e6;
+    --line-strong: #c7cacf;
+    --zebra: #f8f8f7;
+    --hover: #edf2f7;
+    --head-bg: #fbfbfa;
+    --note-bg: #f7f8f8;
+    --focus: #2f6f9f;
+    --pair-rule: #9db3c7;
+    --product-bg: #e9f1f8;
+    --product-fg: #214d72;
+    --product-line: #c7d9e9;
+    --vanilla-bg: #f4f0e8;
+    --vanilla-fg: #5b5242;
+    --vanilla-line: #e1d9ca;
+    --test-fg: #6a6f76;
+    --test-line: #d5d8db;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1114;
+      --surface: #16191d;
+      --fg: #e7e8ea;
+      --fg-soft: #c4c7cb;
+      --muted: #969ca4;
+      --line: #272b30;
+      --line-strong: #3b4047;
+      --zebra: #191c20;
+      --hover: #1f2832;
+      --head-bg: #121518;
+      --note-bg: #191c20;
+      --focus: #8ec2ea;
+      --pair-rule: #506b83;
+      --product-bg: #16283a;
+      --product-fg: #a9cce9;
+      --product-line: #28415a;
+      --vanilla-bg: #262219;
+      --vanilla-fg: #d8ccb7;
+      --vanilla-line: #3e382a;
+      --test-fg: #969ca4;
+      --test-line: #34383d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 28px 24px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .board { max-width: 1440px; margin: 0 auto; display: grid; gap: 18px; }
+  .board-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.25; }
+  h2 { margin: 0; font-size: 15px; font-weight: 650; }
+  .sub { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .rule { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+  .badge {
+    flex: none; padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--surface); color: var(--muted); font-size: 11.5px; white-space: nowrap;
+  }
+  .legend {
+    list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 28px;
+    color: var(--muted); font-size: 12.5px; line-height: 1.55;
+  }
+  .legend li { margin: 0; }
+  .legend strong { color: var(--fg-soft); font-weight: 600; }
+  .viewbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .view-toggle {
+    font: inherit; font-size: 12.5px; font-weight: 600; color: var(--fg);
+    background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .view-toggle:hover { background: var(--hover); }
+  .view-toggle[aria-pressed="true"] { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  .view-toggle.is-partial { border-style: dashed; }
+  .hint { margin: 0; color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1 1 24px; }
+  .groups { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font: inherit; font-size: 12px; color: var(--muted); background: transparent;
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .chip:hover { color: var(--fg); border-color: var(--line-strong); }
+  .chip[aria-pressed="true"] { color: var(--fg); background: var(--head-bg); border-color: var(--line-strong); }
+  .chip.is-partial { border-style: dashed; color: var(--muted); }
+  .run-selector { margin: 10px 0; }
+  .table-scroll {
+    position: relative; min-width: 0;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .table-scroll.scroll-x .results th[data-col="task"],
+  .table-scroll.scroll-x .results td[data-col="task"] { min-width: 140px; }
+  .table-scroll.scroll-x .results th[data-col="outcome"],
+  .table-scroll.scroll-x .results td[data-col="outcome"] { min-width: 190px; }
+  .table-scroll.scroll-x .results th[data-col="model"],
+  .table-scroll.scroll-x .results td[data-col="model"] { min-width: 105px; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  table.results { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13.5px; }
+  .results th, .results td {
+    padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle;
+  }
+  .results thead th {
+    position: sticky; top: 0; z-index: 3; padding: 0;
+    background: var(--head-bg); border-bottom: 1px solid var(--line-strong);
+    color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: 0.04em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .results thead th.notes-head { padding: 9px 10px; text-align: right; }
+  .col-toggle {
+    display: block; width: 100%; padding: 9px 10px; margin: 0;
+    background: none; border: 0; font: inherit; color: inherit; text-align: left;
+    letter-spacing: inherit; text-transform: inherit; white-space: nowrap; cursor: pointer;
+  }
+  .col-toggle:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 3px; }
+  .results thead th.num .col-toggle { text-align: right; }
+  .results thead th.is-collapsed { width: 1%; padding: 0; }
+  .results thead th.is-collapsed .col-toggle { padding-left: 7px; padding-right: 7px; color: var(--muted); }
+  .results .run-head, .results .run-cell {
+    position: sticky; left: 0; width: 200px; min-width: 200px; max-width: 200px;
+    border-right: 1px solid var(--line);
+  }
+  .results .run-head { z-index: 4; padding: 9px 10px; }
+  .results .run-cell { z-index: 2; font-size: 12px; font-weight: 500; line-height: 1.4; overflow-wrap: anywhere; }
+  .results tbody { --row-bg: var(--surface); }
+  .results tbody:nth-of-type(even) { --row-bg: var(--zebra); }
+  .results tr.result > * { background: var(--row-bg); }
+  .results tr.result:hover > * { background: var(--hover); }
+  .results tr.result > :first-child { border-left: 3px solid transparent; }
+  .results tbody.pair tr.result > :first-child { border-left-color: var(--pair-rule); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .results td[data-col="task"] { color: var(--muted); text-wrap: pretty; }
+  .results td[data-col="outcome"] { color: var(--fg-soft); font-size: 13px; text-wrap: pretty; }
+  .results td[data-col="compactions"], .results td[data-col="removed"] { white-space: normal; }
+  .unit { white-space: nowrap; }
+  .arm {
+    display: inline-block; padding: 2px 8px; border: 1px solid; border-radius: 4px;
+    font-size: 11.5px; font-weight: 600; line-height: 1.45; white-space: nowrap;
+  }
+  .arm-product { background: var(--product-bg); border-color: var(--product-line); color: var(--product-fg); }
+  .arm-vanilla { background: var(--vanilla-bg); border-color: var(--vanilla-line); color: var(--vanilla-fg); }
+  .arm-test { background: transparent; border-color: var(--test-line); color: var(--test-fg); }
+  .cost { white-space: nowrap; }
+  .cost .money { display: block; font-size: 15.5px; font-weight: 650; line-height: 1.25; color: var(--fg); }
+  .cost .qual { display: block; font-size: 10.5px; font-weight: 400; line-height: 1.35; color: var(--muted); }
+  .note-toggle-cell { width: 58px; text-align: right; }
+  .note-toggle {
+    font: inherit; font-size: 11.5px; font-weight: 500; color: var(--muted);
+    background: none; border: 0; padding: 4px 2px; cursor: pointer; white-space: nowrap;
+  }
+  .note-toggle::before { content: "+ "; }
+  .note-toggle[aria-expanded="true"] { color: var(--fg); font-weight: 600; }
+  .note-toggle[aria-expanded="true"]::before { content: "− "; }
+  .note-toggle:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 3px; }
+  .note-row > .note-cell {
+    padding: 0; background: var(--note-bg);
+    border-left: 3px solid transparent; border-bottom: 1px solid var(--line);
+  }
+  .results tbody.pair .note-row > .note-cell { border-left-color: var(--pair-rule); }
+  .note-body {
+    padding: 12px 16px 14px 14px; max-width: 122ch;
+    font-size: 13px; line-height: 1.65; color: var(--fg-soft); text-wrap: pretty;
+  }
+  .guide {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+    padding: 0 14px; color: var(--muted); font-size: 12.5px;
+  }
+  .guide summary { padding: 11px 0; color: var(--fg-soft); font-size: 13px; font-weight: 500; cursor: pointer; }
+  .guide ul { margin: 0 0 12px; padding-left: 18px; }
+  .guide li { margin: 5px 0; line-height: 1.55; }
+  .guide strong { color: var(--fg-soft); font-weight: 600; }
+  .charts { display: grid; gap: 10px; }
+  .charts-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+  .chart-key { list-style: none; margin: 0; padding: 0; display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 12px; }
+  .chart-key li { display: flex; align-items: center; gap: 5px; }
+  .chart-key .swatch { width: 9px; height: 9px; border-radius: 2px; border: 1px solid var(--line-strong); }
+  .swatch-product { background: var(--product-fg); }
+  .swatch-vanilla { background: var(--vanilla-fg); }
+  .swatch-ask { background: var(--product-line); }
+  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+  .chart-card {
+    margin: 0; padding: 12px 14px 10px; min-width: 0;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  }
+  .chart-card svg { display: block; width: 100%; height: auto; font-family: inherit; }
+  .chart-card figcaption { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .chart-card .grid-line { stroke: var(--line); stroke-width: 0.7; }
+  .chart-card .axis-line { stroke: var(--line-strong); stroke-width: 0.8; }
+  .chart-card .limit { stroke: var(--muted); stroke-width: 0.8; stroke-dasharray: 3 3; }
+  .chart-card .tick { fill: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
+  .chart-card .val { fill: var(--fg-soft); font-size: 8px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .chart-card .cat { fill: var(--muted); font-size: 8.5px; }
+  .chart-card .bar-product, .chart-card .bar-main { fill: var(--product-fg); }
+  .chart-card .bar-vanilla { fill: var(--vanilla-fg); }
+  .chart-card .bar-ask { fill: var(--product-line); stroke: var(--surface); stroke-width: 0.8; }
+  .scope-tag {
+    display: inline-block; padding: 2px 8px; border: 1px solid var(--line-strong);
+    border-radius: 999px; color: var(--muted); font-size: 11px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .scope-tag-warn {
+    background: var(--vanilla-bg); border-color: var(--vanilla-line); color: var(--vanilla-fg);
+  }
+  .control-note { margin: 10px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+  .chart-wide { padding-bottom: 12px; }
+  .rate-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+  .rate-table th, .rate-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .rate-table thead th {
+    background: var(--head-bg); color: var(--muted); font-size: 11px; font-weight: 650;
+    letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--line-strong);
+    white-space: nowrap;
+  }
+  .rate-table tbody th { color: var(--fg-soft); font-weight: 600; white-space: nowrap; }
+  .rate-table th.num, .rate-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .rate-table .basis { color: var(--muted); }
+  .rate-table tbody tr:last-child th, .rate-table tbody tr:last-child td { border-bottom: 0; }
+  .takeaway {
+    margin: 0; padding: 10px 12px; border-left: 3px solid var(--pair-rule);
+    background: var(--note-bg); color: var(--fg-soft); font-size: 13px; line-height: 1.55;
+  }
+  @media (max-width: 700px) {
+    .chart-grid { grid-template-columns: 1fr; }
+  }
+  [hidden] { display: none !important; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .checkpoints { display: grid; gap: 10px; }
+  .checkpoints .table-scroll { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  table.checkpoint { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+  .checkpoint th, .checkpoint td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .checkpoint thead th {
+    background: var(--head-bg); color: var(--muted); font-size: 11px; font-weight: 650;
+    letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--line-strong);
+  }
+  .checkpoint thead tr:first-child th:first-child { text-align: right; }
+  .checkpoint thead tr:first-child th[colspan] { text-align: center; color: var(--fg-soft); }
+  .checkpoint thead tr:last-child th { text-align: right; }
+  .checkpoint tbody th { text-align: right; width: 48px; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .checkpoint tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .checkpoint tbody tr:nth-child(even) td, .checkpoint tbody tr:nth-child(even) th { background: var(--zebra); }
+  .checkpoint tbody tr:hover td, .checkpoint tbody tr:hover th { background: var(--hover); }
+  .checkpoint .deliverable { white-space: nowrap; }
+  .checkpoint code { color: var(--fg-soft); }
+  .checkpoint tbody tr:last-child td, .checkpoint tbody tr:last-child th { border-bottom: 0; }
+  button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--focus); outline-offset: 2px;
+  }
+</style>
+</head>
+<body>
+<style>
+  .results thead th { padding: 9px 10px; }
+  .results thead th.run-head { padding: 9px 10px; }
+</style>
+<main class="board" id="racoons-result-board">
+  <header class="board-head">
+    <div>
+      <h1>CREMATOR test result board — dsh, post-cap</h1>
+      <p class="sub">dsh runs only: the two long shapes from the 2026-11-16 uncapped campaign, after the 12-row table cap was removed (ADR-0060). One run per arm per shape; n = 1, so these are directions, not intervals.</p>
+      <p class="rule">Short SWE-batch runs (SWE-bench-Live lite, SWE-rebench) are removed. The compounded shape is a long dsh session over 36 records + 8 SWE tasks + summary, so it stays.</p>
+    </div>
+    <span class="badge">post-cap · 4 draws</span>
+  </header>
+
+  <ul class="legend">
+    <li><strong>True tokens:</strong> main prompt + output + ask lane + native compaction.</li>
+    <li><strong>Peak context:</strong> the largest prompt in the session.</li>
+    <li><strong>Compactions:</strong> completed host compactions.</li>
+    <li><strong>Ask triggers:</strong> successful prune-ask exchanges. The vanilla arm mounts no ask lane.</li>
+    <li><strong>Removals:</strong> product removal applications. Vanilla loads no product; its host pruner is a separate lane and is not counted here.</li>
+    <li><strong>Cost:</strong> DeepSeek official is computed from the measured token split; the other three cards are extrapolations, not invoices. The cost table below carries the method.</li>
+    <li><strong>Solve:</strong> the task's named fail-tests, after the run.</li>
+  </ul>
+
+  <div class="table-scroll">
+    <table class="results">
+      <caption class="sr-only">Post-cap dsh runs, product against vanilla, one row per arm.</caption>
+      <thead>
+        <tr>
+          <th scope="col" class="run-head">Shape / run</th>
+          <th scope="col">Arm</th>
+          <th scope="col" data-col="task">Task</th>
+          <th scope="col" data-col="outcome">Outcome</th>
+          <th scope="col" class="num">True tokens</th>
+          <th scope="col" class="num">Peak context</th>
+          <th scope="col" class="num">Turns</th>
+          <th scope="col" class="num">Compactions</th>
+          <th scope="col" class="num">Ask triggers</th>
+          <th scope="col" class="num">Removals</th>
+          <th scope="col" class="num">Cost USD</th>
+          <th scope="col">Notes</th>
+        </tr>
+      </thead>
+      <tbody class="pair">
+        <tr class="result">
+          <th scope="row" class="run-cell">extended-36<br><code>run 01</code></th>
+          <td><span class="arm arm-product">product</span></td>
+          <td data-col="task">36-record audit</td>
+          <td data-col="outcome">36/36 · BENCH-DONE · exit 0</td>
+          <td class="num">29,274,991</td>
+          <td class="num">318,989</td>
+          <td class="num">162</td>
+          <td class="num">1</td>
+          <td class="num">15</td>
+          <td class="num">118</td>
+          <td class="num cost"><span class="money">0.5043</span> <span class="qual">(computed)</span></td>
+          <td>Compacted at request 155 of 162; ask lane 1.76M tokens; 74% of eligible results offered.</td>
+        </tr>
+        <tr class="result">
+          <th scope="row" class="run-cell">extended-36<br><code>run 02e</code></th>
+          <td><span class="arm arm-vanilla">vanilla</span></td>
+          <td data-col="task">36-record audit</td>
+          <td data-col="outcome">36/36 · BENCH-DONE · exit 0</td>
+          <td class="num">35,209,184</td>
+          <td class="num">321,199</td>
+          <td class="num">167</td>
+          <td class="num">1</td>
+          <td class="num">0</td>
+          <td class="num">0</td>
+          <td class="num cost"><span class="money">0.3662</span> <span class="qual">(computed)</span></td>
+          <td>Compacted at request 93 of 167; accepted control draw 2e (four of five control draws failed).</td>
+        </tr>
+      </tbody>
+      <tbody class="pair">
+        <tr class="result">
+          <th scope="row" class="run-cell">compounded<br><code>run 07</code></th>
+          <td><span class="arm arm-product">product</span></td>
+          <td data-col="task">36 records + 8 SWE tasks + summary</td>
+          <td data-col="outcome">45/45 outputs · 4/8 SWE · exit 0</td>
+          <td class="num">39,315,358</td>
+          <td class="num">280,710</td>
+          <td class="num">218</td>
+          <td class="num">0</td>
+          <td class="num">6</td>
+          <td class="num">116</td>
+          <td class="num cost"><span class="money">0.3888</span> <span class="qual">(computed)</span></td>
+          <td>0 compactions; ask lane 854k tokens (32.4% cached); all 45 outputs written.</td>
+        </tr>
+        <tr class="result">
+          <th scope="row" class="run-cell">compounded<br><code>run 08</code></th>
+          <td><span class="arm arm-vanilla">vanilla</span></td>
+          <td data-col="task">36 records + 8 SWE tasks + summary</td>
+          <td data-col="outcome">45/45 outputs · 5/8 SWE · exit 0</td>
+          <td class="num">44,453,428</td>
+          <td class="num">319,673</td>
+          <td class="num">197</td>
+          <td class="num">0</td>
+          <td class="num">0</td>
+          <td class="num">0</td>
+          <td class="num cost"><span class="money">0.2700</span> <span class="qual">(computed)</span></td>
+          <td>0 compactions; all 45 outputs; the one-task gap is <code>duo-labs__py_webauthn-241</code>, an order-effect candidate at n = 1.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="control-note"><strong>Pair deltas, product against vanilla.</strong> True tokens: extended-36 −16.9% (29.27M vs 35.21M), compounded −11.6% (39.32M vs 44.45M). Peak context: −0.7% and −12.2%. Turns: 162/167 and 218/197. Compactions: 1/1 and 0/0. Solve: 36/36 both; 4/8 against 5/8.</p>
+
+  <div class="charts-head">
+    <div>
+      <h2 id="cost-title">Cost at four rate cards</h2>
+      <p class="rule">Measured DeepSeek split plus three extrapolations. The product pays for an ask lane; the vanilla arm has none.</p>
+    </div>
+  </div>
+
+  <div class="table-scroll">
+    <table class="rate-table">
+      <caption class="sr-only">Cost per run at DeepSeek official, GLM 5.3, GPT-6.1 Sol and Claude Opus 5.5.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Shape</th>
+          <th scope="col">Arm</th>
+          <th scope="col" class="num">True tokens</th>
+          <th scope="col" class="num">DeepSeek official</th>
+          <th scope="col" class="num">GLM 5.3</th>
+          <th scope="col" class="num">GPT-6.1 Sol</th>
+          <th scope="col" class="num">Claude Opus 5.5</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">extended-36</th><td><span class="arm arm-product">product</span></td><td class="num">29,274,991</td><td class="num">$0.5043</td><td class="num">$10.9634</td><td class="num">$7.7653</td><td class="num">$85.3846</td></tr>
+        <tr><th scope="row">extended-36</th><td><span class="arm arm-vanilla">vanilla</span></td><td class="num">35,209,184</td><td class="num">$0.3662</td><td class="num">$11.2748</td><td class="num">$7.1395</td><td class="num">$79.3636</td></tr>
+        <tr><th scope="row">compounded</th><td><span class="arm arm-product">product</span></td><td class="num">39,315,358</td><td class="num">$0.3888</td><td class="num">$12.4142</td><td class="num">$7.6743</td><td class="num">$86.2629</td></tr>
+        <tr><th scope="row">compounded</th><td><span class="arm arm-vanilla">vanilla</span></td><td class="num">44,453,428</td><td class="num">$0.2700</td><td class="num">$12.6955</td><td class="num">$7.1827</td><td class="num">$81.2739</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-scroll">
+    <table class="rate-table">
+      <caption class="sr-only">Rate cards used in the cost table.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Rate card</th>
+          <th scope="col" class="num">Uncached / M</th>
+          <th scope="col" class="num">Cached / M</th>
+          <th scope="col" class="num">Output / M</th>
+          <th scope="col">Basis</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">DeepSeek official</th><td class="num">$0.15</td><td class="num">$0.003</td><td class="num">$0.60</td><td class="basis">measured rates; output assumed to include reasoning</td></tr>
+        <tr><th scope="row">GLM 5.3</th><td class="num">$1.40</td><td class="num">$0.26</td><td class="num">$5.60</td><td class="basis">input/cached from the 2026-10-26 floor-calibration note; output at q = 4, assumed</td></tr>
+        <tr><th scope="row">GPT-6.1 Sol</th><td class="num">$1.25</td><td class="num">$0.125</td><td class="num">$10.00</td><td class="basis">no Sol rate in the repo; placeheld at the Astra card — not a vendor quote</td></tr>
+        <tr><th scope="row">Claude Opus 5.5</th><td class="num">$15.00</td><td class="num">$1.50</td><td class="num">$75.00</td><td class="basis">assumed — not a vendor quote</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="control-note"><strong>Cost method.</strong> Main lane: measured uncached input, cache read and output. Ask lane: measured from the run's own <code>prune-ask</code> usage rows (extended-36 47.6% cached, compounded 32.4% cached). Compaction prompt: priced uncached as an upper bound. Cache write is zero in these runs; reasoning is inside the output rate. DeepSeek is the measured provider; the other three are what the same token split would cost at those cards, not invoices. n = 1 per cell.</p>
+
+  <p class="takeaway"><strong>Post-cap read.</strong> On the two long dsh shapes the product used fewer true tokens and lower peak context, with the same compaction count. It solved the same 36/36, and one fewer SWE task on the compounded shape. The token saving does not become a dollar saving at these rates: the product is cheaper only on GLM 5.3 (extended-36 −2.8%, compounded −2.2%). It is more expensive on DeepSeek (+37.7% / +44.0%), GPT-6.1 Sol (+8.8% / +6.8%) and Claude Opus 5.5 (+7.6% / +6.1%), because its ask lane is uncached and output-heavy.</p>
+</main>
+
+</body>
+</html>

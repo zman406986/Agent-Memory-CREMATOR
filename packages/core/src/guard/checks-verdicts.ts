@@ -139,6 +139,9 @@ export function checkVerdicts(c: CheckContext, plans: readonly RulePlan[]): void
       // its ranges name what was removed, never what was kept.
       const receipt = plan.notes.find(note => note.id === op.noteId);
       if (receipt === undefined || receipt.kind !== "receipt") return; // `checkOperations` speaks.
+      if (receipt.path !== (unit.path ?? unit.nodeId)) {
+        report("invalid-note", "A receipt names a path other than its unit's", unit.nodeId);
+      }
       if (receipt.label !== receiptLabelFor(verdict)) {
         report("invalid-note", "A receipt label differs from its verdict's descriptor", unit.nodeId);
       }

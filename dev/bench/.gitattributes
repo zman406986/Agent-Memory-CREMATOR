@@ -1,0 +1,14 @@
+# Each extended brief's task block is a byte pin: the round manifest carries its
+# sha256 and character count, and `bench-run.mjs`'s manifest gate compares both
+# before anything is wiped. The repo is authored on Windows with
+# `core.autocrlf=true` — the exact setting that rewrites an unattributed text
+# file on checkout — so these rules are load-bearing, not tidiness. Named
+# patterns, not `*`: only the frozen briefs are pins.
+bench-brief-extended.md text eol=lf
+bench-brief-extended-32.md text eol=lf
+bench-brief-extended-33.md text eol=lf
+bench-brief-extended-36.md text eol=lf
+bench-brief-extended-48.md text eol=lf
+bench-brief-swe-lite.md text eol=lf
+bench-brief-swe-rebench.md text eol=lf
+bench-brief-compounded.md text eol=lf

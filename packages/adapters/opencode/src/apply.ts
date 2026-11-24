@@ -1745,6 +1745,29 @@ function pathBasename(path: string): string {
 }
 
 /**
+ * One path spelling with both separators and ASCII case folded (ISSUE-570).
+ * Windows accepts either separator and either case, and the model's label may
+ * spell the directory differently than the call did. The fold is one character
+ * to one character — `toLowerCase` is not, `İ` alone becoming two — so every
+ * index in the line stays valid and a match found in the fold slices the label.
+ */
+function sameSpacing(path: string): string {
+  return path.replace(/\\/gu, '/').replace(/[A-Z]/gu, character => character.toLowerCase());
+}
+
+/**
+ * The label text before a named directory, with the label's own directory
+ * dropped (ISSUE-570). The call's path names the directory; joining the label's
+ * spelling to it would name a directory twice, or name a path the file is not
+ * under. A directory may contain spaces, so the whole run up to the separator
+ * goes; text before a run that does not end in a separator is the label's own
+ * voice and stays.
+ */
+function withoutDirPrefix(prefix: string): string {
+  return /[\\/]$/u.test(prefix) ? '' : prefix;
+}
+
+/**
  * The line with the target path folded into its `— about:` descriptor (1g
  * FIX 2). Every byte outside that descriptor is the ledger's own: the target,
  * the ranges, the pass segment and the recall marker are untouched, so the
@@ -1765,12 +1788,13 @@ function writePathReceiptText(text: string, target: WriteTarget | null): string 
   if (aboutAt < 0) return text;
   const labelAt = aboutAt + RECEIPT_ABOUT_MARKER.length;
   const label = head.slice(labelAt);
-  if (label.includes(target.path)) return text;
+  const spaced = sameSpacing(label);
+  if (spaced.includes(sameSpacing(target.path))) return text;
   const base = pathBasename(target.path);
-  const baseAt = base.length === 0 ? -1 : label.lastIndexOf(base);
+  const baseAt = base.length === 0 ? -1 : spaced.lastIndexOf(sameSpacing(base));
   const named = baseAt < 0
     ? `${label} (${target.path})`
-    : `${label.slice(0, baseAt)}${target.path}${label.slice(baseAt + base.length)}`;
+    : `${withoutDirPrefix(label.slice(0, baseAt))}${target.path}${label.slice(baseAt + base.length)}`;
   return `${head.slice(0, labelAt)}${named}${text.slice(recallAt)}`;
 }
 

@@ -1,0 +1,102 @@
+{
+  "slug": "oversized-result-uncapped",
+  "task": "Run the PowerShell command in this directory and tell me how many lines its output has.",
+  "timeoutMs": 120000,
+  "notes": "ADR-0014 took the cap off the product path: CapRule is unregistered and capBytes/capHeadBytes are accepted-and-ignored, so no cap plan, marker or archive can exist. This scenario pins the surviving truth: a 49 KB result is carried to the wire whole, the entry seam still captures it, and nothing rewrites it. The title row is disabled for the same reason as the keepall-final scenario (a title call can be captured as main's seed).",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "workFiles": {
+    "big.txt": ""
+  },
+  "perturbation": "change expect.mock.mainBodyContains to a string the result never contains: the run must fail by name 'mock main request carries the text'",
+  "racoons": {
+    "barBytes": 2048,
+    "anchors": "off"
+  },
+  "script": {
+    "title": "An oversized result is not capped",
+    "replies": [
+      {
+        "name": "ask-for-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running it.",
+          "calls": [
+            {
+              "id": "rig_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-line-count",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "PowerShell",
+      "mainBodyContains": "row 600 xxxxxxxxxxxxxxxxxxxx",
+      "titleRequests": {
+        "max": 0
+      },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 1,
+      "results": 1,
+      "failedResults": 0,
+      "callIds": [
+        "rig_pwsh_1"
+      ],
+      "names": [
+        "pwsh"
+      ]
+    },
+    "session": {
+      "userTextContains": "PowerShell",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "ledger": true,
+      "entries": 1,
+      "surfaceReplacements": 0,
+      "requestTextAbsent": "[Capped: ",
+      "secondPassAddsNothing": 0
+    },
+    "stdout": {
+      "finalText": "The command printed 600 rows."
+    }
+  }
+}

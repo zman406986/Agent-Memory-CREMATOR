@@ -1,0 +1,33 @@
+{
+  "schema": "racoons-bench-round-tasks/1",
+  "round": "2026-11-16-swe-lite",
+  "brief": {
+    "path": "dev/bench/bench-brief-swe-lite.md",
+    "taskSha256": "b16b1b24a5aae3d1146b4cfe3ff0c0db27ebb27ba149c8dff27291462ca547eb",
+    "taskSha256Method": "sha256 over the first fenced block under 'Task text', trimmed (dev/bench/manifest-gate.mjs taskSha256); computed 2026-11-16 by dev/bench/make-round-manifest.mjs",
+    "taskBlockBytes": 16037
+  },
+  "imageRoot": "C:/Users/TZhen/Desktop/racoons-bench/2026-11-16-swe-lite/racoons-arm",
+  "image": {
+    "source": "src",
+    "digest": "7a9e4c7555c7119e4945b357a366fb26a993fa7b7a1cc26d92d53d3bcd4dcfb1",
+    "reMaterialized": "2026-11-15",
+    "files": 1577,
+    "bytes": 49308523
+  },
+  "provenance": {
+    "derivedAt": "2026-11-16",
+    "generator": "dev/bench/make-round-manifest.mjs",
+    "tools": [
+      "dev/bench/bench-brief-swe-lite.md (the fenced 'Task text' block: taskSha256 and its character count)",
+      "C:/Users/TZhen/Desktop/racoons-bench/2026-11-16-swe-lite/racoons-arm/manifest.json (image.digest = totals.multisetSha256, plus the image file and byte counts)",
+      "dev/bench/dsh-checkpoints.mjs deliverablesFromBrief over the task fence, the whole brief as fallback (deliverables.count; the same call the launcher makes)"
+    ],
+    "note": "Omitted informational blocks: tasks, totals, windowProjection, expectedFiresNote and dist. They describe the brief's bound table and a measured dist tree, which this generator does not read; no launcher gate reads them (dev/bench/manifest-gate.mjs manifestEnforcementRecord)."
+  },
+  "deliverables": {
+    "count": 5,
+    "source": "the brief-derived list (dev/bench/dsh-checkpoints.mjs deliverablesFromBrief)",
+    "note": "The count is the length of the list dev/bench/bench-run.mjs derives from this brief (5 path(s)); manifestDeliverablesGate compares this number to that list at launch, so a brief edited after this file was written fails the launch."
+  }
+}

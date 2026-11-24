@@ -192,6 +192,12 @@ export class EpisodeTracker {
           prior.closeReason = null;
           prior.closedAtStep = null;
           prior.closedAtTurn = null;
+          // The late result is fresh evidence: the burst continues, so the idle
+          // baseline moves to it. Otherwise a repeated known path would leave the
+          // baseline in the old burst and the episode would re-close at a turn
+          // earlier than a member it now holds (ISSUE-565).
+          prior.lastNewPathStep = result.stepOrdinal;
+          prior.lastNewPathTurn = result.turnOrdinal;
           episode = prior;
           active.set(target.key, episode);
         } else {

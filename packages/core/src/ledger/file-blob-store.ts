@@ -71,12 +71,17 @@ export class FileBlobStore implements BlobStore {
         } catch (error) {
           try { rmSync(claim, { recursive: true, force: true }); }
           catch { /* the sweep recovers what this could not remove */ }
-          if (!lockPathHeld(error, lockPath)) throw error;
+          // Windows refuses the claim with EPERM while a lock is there. A lock
+          // path gone by this look means its holder released inside the
+          // window, so the refusal was contention that has passed, never a
+          // disk fault: retry the claim (LOCK_ATTEMPTS bounds the wait).
+          const held = lockPathHeld(error, lockPath);
+          if (!held && !hasCode(error, "EPERM")) throw error;
           if (existsSync(target)) {
             await this.#acceptExisting(hash, copy.byteLength);
             return hash;
           }
-          breakStaleLock(lockPath);
+          if (held) breakStaleLock(lockPath);
           await new Promise<void>(done => setTimeout(done, LOCK_RETRY_MS));
         }
       }

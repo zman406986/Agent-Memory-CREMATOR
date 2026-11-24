@@ -390,7 +390,16 @@ export class RacoonsEngine {
     const episodes = detectEpisodes(o, snapshot);
     const committed = await committedState(entries, o.port);
     this.reportConflicts(committed.conflicts);
-    if (committed.blocked) return result('recovery-pending');
+    if (committed.blocked) {
+      // A receipt read that threw is the host failing, not refusing: no conflict
+      // carries it, so name the intent and the skip before blocking (ISSUE-556).
+      for (const failure of committed.unread) {
+        this.emit({ kind: 'error', eventId: input.eventId, stage: 'recovery',
+          message: `receipt read failed for ${failure.intentId}: ${failure.message}` });
+      }
+      this.emit({ kind: 'skip', eventId: input.eventId, ruleId: null, reason: 'recovery-pending' });
+      return result('recovery-pending');
+    }
     const state = breakerState(entries);
     // A disable read from the ledger is history: it asks for its one notice and
     // never ends the pass, because ending it would leave no validation able to
@@ -641,8 +650,11 @@ export class RacoonsEngine {
     if (!validation.ok) {
       await o.ledger.append(validationEvent);
       if (validation.breaker.disabled) {
-        await persistBreaker(o, snapshot.currentTurnOrdinal, await readEntries(o.ledger, o.sessionId));
-        this.emit({ kind: 'breaker-disabled', consecutiveValidationFailures: 2 });
+        // A refusal while the breaker is already quiet appends no marker, so it
+        // reports no disable: the telemetry must match the ledger's one row.
+        const appended = await persistBreaker(o, snapshot.currentTurnOrdinal,
+          await readEntries(o.ledger, o.sessionId));
+        if (appended) this.emit({ kind: 'breaker-disabled', consecutiveValidationFailures: 2 });
       }
       return result(validation.breaker.disabled ? 'disabled' : 'rejected', validation);
     }

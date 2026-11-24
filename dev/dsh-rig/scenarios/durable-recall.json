@@ -1,0 +1,232 @@
+{
+  "slug": "durable-recall",
+  "task": "Run the PowerShell command in this directory and tell me how many lines its output has.",
+  "secondLaunch": {
+    "task": "Use the necromancy tool with the id printed in the racoons receipt to restore the original output."
+  },
+  "timeoutMs": 120000,
+  "perturbation": "change the launch-2 table answer from forgetall to keepall: no removal mints a recall id, and the run must fail by name 'the necromancy tool restores the original bytes after a restart' (or the mock's recall-id substitution refuses)",
+  "workFiles": {
+    "big.txt": ""
+  },
+  "racoons": {
+    "capBytes": 8192,
+    "capHeadBytes": 2048,
+    "barBytes": 2048,
+    "anchors": "off",
+    "contextWindowTokens": 40000,
+    "entryAskTrigger": { "mode": "count" }
+  },
+  "script": {
+    "title": "Durable recall",
+    "answers": {
+      "entry": {
+        "type": "text",
+        "text": "{{shapeAnswer}}",
+        "shape": {
+          "keepall": true
+        }
+      }
+    },
+    "replies": [
+      {
+        "name": "prune-table-post-restart-forgetall",
+        "match": {
+          "last_user_text_matches": "The messages above are main's production conversation",
+          "body_text_contains": "recall:sha256:"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"1\":{\"forgetall\":\"the restored shell output\"}}"
+        }
+      },
+      {
+        "name": "prune-table-round-2-forgetall",
+        "match": {
+          "last_user_text_matches": "The messages above are main's production conversation",
+          "body_text_contains": "The command printed 600 rows."
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"1\":{\"forgetall\":\"an oversized shell listing\"},\"2\":{\"keepall\":true}}"
+        }
+      },
+      {
+        "name": "prune-table-round-1-keepall",
+        "match": {
+          "last_user_text_matches": "The messages above are main's production conversation"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"1\":{\"keepall\":true}}"
+        }
+      },
+      {
+        "name": "acknowledge-recall",
+        "match": {
+          "tools_length": "present",
+          "last_assistant_tool_names": [
+            "necromancy"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The archived output was restored."
+        }
+      },
+      {
+        "name": "ask-for-recall",
+        "match": {
+          "tools_length": "present",
+          "body_text_contains": "recall:sha256:"
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Restoring the archived result.",
+          "calls": [
+            {
+              "id": "rig_recall_1",
+              "name": "necromancy",
+              "input": {
+                "id": "{{recallId}}"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ask-for-warmup",
+        "match": {
+          "tools_length": "present",
+          "last_user_text_matches": "the id printed in the racoons receipt"
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Reading the receipt.",
+          "calls": [
+            {
+              "id": "rig_pwsh_2",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit one warmup line",
+                "command": "\"warmup\""
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ask-for-pwsh-big",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the big one.",
+          "calls": [
+            {
+              "id": "rig_pwsh_0",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit sixty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ BIGRESULT-MARK\" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ask-for-pwsh-small",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the small one.",
+          "calls": [
+            {
+              "id": "rig_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit thirty numbered lines",
+                "command": "1..30 | ForEach-Object { \"unit $_ \" + ('y' * 110) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-line-count",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 6,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "Run the PowerShell command in this directory",
+      "titleRequests": {
+        "max": 1
+      },
+      "titleRequestsHaveNoTools": true,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 4,
+      "results": 4,
+      "failedResults": 0,
+      "callIds": [
+        "rig_pwsh_0",
+        "rig_pwsh_1",
+        "rig_pwsh_2",
+        "rig_recall_1"
+      ],
+      "names": [
+        "pwsh",
+        "pwsh",
+        "pwsh",
+        "necromancy"
+      ]
+    },
+    "session": {
+      "userTextContains": "the id printed in the racoons receipt",
+      "eventTypesPresent": [
+        "tool/call",
+        "tool/result"
+      ]
+    },
+    "racoons": {
+      "mounted": 2,
+      "ledger": true,
+      "blobRoot": true,
+      "storageSessions": 1,
+      "durableStorage": true,
+      "recallToolRestores": true,
+      "atRestUnchangedAfterRestart": true
+    },
+    "stdout": {
+      "finalText": "The archived output was restored."
+    }
+  },
+  "notes": "Durable recall across a dsh restart (ISSUE-004 chunk 5; ISSUE-074). Two launches on one session. Every over-floor result is answered keepall at the entry gate (the entry lane asks them all), so no entry removal mints a recall id. The prune trigger is the half window (40000, threshold 20000): launch 1 crosses and runs round 1, which keeps its one unit. Launch 2 resumes the stored session, crosses again, and round 2 forgets launch 1's result; that removal is the recall id the second launch restores through the necromancy tool, byte-exact, from the durable blob store. The table rows are the bulk prune's lane since ADR-0028 removed the judge pass. The resumed launch is also the proof that a session whose entry exchange was APPLIED can be reopened: before ISSUE-074 the stored answer row was an assistant turn and dsh refused the whole log."
+}

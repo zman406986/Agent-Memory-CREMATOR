@@ -1,0 +1,127 @@
+{
+  "slug": "keepall-final",
+  "task": "Run the PowerShell command in this directory and tell me how many lines its output has.",
+  "secondLaunch": {
+    "task": "Report the line count again, from what you already ran."
+  },
+  "timeoutMs": 120000,
+  "notes": "The keepall-final pin (ISSUE-067 CHUNK-3, re-pointed by ISSUE-073; ADR-0028 §4 as amended by the owner ruling 2026-10-27; ISSUE-074). Step 1's result is over the floor and is asked: the entry answer is keepall, so the exchange is rewound and the result stays landed whole. The window is 40000 and one 49 KB result estimates 12483 tokens, so the SAME step boundary crosses the half window (20000) and the bulk prune runs. What that pass sees is the settled set: the unit the entry checkpoint kept is withheld, so the plan still counts the in-memory unit (units 1) but numbers NO row (askRows 0, settledWithheld 1) and sends NO table (0 asks, 0 tableUnits). The pass records one `prune-recorded` with zero removals and publishes nothing. `surfaceOps: 1` is the entry keepall's own rewind (a replace over the ask exchange); the prune pass with no removals writes nothing. ADR-0028 §4's 'a keep-all is final for that content' at the checkpoint is the ruling that won: ISSUE-068's wording was the expectation and ADR-0028 §4's cross-seam reading is overruled for settled keeps. The secondLaunch block is the ISSUE-074 resume proof: a second dsh process reopens the session whose entry exchange was APPLIED (rewound), and exits 0. Before scheme A the stored answer row was an assistant turn outside every step, and dsh refused the whole stored log (SessionFormatError).",
+  "perturbation": "delete the `settledNodeIds` argument at the mount's runRecordOnlyPrune call: the plan numbers the just-kept unit again and the run must fail by name 'the plan numbered every row'",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "workFiles": {
+    "big.txt": ""
+  },
+  "racoons": {
+    "floorBytes": 512,
+    "barBytes": 2048,
+    "contextWindowTokens": 40000
+  },
+  "script": {
+    "title": "Keep-all is final at the checkpoint",
+    "answers": {
+      "entry": { "type": "text", "text": "{{shapeAnswer}}", "shape": { "keepall": true } }
+    },
+    "replies": [
+      {
+        "name": "table-keepall",
+        "match": {
+          "last_user_text_matches": "maps every index above to its verdict"
+        },
+        "reply": { "type": "text", "text": "{{tableAnswer}}" }
+      },
+      {
+        "name": "report-again-after-restart",
+        "match": {
+          "last_user_text_matches": "Report the line count again"
+        },
+        "reply": { "type": "text", "text": "It printed 600 rows." }
+      },
+      {
+        "name": "ask-for-first-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running it.",
+          "calls": [
+            {
+              "id": "rig_keepall_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-line-count",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": ["pwsh"]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The command printed 600 rows."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 3,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "titleRequests": { "max": 0 },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "tools": {
+      "calls": 1,
+      "results": 1,
+      "failedResults": 0,
+      "callIds": ["rig_keepall_1"],
+      "names": ["pwsh"]
+    },
+    "session": {
+      "userTextContains": "PowerShell",
+      "eventTypesPresent": ["tool/call", "tool/result"]
+    },
+    "racoons": {
+      "ledger": true,
+      "mounted": 2,
+      "entries": 1,
+      "surfaceReplacements": 0,
+      "secondPassAddsNothing": 0
+    },
+    "prune": {
+      "requested": 0,
+      "recorded": 1,
+      "reasonNull": true,
+      "round": 1,
+      "asks": 0,
+      "tableUnits": [],
+      "planUnits": 1,
+      "planAskRows": 0,
+      "settledWithheld": 1,
+      "l2RemovalCount": { "keeplines": 0, "forgetall": 0, "forgetlines": 0 },
+      "refusedTotal": 0,
+      "rejectedCount": 0,
+      "thresholds": 1,
+      "threshold": 20000,
+      "noPublish": true,
+      "surfaceOps": 1,
+      "noPruneError": true
+    },
+    "stdout": { "finalText": "It printed 600 rows." }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "slug": "tier3-smoke",
+  "provider": "a6-real",
+  "task": "Read service.conf in the current directory. Exactly one value in it is clearly out of range for the setting it configures. Reply with that exact line, then one sentence saying why it is out of range. Do not change any file.",
+  "timeoutMs": 60000,
+  "perturbation": "point the credentials row at an absent file (or delete the a6 entry): the run must fail with MISSING_CREDENTIAL and produce no usage row, never a green run",
+  "workFiles": {
+    "service.conf": "# svc.conf - rig fixture, not a real service\n[server]\nhost = 0.0.0.0\nport = 99999\nworkers = 4\nkeepalive_s = 30\nrequest_timeout_ms = 1500\nmax_body_kb = 512\n\n[retry]\nmax_attempts = 3\ninitial_backoff_ms = 250\nmax_backoff_ms = 4000\njitter = 0.2\n\n[storage]\nbackend = sqlite\npath = ./data/svc.db\nwal = true\nsync = normal\nautovacuum_pages = 256\n\n[cache]\nenabled = true\nttl_s = 60\nmax_entries = 4096\neviction = lru\n\n[logging]\nlevel = info\nformat = json\nsink = stderr\nrotate_mb = 50\nkeep_files = 5\n\n[telemetry]\nenabled = false\nendpoint = https://collector.invalid/v1/events\nsample_rate = 0.0\n\n[feature_flags]\nnew_scheduler = false\nbatch_writes = true\nlegacy_api = false\n"
+  },
+  "expect": {
+    "exitCode": 0,
+    "session": {
+      "assistantTextContains": "99999",
+      "userTextContains": "service.conf"
+    },
+    "tools": {
+      "namesInclude": [
+        "read"
+      ],
+      "resultContains": "port = 99999"
+    },
+    "realApi": {
+      "provider": "a6",
+      "model": "deepseek-v4.1-flash-1017",
+      "minAssistantTurns": 1,
+      "maxModelRequests": 3,
+      "minUsageRows": 1,
+      "minOutputTokens": 1
+    }
+  }
+}

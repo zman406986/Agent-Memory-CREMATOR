@@ -41,21 +41,27 @@ function episodeMarker(entries: readonly LedgerEntry[], tripSequence: number): L
   return marker;
 }
 
+/**
+ * Writes the one marker a disable is owed. It answers `true` only when this
+ * call appended it, so the caller reports a disable once: a refusal while the
+ * breaker is already quiet writes nothing and must not emit (ISSUE-557).
+ */
 export async function persistBreaker(
   options: EngineOptions, fallbackTurn: number, entries: readonly LedgerEntry[],
-): Promise<void> {
+): Promise<boolean> {
   const episode = currentDisable(entries);
-  if (episode === null) return;
+  if (episode === null) return false;
   const { trip } = episode;
   // A marker written after this trip belongs to this episode; an earlier marker
   // belongs to a previous disable and must not silence a re-disable (ISSUE-308).
-  if (episodeMarker(entries, trip.sequence) !== null) return;
+  if (episodeMarker(entries, trip.sequence) !== null) return false;
   const failure = trip.event;
   const turn = 'engineTurnOrdinal' in failure && typeof failure.engineTurnOrdinal === 'number'
     ? failure.engineTurnOrdinal : fallbackTurn;
   await options.ledger.append({ kind: 'breaker-disabled', sessionId: options.sessionId,
     eventKey: `engine-breaker-disabled:${options.sessionId}${episodeSuffix(episode.ordinal)}`,
     atMs: failure.atMs, turnOrdinal: turn, reason: 'two-validation-failures' });
+  return true;
 }
 
 /**

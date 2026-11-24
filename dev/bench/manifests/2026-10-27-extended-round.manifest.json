@@ -1,0 +1,159 @@
+{
+  "schema": "racoons-bench-round-tasks/1",
+  "round": "extended",
+  "brief": {
+    "path": "dev/bench/bench-brief-extended.md",
+    "taskSha256": "4d2d3fbe3ef4f847dfc4f54963e7b0b95535168fe9d61f72ca84b8509b33dd8f",
+    "taskSha256Method": "sha256 over the first fenced block under 'Task text' (run-b/task-sha.mjs); recomputed 2026-10-28 after the critic-repair edits and matched",
+    "taskBlockBytes": 9329
+  },
+  "imageRoot": "C:/Users/TZhen/Desktop/racoons-bench/2026-10-23-aetherium/racoons-arm",
+  "image": {
+    "source": "Taskworld-Project@dc2b5bd",
+    "digest": "9087422da59c721391ce57303dbf8770ff7ccb1352a622f493366a8807329a98",
+    "reMaterialized": "2026-10-27",
+    "note": "sibling parked at racoons-bench/_sibling-parked-2026-10-27, bytes identical to pin 508b1eec",
+    "files": 1787,
+    "bytes": 21079823
+  },
+  "dist": {
+    "dir": "scratchpad/dsh-rig/dist-frozen-2026-10-28-ce15e90",
+    "files": 150,
+    "treeSha256": "39cbd2faa59dca99ddb11f722a2f048ab0e61bc5b3c037f024387a3af4206fc8",
+    "head": "ce15e90791cfaccf889fdf0879ecb66b3b3a1bfe",
+    "sourceStamp": "387a673117f4c7824433ffee1fb647cc999d560c1bc7b4b84a7b5bfaa5d17390",
+    "rebuilt": "2026-10-28",
+    "superseded": "head a4d02b3b… / treeSha256 36aff214… / sourceStamp cfb75199… (dist-frozen-2026-10-27): commits c4768f3 (053) and 5c2fdb1 (083) landed after it",
+    "treeSha256Method": "sha256sum over the frozen tree's path-sorted file list (scratchpad/dsh-rig/dist-files-frozen-2026-10-28-ce15e90.txt), the same method that produced 36aff214…"
+  },
+  "tasks": [
+    {
+      "name": "T1 orientation",
+      "files": 6,
+      "bytes": 65054,
+      "roots": ["AGENTS.md", "CONTEXT.md", "PRD.md", "docs/project/index.md", "docs/guides/index.md", "docs/adr/index.md"]
+    },
+    {
+      "name": "T2 entry currency",
+      "files": 71,
+      "bytes": 511370,
+      "roots": ["docs/project", "docs/guides", "docs/adr"]
+    },
+    {
+      "name": "T3 core charter",
+      "files": 24,
+      "bytes": 848181,
+      "roots": ["platform-free-core (top-level *.lua only)", "platform-free-core/README.md", "docs/project/building/ref-lua-subset-gate.md"]
+    },
+    {
+      "name": "T4 core tests",
+      "files": 23,
+      "bytes": 574878,
+      "roots": ["platform-free-core/dev"]
+    },
+    {
+      "name": "T5 shell quarantine",
+      "files": 17,
+      "bytes": 420529,
+      "roots": ["client-scripts", "docs/project/building/ref-lua-subset-gate.md"]
+    },
+    {
+      "name": "T6 gate coverage",
+      "files": 26,
+      "bytes": 88961,
+      "roots": ["dev/lua-gate", "docs/project/building/ref-lua-subset-gate.md"]
+    },
+    {
+      "name": "T7 plan traceability",
+      "files": 49,
+      "bytes": 379316,
+      "roots": ["pipeline/output/module_plans", "prototype test/Prototype1/src"]
+    },
+    {
+      "name": "T8 distillation audit",
+      "files": 53,
+      "bytes": 818229,
+      "roots": ["issue-tracker/resolved"]
+    },
+    {
+      "name": "T9 open triage",
+      "files": 27,
+      "bytes": 340846,
+      "roots": ["issue-tracker/open"]
+    },
+    {
+      "name": "T10 plans disposition",
+      "files": 82,
+      "bytes": 1839827,
+      "roots": ["docs/plans"]
+    },
+    {
+      "name": "T11 corpus EN",
+      "files": 42,
+      "bytes": 697635,
+      "roots": ["docs/official-docs-mirror-en-us/knowledge/node-introduction"]
+    },
+    {
+      "name": "T12 corpus ZH",
+      "files": 42,
+      "bytes": 562976,
+      "roots": ["docs/official-docs-mirror-zh-cn/knowledge/node-introduction"]
+    }
+  ],
+  "totals": {
+    "reads": 462,
+    "distinctFiles": 456,
+    "bytes": 7147802,
+    "bytesMiB": 6.82,
+    "deriveScriptNote": "shared-path repeats: 1 file counted in T3, T5 and T6",
+    "briefCorrection": "Every count above counts file-reads, not distinct files: the overlaps are docs/project/building/ref-lua-subset-gate.md (T2, T3, T5, T6) and the three index files T1 shares with T2. 462 reads over 456 distinct files.",
+    "reconciliation": "6 repeats = 3 extra reads of ref-lua-subset-gate.md (4 arms: T2, T3, T5, T6) + 3 index files counted twice (T1 and T2's walk). Re-verified by an independent walk of the frozen image: reads 462, distinct 456."
+  },
+  "windowProjection": {
+    "windowTokens": 400000,
+    "bulkPruneBarTokens": 200000,
+    "method": "Retention bands measured on run B's ledger (kept bytes / original bytes per shaped unit), applied per file, divided by 4 bytes per token; cumulative adds 1,327 B of user-message overhead per shaped result at 0.179 shaped results per file.",
+    "retentionBands": [
+      { "bytesFrom": 0, "bytesToExclusive": 1280, "keepRatio": 0.695 },
+      { "bytesFrom": 1280, "bytesToExclusive": 4096, "keepRatio": 0.431 },
+      { "bytesFrom": 4096, "bytesToExclusive": 16384, "keepRatio": 0.196 },
+      { "bytesFrom": 16384, "bytesToExclusive": 65536, "keepRatio": 0.04 },
+      { "bytesFrom": 65536, "bytesToExclusive": null, "keepRatio": 0.02 }
+    ],
+    "bytesPerToken": 4,
+    "userMessageOverheadBytesPerShapedResult": 1327,
+    "shapedResultsPerFile": 0.179,
+    "shapedResultsPerFileSource": "run B measured 35 shaped results / 195 results per file = 0.179 (the code path that produced these numbers)",
+    "perTask": [
+      { "name": "T1", "files": 6, "rawMiB": 0.06, "retainedMiB": 0.01, "retainedTokens": 2016, "cumulativeTokens": 2348 },
+      { "name": "T2", "files": 71, "rawMiB": 0.49, "retainedMiB": 0.1, "retainedTokens": 26827, "cumulativeTokens": 33488 },
+      { "name": "T3", "files": 24, "rawMiB": 0.81, "retainedMiB": 0.32, "retainedTokens": 84646, "cumulativeTokens": 119461 },
+      { "name": "T4", "files": 23, "rawMiB": 0.55, "retainedMiB": 0.1, "retainedTokens": 26754, "cumulativeTokens": 147542 },
+      { "name": "T5", "files": 17, "rawMiB": 0.4, "retainedMiB": 0.03, "retainedTokens": 6570, "cumulativeTokens": 155107 },
+      { "name": "T6", "files": 26, "rawMiB": 0.08, "retainedMiB": 0.01, "retainedTokens": 3885, "cumulativeTokens": 160651 },
+      { "name": "T7", "files": 49, "rawMiB": 0.36, "retainedMiB": 0.07, "retainedTokens": 17707, "cumulativeTokens": 181344 },
+      { "name": "T8", "files": 53, "rawMiB": 0.78, "retainedMiB": 0.07, "retainedTokens": 19536, "cumulativeTokens": 203866 },
+      { "name": "T9", "files": 27, "rawMiB": 0.33, "retainedMiB": 0.17, "retainedTokens": 43930, "cumulativeTokens": 249455 },
+      { "name": "T10", "files": 82, "rawMiB": 1.75, "retainedMiB": 0.53, "retainedTokens": 139757, "cumulativeTokens": 394188 },
+      { "name": "T11", "files": 42, "rawMiB": 0.67, "retainedMiB": 0.21, "retainedTokens": 55603, "cumulativeTokens": 452445 },
+      { "name": "T12", "files": 42, "rawMiB": 0.54, "retainedMiB": 0.14, "retainedTokens": 37902, "cumulativeTokens": 493001 }
+    ],
+    "all": { "files": 462, "rawMiB": 6.82, "retainedMiB": 1.77, "retainedTokens": 465133 },
+    "finalEstimateTokens": 493001,
+    "assumptions": [
+      "Retention ratios come from run B's ledger on the same brief shape, not from this image.",
+      "4 bytes per token is a flat divisor; CJK corpus (T11, T12) will under- or over-read against it.",
+      "The 1,327 B overhead applies only to shaped (tool-result) replies, at the measured run-B rate.",
+      "Estimate is transcript-only, the same quantity the mount's half-window trigger reads."
+    ]
+  },
+  "expectedFiresNote": "The mount prunes at half of --window-tokens 400 000, so the bar is ~200 000 tokens. The cumulative estimate passes 200 000 during T8 (181k after T7, 204k after T8) and passes 400 000 during T11 (394k after T10, 452k after T11). So fire 1 lands in T8; fire 2 lands in T11, at the host's native compaction bar, and therefore races compaction rather than clearing it early. If fire 2 loses that race the round records one fire: an informative partial, not a failed run. Method: retention bands 0.695/0.431/0.196/0.04/0.02, divisor 4 bytes per token.",
+  "provenance": {
+    "derivedAt": "2026-10-27",
+    "tools": [
+      "_derive-task-sizes.mjs (per-task counts and bytes; also emitted the tasks/totals shape reused here)",
+      "_derive-window.mjs (retention-band projection and cumulative totals)"
+    ],
+    "note": "The derive scripts live under scratchpad/, which is disposable by law and never evidence. The numbers above are restated with their method so any directory walk of the frozen image can re-derive them; nothing here depends on the scripts surviving."
+  }
+}

@@ -25,9 +25,15 @@
  * an absent or corrupt document reads as "nothing durable yet", never as a
  * licence to trust garbage. A write failure is returned to the caller so the
  * mount can name it; it never throws.
+ *
+ * ISSUE-563: two mounts of one durable root (two terminals) now share this file.
+ * The read-modify-write therefore runs under the session ledger's own
+ * cross-process write lock, so neither mount can publish a document built from a
+ * read that missed the other's fact.
  */
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { ApplyReceipt, WireAnswer } from '@cremator/core';
 import type { StorageTarget } from './storage.js';
 
@@ -178,6 +184,61 @@ function publishDoc(dir: string, doc: MountDoc): DurableWriteResult {
   }
 }
 
+/**
+ * How long one state write waits for the session ledger's write lock. The value
+ * is the ledger's own (`sqlite-ledger.ts` opens every ledger with
+ * `busy_timeout = 5000`), so a held lock is waited out for exactly as long as a
+ * ledger append is, and no state write is lost to contention it could have
+ * waited out.
+ */
+const STATE_LOCK_TIMEOUT_MS = 5000;
+
+/**
+ * Run one read-modify-write under the ledger's cross-process write lock
+ * (ISSUE-563). Two mounts of one root in different processes write this file;
+ * without a lock each could publish a document whose read missed the other's
+ * fact. `BEGIN IMMEDIATE` on this session's own `ledger.sqlite` is the mutex
+ * every mount of the session already shares, and SQLite serializes it across
+ * processes. The lock covers a synchronous section only, so no mount ever waits
+ * on another mount's ledger work while holding it, and this process's own
+ * ledger handle is never inside a transaction when a state write runs
+ * (JavaScript is single-threaded). A lock that cannot be taken fails the write
+ * by name, which the caller journals.
+ */
+function withLedgerLock(
+  target: StorageTarget, write: () => DurableWriteResult,
+): DurableWriteResult {
+  if (target.kind !== 'durable') return write();
+  const databasePath = target.databasePath;
+  // No ledger file means no mount has opened this session here, so there is no
+  // other writer of this session's state to interleave with.
+  if (!fs.existsSync(databasePath)) return write();
+  let db: DatabaseSync;
+  try { db = new DatabaseSync(databasePath); }
+  catch (error) { return lockFailure(target, error); }
+  try {
+    db.exec(`PRAGMA busy_timeout = ${String(STATE_LOCK_TIMEOUT_MS)}`);
+    db.exec('BEGIN IMMEDIATE');
+    const result = write();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* the write never started */ }
+    return lockFailure(target, error);
+  } finally {
+    try { db.close(); } catch { /* the write's own result stands */ }
+  }
+}
+
+/** The named failure of a state write that could not take the ledger lock. */
+function lockFailure(target: StorageTarget, error: unknown): DurableWriteResult {
+  const reason = error instanceof Error ? error.message : String(error);
+  const dir = sessionDirOf(target);
+  const path = dir === null ? MOUNT_STATE_FILE : join(dir, MOUNT_STATE_FILE);
+  return { ok: false, message: `refusing to write ${path} without the ledger's `
+    + `cross-process lock: ${reason}` };
+}
+
 function readReceiptsOf(doc: MountDoc): ApplyReceipt[] {
   const receipts = doc.receipts;
   if (!Array.isArray(receipts)) return [];
@@ -227,10 +288,12 @@ export function writeDurableReceipt(
 ): DurableWriteResult {
   const dir = sessionDirOf(target);
   if (dir === null) return { ok: true };
-  const read = readDoc(dir);
-  if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
-  const prior = readReceiptsOf(read.doc).filter(row => row.intentId !== receipt.intentId);
-  return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] });
+  return withLedgerLock(target, () => {
+    const read = readDoc(dir);
+    if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+    const prior = readReceiptsOf(read.doc).filter(row => row.intentId !== receipt.intentId);
+    return publishDoc(dir, { ...read.doc, receipts: [...prior, receipt] });
+  });
 }
 
 /**
@@ -248,13 +311,15 @@ export function removeDurableReceipt(
 ): DurableWriteResult {
   const dir = sessionDirOf(target);
   if (dir === null) return { ok: true };
-  const read = readDoc(dir);
-  if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
-  const prior = readReceiptsOf(read.doc);
-  const remaining = prior.filter(row => row.intentId !== intentId);
-  if (remaining.length === prior.length) return { ok: true };
-  const { receipts: _prior, ...rest } = read.doc;
-  return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) });
+  return withLedgerLock(target, () => {
+    const read = readDoc(dir);
+    if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+    const prior = readReceiptsOf(read.doc);
+    const remaining = prior.filter(row => row.intentId !== intentId);
+    if (remaining.length === prior.length) return { ok: true };
+    const { receipts: _prior, ...rest } = read.doc;
+    return publishDoc(dir, { ...rest, ...(remaining.length === 0 ? {} : { receipts: remaining }) });
+  });
 }
 
 function isStringArray(value: unknown): value is readonly string[] {
@@ -322,7 +387,9 @@ export function writeDurableAskState(
 ): DurableWriteResult {
   const dir = sessionDirOf(target);
   if (dir === null) return { ok: true };
-  const read = readDoc(dir);
-  if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
-  return publishDoc(dir, { ...read.doc, ask });
+  return withLedgerLock(target, () => {
+    const read = readDoc(dir);
+    if (read.rejected !== undefined) return refuseWrite(dir, read.rejected);
+    return publishDoc(dir, { ...read.doc, ask });
+  });
 }

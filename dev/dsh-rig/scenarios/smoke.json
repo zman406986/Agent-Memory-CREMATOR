@@ -1,0 +1,39 @@
+{
+  "slug": "smoke",
+  "task": "Explain in one sentence why a test rig points the model base URL at a local mock.",
+  "timeoutMs": 60000,
+  "perturbation": "replace expect.session.assistantTexts[0] with a string the mock never sent; the run must fail by name 'session assistant turn content'",
+  "script": {
+    "title": "Rig smoke",
+    "replies": [
+      {
+        "name": "text-turn",
+        "match": { "tools_length": "present", "tool_results_count": 0 },
+        "reply": {
+          "type": "text",
+          "text": "SMOKE OK: the loopback mock answered this turn without tools."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 1,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "local mock",
+      "titleRequests": { "max": 1 },
+      "titleRequestsHaveNoTools": true,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "session": {
+      "assistantTexts": ["SMOKE OK: the loopback mock answered this turn without tools."],
+      "userTextContains": "local mock",
+      "eventTypesAbsent": ["tool/call", "tool/result"]
+    },
+    "stdout": { "finalText": "SMOKE OK: the loopback mock answered this turn without tools." }
+  }
+}

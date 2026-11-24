@@ -1,0 +1,27 @@
+{
+  "sourceSha256": "4f687ea4bbd68809a83ef07be3dcd77d9fdd372696efec8be41dc3ebb4daedcd",
+  "sourcePath": "<home>/.zcode/cli/agents/<sess_*>/<agent_c9a68f18-*>/transcript.jsonl",
+  "converterVersion": 2,
+  "textMode": "placeholder",
+  "textCap": 4000,
+  "maxReplies": 24,
+  "turnCount": 33,
+  "scriptedTurns": 10,
+  "pathMap": {
+    "replay/file-1.md": "docs/adr/ADR-0002-platform-free-core-and-carve-out.md",
+    "replay/file-2.md": "docs/adr/ADR-0003-carry-over-ratification.md",
+    "replay/file-3.md": "docs/adr/ADR-0005-code-owned-gameplay-sprites.md",
+    "replay/file-4.md": "docs/guides/law-writing-an-adr.md",
+    "replay/file-5.md": "docs/guides/law-editing-issue-files.md"
+  },
+  "notes": [
+    "Built 2026-10-23 by dev/bench/mock-replay.mjs; no recorded prose, only synthetic keys and arm-relative targets.",
+    "Record was made against a different repository, so every recorded path is foreign; targets are chosen from the arm's own layout, not from the recording.",
+    "Targets are files that exist, byte-identical, in BOTH arms of the frozen image: docs/adr/ADR-0002, ADR-0003, ADR-0005, docs/guides/law-writing-an-adr.md, docs/guides/law-editing-issue-files.md. Re-check each after a new prep.mjs freeze.",
+    "file-5 is read at offset 40 (limit 20), so its target must hold at least 40 lines; a shorter file turns the read into FS_NOT_FOUND and the launcher's 'no tool result failed on a path' assertion fails.",
+    "The five recorded edits carry old_string prose from the source repository. No path map can make those literals match an arm file, so those five edit calls replay as FS_EDIT_NOT_FOUND: counted and named under mockReplay.toolResults, never hidden. That is a fidelity limit of a foreign record, not a map defect.",
+    "10 of 33 turns are scripted: the converter stops the prefix at the first unmappable call (TodoWrite at source turn 11). The remaining 22 turns are dropped, not remapped.",
+    "All 10 pwsh calls in the prefix replay as the converter's withheld-command placeholder, so no recorded shell command runs.",
+    "textMode is placeholder because the converter's synthetic key form depends on it; a map built for one mode is refused under the other."
+  ]
+}

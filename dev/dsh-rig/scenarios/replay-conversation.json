@@ -1,0 +1,42 @@
+{
+  "slug": "replay-conversation",
+  "task": "Replay the recorded session: read the two notes files, then report what you read.",
+  "timeoutMs": 120000,
+  "perturbation": "change expect.replay.scriptTurns to 4; the run must fail by name 'replay script turn count', or run with --projection-in on a projection whose request_keys[1][0] is 1 and read 'canonical projection matches the recorded run'",
+  "workFiles": {
+    "replay/file-1.md": "# Note one\n\nreplayed read one\n",
+    "replay/file-2.md": "# Note two\n\nreplayed read two\n"
+  },
+  "scriptPath": "../fixtures/replay-session.json",
+  "projectionPath": "../fixtures/replay-session.projection.json",
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 3,
+      "firstRequestKind": "main",
+      "mainHasTools": true,
+      "mainHasSystem": true,
+      "mainUserTextContains": "Replay the recorded session",
+      "titleRequests": { "max": 1 },
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "replay": {
+      "scriptTurns": 3,
+      "minTurns": 3,
+      "assistantTextsMatchScript": true,
+      "requestKeysMatchScript": true
+    },
+    "tools": {
+      "calls": 4,
+      "results": 4,
+      "failedResults": 0,
+      "resultContains": ["replayed read one", "replayed read two"]
+    },
+    "session": {
+      "userTextContains": "Replay the recorded session",
+      "eventTypesPresent": ["tool/call", "tool/result"]
+    },
+    "stdout": { "finalText": "<replay turn 3: 8252 chars>" }
+  }
+}

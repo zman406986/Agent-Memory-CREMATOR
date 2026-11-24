@@ -1,0 +1,194 @@
+{
+  "slug": "table-correction",
+  "task": "Run two PowerShell commands in this directory: one listing 1..600 padded with x, then one padded with y, and tell me how many lines each printed.",
+  "secondLaunch": {
+    "task": "/prune"
+  },
+  "timeoutMs": 120000,
+  "notes": "The table-then-correction round trip (ISSUE-120; ISSUE-113's retry path). Launch 1 runs two pwsh commands, each a result well over the floor, so the entry lane asks both and answers keepall. Launch 2 is a whole-message /prune: the pass plans two in-memory units from the EARLIER launch (a settled keep from an earlier launch stays listable; only the current launch's just-kept unit is withheld, ISSUE-073), so its first table has two rows. `first-table-partial` answers keepall for index 1 and omits the highest, 2 — the parser's `missing-index` refusal. The carry scheduler re-asks row 2 alone; `carry-table-refuses` answers `{}`, which refuses it again. The pass then spends its ONE correction turn on that row (the approved message carries 'Your previous answer could not be applied'), and `correction-turn` answers forgetall. The /prune turn itself calls a small pwsh command — the pass runs at the next pre-step, and a text-only reply makes no pre-step — and that result is under `barBytes`, so it mints no unit. So the first table asks 2 rows and the correction asks 1 (2 answered asks, `tableUnits` [2,1]), the pass's record counts 3 answered tables (first, carry, correction), zero indices are refused, and the correction is the single forgetall removal. The entry floor is 512 and both results clear it, which is why `answers.entry` is a keepall queue rather than absent.",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "perturbation": "answer the first table with {{tableAnswer}} instead of {{partialTableAnswer}}: no row is refused, the correction turn never runs, and the run must fail by name 'the pass spent its one correction turn on the refused row'",
+  "racoons": {
+    "floorBytes": 512,
+    "barBytes": 2048,
+    "anchors": "off",
+    "entryAskTrigger": { "mode": "count" }
+  },
+  "script": {
+    "title": "Table correction",
+    "answers": {
+      "entry": {
+        "type": "text",
+        "text": "{{shapeAnswer}}",
+        "shape": {
+          "keepall": true
+        }
+      }
+    },
+    "replies": [
+      {
+        "name": "correction-turn",
+        "match": {
+          "last_user_text_matches": "could not be applied"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{\"2\":{\"forgetall\":\"an older shell listing\"}}"
+        }
+      },
+      {
+        "name": "carry-table-refuses",
+        "match": {
+          "last_user_text_matches": "^(?![\\s\\S]*\\n1\\. \\[)[\\s\\S]*\\n2\\. \\["
+        },
+        "reply": {
+          "type": "text",
+          "text": "{}"
+        }
+      },
+      {
+        "name": "first-table-partial",
+        "match": {
+          "last_user_text_matches": "maps every index above to its verdict"
+        },
+        "reply": {
+          "type": "text",
+          "text": "{{partialTableAnswer}}"
+        }
+      },
+      {
+        "name": "acknowledge-prune",
+        "match": {
+          "last_user_text_matches": "^/prune"
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Pruning.",
+          "calls": [
+            {
+              "id": "rig_correction_pwsh_3",
+              "name": "pwsh",
+              "input": {
+                "description": "Print a short acknowledgement",
+                "command": "Write-Output ok"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-after-prune",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 3,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "The pass is done."
+        }
+      },
+      {
+        "name": "ask-for-first-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the first.",
+          "calls": [
+            {
+              "id": "rig_correction_pwsh_1",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered x lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('x' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ask-for-second-pwsh",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 1,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Now the second.",
+          "calls": [
+            {
+              "id": "rig_correction_pwsh_2",
+              "name": "pwsh",
+              "input": {
+                "description": "Emit forty kilobytes of numbered y lines",
+                "command": "1..600 | ForEach-Object { \"row $_ \" + ('y' * 96) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "report-both-counts",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 2,
+          "last_assistant_tool_names": [
+            "pwsh"
+          ]
+        },
+        "reply": {
+          "type": "text",
+          "text": "Each command printed 600 rows."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    },
+    "prune": {
+      "requested": 1,
+      "recorded": 1,
+      "asks": 2,
+      "asksPerPass": [
+        3
+      ],
+      "tableUnits": [
+        2,
+        1
+      ],
+      "refusedTotal": 0,
+      "l2RemovalCount": {
+        "keeplines": 0,
+        "forgetall": 1,
+        "forgetlines": 0
+      },
+      "correction": {
+        "corrected": 1,
+        "stillRefused": 0,
+        "refusedRows": 1,
+        "ofRows": 2,
+        "reasons": [
+          "2:missing-index"
+        ]
+      }
+    },
+    "stdout": {
+      "finalText": "The pass is done."
+    }
+  }
+}

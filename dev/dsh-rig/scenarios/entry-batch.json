@@ -1,0 +1,86 @@
+{
+  "slug": "entry-batch",
+  "task": "Run each PowerShell command I ask for, in order, and report when all are done.",
+  "timeoutMs": 90000,
+  "notes": "ISSUE-117 chunk B3. One session proves the BATCHED entry ask end to end: entryAskBatchSize 3 holds rows 1 and 2, the third eligible result fires ONE index-keyed ask, and all three rows apply (one keep-all rewind, two shaped turns) with the exchange gone exactly once.",
+  "perturbation": "remove `entryAskBatchSize` from `racoons` (or set it to 1): every result is asked on its own, so the run's `entry-ask` journal carries no batchIndex and one entry ask is sent per result — the runner's batch gate fails by name",
+  "patches": [
+    "- id: session-title-llm",
+    "  disabled: true"
+  ],
+  "workFiles": {},
+  "racoons": {
+    "floorBytes": 512,
+    "barBytes": 200000,
+    "anchors": "off",
+    "entryAskTrigger": { "mode": "count" },
+    "entryAskBatchSize": 3
+  },
+  "script": {
+    "title": "Entry batch E2E",
+    "answers": {
+      "entry": {
+        "type": "text",
+        "text": "{\"1\":{\"keepall\":true},\"2\":{\"forgetall\":\"an old numbered listing\"},\"3\":{\"keeplines\":[[1,4],\"kept the head of the listing\"]}}"
+      }
+    },
+    "replies": [
+      {
+        "name": "step-1-three-results",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 0
+        },
+        "reply": {
+          "type": "tool_use",
+          "text": "Running the three commands.",
+          "calls": [
+            {
+              "id": "rig_batch_1",
+              "name": "pwsh",
+              "input": {
+                "description": "sixty lines a",
+                "command": "1..60 | ForEach-Object { \"batch-a $_ \" + ('x' * 78) }"
+              }
+            },
+            {
+              "id": "rig_batch_2",
+              "name": "pwsh",
+              "input": {
+                "description": "sixty lines b",
+                "command": "1..60 | ForEach-Object { \"batch-b $_ \" + ('x' * 78) }"
+              }
+            },
+            {
+              "id": "rig_batch_3",
+              "name": "pwsh",
+              "input": {
+                "description": "sixty lines c",
+                "command": "1..60 | ForEach-Object { \"batch-c $_ \" + ('x' * 78) }"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "step-2-report",
+        "match": {
+          "tools_length": "present",
+          "tool_results_count": 3
+        },
+        "reply": {
+          "type": "text",
+          "text": "All three commands ran."
+        }
+      }
+    ]
+  },
+  "expect": {
+    "exitCode": 0,
+    "mock": {
+      "mainRequests": 2,
+      "noMatchRecords": 0,
+      "allRequestsUsedDummyKey": true
+    }
+  }
+}

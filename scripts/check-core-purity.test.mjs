@@ -90,7 +90,11 @@ test('the forms the regexes already caught keep their exact messages', () => {
 test('allow/deny semantics are unchanged', () => {
   assert.deepEqual(judge(OUTSIDE, 'import { h } from "node:crypto";\n'), []);
   assert.deepEqual(judge(OUTSIDE, 'import { h } from "./local.js";\n'), []);
-  assert.deepEqual(judge(OUTSIDE, 'import { h } from "../up.js";\n'), []);
+  assert.deepEqual(
+    judge(OUTSIDE, 'import { h } from "../../up.js";\n'),
+    ['not-ledger/probe.ts: relative import "../../up.js" leaves packages/core/src'],
+    'a relative specifier that climbs out of the tree is reported, not skipped (ISSUE-593)',
+  );
   assert.deepEqual(judge('ledger/rows.ts', 'import { DatabaseSync } from "node:sqlite";\n'), []);
   assert.deepEqual(judge('ledger/rows.ts', 'import { readFile } from "node:fs/promises";\n'), []);
   assert.deepEqual(

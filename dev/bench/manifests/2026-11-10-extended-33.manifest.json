@@ -1,0 +1,489 @@
+{
+  "schema": "racoons-bench-round-tasks/1",
+  "round": "extended-33",
+  "brief": {
+    "path": "dev/bench/bench-brief-extended-33.md",
+    "taskSha256": "7d7077e7447e71bb3ee84baff78ed5ac68961f90001912a718de031bf403b2c5",
+    "taskSha256Method": "sha256 over the first fenced block under 'Task text', trimmed (dev/bench/manifest-gate.mjs taskSha256); recomputed 2026-11-10 and matched",
+    "taskBlockBytes": 24102
+  },
+  "imageRoot": "C:/Users/TZhen/Desktop/racoons-bench/2026-10-23-aetherium/racoons-arm",
+  "image": {
+    "source": "Taskworld-Project@dc2b5bd",
+    "digest": "9087422da59c721391ce57303dbf8770ff7ccb1352a622f493366a8807329a98",
+    "reMaterialized": "2026-10-27",
+    "note": "sibling parked at racoons-bench/_sibling-parked-2026-10-27, bytes identical to pin 508b1eec",
+    "files": 1787,
+    "bytes": 21079823
+  },
+  "dist": {
+    "dir": "scratchpad/dsh-rig/dist",
+    "files": 164,
+    "treeSha256": "b68f5c4af1b589118a1a9f71d2bb0b32194d875a96d0342d74ea8abb71944c45",
+    "head": null,
+    "sourceStamp": "8a10143c25f9e63fd787be60b89c46ba2742689fa4872337692ce7b307bf3c5c",
+    "rebuilt": "2026-11-09",
+    "treeSha256Method": "sha256 over the dist tree's path-sorted file list (dev/bench/dist-hash.mjs distTreeSha256), recomputed 2026-11-09",
+    "note": "Informational only: dev/bench/manifest-gate.mjs reads brief.taskSha256, brief.taskBlockBytes and image.digest, not this block. dev/bench/bench-run.mjs records the mounted tree as result.json.mount.distSha256 but does not compare it to this block. This names the tree the six runs mount."
+  },
+  "tasks": [
+    {
+      "name": "T1 orientation",
+      "files": 6,
+      "bytes": 65536,
+      "roots": [
+        "AGENTS.md",
+        "CONTEXT.md",
+        "PRD.md",
+        "docs/project/index.md",
+        "docs/guides/index.md",
+        "docs/adr/index.md"
+      ]
+    },
+    {
+      "name": "T2 entry currency",
+      "files": 71,
+      "bytes": 510976,
+      "roots": [
+        "docs/project",
+        "docs/guides",
+        "docs/adr"
+      ]
+    },
+    {
+      "name": "T3 core charter",
+      "files": 24,
+      "bytes": 847872,
+      "roots": [
+        "platform-free-core (top-level *.lua only)",
+        "platform-free-core/README.md",
+        "docs/project/building/ref-lua-subset-gate.md"
+      ]
+    },
+    {
+      "name": "T4 core tests",
+      "files": 23,
+      "bytes": 574464,
+      "roots": [
+        "platform-free-core/dev"
+      ]
+    },
+    {
+      "name": "T5 shell quarantine",
+      "files": 17,
+      "bytes": 420864,
+      "roots": [
+        "client-scripts",
+        "docs/project/building/ref-lua-subset-gate.md"
+      ]
+    },
+    {
+      "name": "T6 gate coverage",
+      "files": 26,
+      "bytes": 89088,
+      "roots": [
+        "dev/lua-gate",
+        "docs/project/building/ref-lua-subset-gate.md"
+      ]
+    },
+    {
+      "name": "T7 plan traceability",
+      "files": 49,
+      "bytes": 378880,
+      "roots": [
+        "pipeline/output/module_plans",
+        "prototype test/Prototype1/src"
+      ]
+    },
+    {
+      "name": "T8 distillation audit",
+      "files": 53,
+      "bytes": 818176,
+      "roots": [
+        "issue-tracker/resolved"
+      ]
+    },
+    {
+      "name": "T9 open triage",
+      "files": 27,
+      "bytes": 340992,
+      "roots": [
+        "issue-tracker/open"
+      ]
+    },
+    {
+      "name": "T10 plans disposition",
+      "files": 82,
+      "bytes": 1840128,
+      "roots": [
+        "docs/plans"
+      ]
+    },
+    {
+      "name": "T11 corpus EN",
+      "files": 42,
+      "bytes": 697344,
+      "roots": [
+        "docs/official-docs-mirror-en-us/knowledge/node-introduction"
+      ]
+    },
+    {
+      "name": "T12 corpus ZH",
+      "files": 42,
+      "bytes": 563200,
+      "roots": [
+        "docs/official-docs-mirror-zh-cn/knowledge/node-introduction"
+      ]
+    },
+    {
+      "name": "T13 ADR ledger",
+      "files": 7,
+      "bytes": 41984,
+      "roots": [
+        "docs/adr"
+      ]
+    },
+    {
+      "name": "T14 law-guide ledger",
+      "files": 7,
+      "bytes": 44032,
+      "roots": [
+        "docs/guides/law-*.md"
+      ]
+    },
+    {
+      "name": "T15 reference-guide ledger",
+      "files": 13,
+      "bytes": 99328,
+      "roots": [
+        "docs/guides/ref-*.md",
+        "docs/guides/index.md"
+      ]
+    },
+    {
+      "name": "T16 resolved ledger",
+      "files": 53,
+      "bytes": 818176,
+      "roots": [
+        "issue-tracker/resolved"
+      ]
+    },
+    {
+      "name": "T17 open acceptance",
+      "files": 27,
+      "bytes": 340992,
+      "roots": [
+        "issue-tracker/open"
+      ]
+    },
+    {
+      "name": "T18 archive early",
+      "files": 11,
+      "bytes": 238592,
+      "roots": [
+        "archive/00-template-reference-index.md",
+        "archive/2026-09-23-genshin-ts-vendored-clone.md",
+        "archive/2026-09-23-ugc-evidence-a1-a9.md",
+        "archive/2026-09-25-community-prior-art-research.md",
+        "archive/2026-09-25-local-prior-art-gil-and-scripts.md",
+        "archive/2026-09-25-paint-experiment-lessons.md",
+        "archive/2026-09-26-example-deepdive-badapple.md",
+        "archive/2026-09-26-example-deepdive-lua2048.md",
+        "archive/2026-09-26-example-deepdive-pure2d-template.md",
+        "archive/2026-09-26-example-deepdive-tank-battle.md",
+        "archive/2026-09-26-example-scripts-deep-dive-input-and-canvas.md"
+      ]
+    },
+    {
+      "name": "T19 archive late",
+      "files": 13,
+      "bytes": 168960,
+      "roots": [
+        "archive/.gitkeep",
+        "archive/2026-09-27-previous-attempt-salvage-record.md",
+        "archive/2026-09-28-doc-debloat-extract.md",
+        "archive/2026-09-28-footprint-and-effect-provenance.md",
+        "archive/2026-09-28-gia-pixel-pack-measurement.md",
+        "archive/2026-09-28-save-key-census.md",
+        "archive/2026-09-30-client-runtime-verdicts-and-lessons.md",
+        "archive/PRD-SKELETON.md",
+        "archive/TEMPLATE-GUIDE.md",
+        "archive/domain-docs.md",
+        "archive/platform-facts-register.md",
+        "archive/process-pitfalls.md",
+        "archive/read-before-agent-ops.md"
+      ]
+    },
+    {
+      "name": "T20 art/audio archive",
+      "files": 6,
+      "bytes": 76800,
+      "roots": [
+        "archive/2026-09-28-art-audio-pipeline"
+      ]
+    },
+    {
+      "name": "T21 paint archive",
+      "files": 3,
+      "bytes": 194560,
+      "roots": [
+        "archive/ms-paint-experiment-archive"
+      ]
+    },
+    {
+      "name": "T22 dev probes",
+      "files": 7,
+      "bytes": 49152,
+      "roots": [
+        "dev/fengari-check",
+        "dev/beyond-simulator"
+      ]
+    },
+    {
+      "name": "T23 tool ledger",
+      "files": 18,
+      "bytes": 236544,
+      "roots": [
+        "tools/payload_bundle",
+        "tools/sprite_encode (including tools/sprite_encode/tests)"
+      ]
+    },
+    {
+      "name": "T24 pipeline reviews",
+      "files": 13,
+      "bytes": 154624,
+      "roots": [
+        "pipeline/output/architecture",
+        "pipeline/output/reviews"
+      ]
+    },
+    {
+      "name": "T25 building protocol matrix",
+      "files": 35,
+      "bytes": 296960,
+      "roots": [
+        "docs/project/building"
+      ]
+    },
+    {
+      "name": "T26 miliastra design",
+      "files": 19,
+      "bytes": 991232,
+      "roots": [
+        "miliastra design plan/ (root files only, 19)"
+      ]
+    },
+    {
+      "name": "T27 miliastra audit one",
+      "files": 19,
+      "bytes": 173056,
+      "roots": [
+        "miliastra design plan/audit No.1"
+      ]
+    },
+    {
+      "name": "T28 miliastra audit two",
+      "files": 21,
+      "bytes": 366592,
+      "roots": [
+        "miliastra design plan/audit No.2"
+      ]
+    },
+    {
+      "name": "T29 previous attempt",
+      "files": 179,
+      "bytes": 1503232,
+      "roots": [
+        "previous attempt"
+      ]
+    },
+    {
+      "name": "T30 enigmata decompiled",
+      "files": 339,
+      "bytes": 1357824,
+      "roots": [
+        "other games reference material/enigmata-stellar-war/decompiled-flash-source (.as + .csv only)"
+      ]
+    },
+    {
+      "name": "T31 other games",
+      "files": 20,
+      "bytes": 420864,
+      "roots": [
+        "other games reference material (exclude decompiled-flash-source/; .md + .lua only)"
+      ]
+    }
+  ],
+  "totals": {
+    "reads": 1272,
+    "distinctFiles": 1124,
+    "bytes": 14721024,
+    "bytesMiB": 14.04,
+    "deriveScriptNote": "per-set Files and KiB are the brief's bound table; bytes = KiB x 1024.",
+    "briefCorrection": "Every count above counts file-reads, not distinct files: the overlaps are docs/project/building/ref-lua-subset-gate.md (T2, T3, T5, T6, T25) and the three index files T1 shares with T2. T13, T14, T15 and T25 re-read files T2 already reads; T16 and T17 re-read T8 and T9 exactly. 1272 reads over 1124 distinct files. T30 does not read the 44 media files; T31 reads no .gil.",
+    "reconciliation": "Summing the 31 rows of the brief's bound table: 1272 Files and 14376 KiB. The brief's text states 1272 reads over 1124 distinct files. Both values are copied from dev/bench/bench-brief-extended-32.md, not re-derived from the image here.",
+    "t32Note": "T32 (32-pelican-bicycle.html) is generated from the prompt and reads no file: it adds one deliverable and no reads. reads/distinctFiles/bytes stay the 31-set values."
+  },
+  "windowProjection": {
+    "windowTokens": 400000,
+    "bulkPruneBarTokens": 200000,
+    "scope": "T1..T12 only. The first thirteen records are unchanged from the 13-file brief, so this projection still covers the two expected fires (T8 and T11). The 32 brief gives no per-set retained-byte data for T13..T31; this is not a 32-file projection.",
+    "method": "Retention bands measured on run B's ledger (kept bytes / original bytes per shaped unit), applied per file, divided by 4 bytes per token; cumulative adds 1,327 B of user-message overhead per shaped result at 0.179 shaped results per file.",
+    "retentionBands": [
+      {
+        "bytesFrom": 0,
+        "bytesToExclusive": 1280,
+        "keepRatio": 0.695
+      },
+      {
+        "bytesFrom": 1280,
+        "bytesToExclusive": 4096,
+        "keepRatio": 0.431
+      },
+      {
+        "bytesFrom": 4096,
+        "bytesToExclusive": 16384,
+        "keepRatio": 0.196
+      },
+      {
+        "bytesFrom": 16384,
+        "bytesToExclusive": 65536,
+        "keepRatio": 0.04
+      },
+      {
+        "bytesFrom": 65536,
+        "bytesToExclusive": null,
+        "keepRatio": 0.02
+      }
+    ],
+    "bytesPerToken": 4,
+    "userMessageOverheadBytesPerShapedResult": 1327,
+    "shapedResultsPerFile": 0.179,
+    "shapedResultsPerFileSource": "run B measured 35 shaped results / 195 results per file = 0.179 (the code path that produced these numbers)",
+    "perTask": [
+      {
+        "name": "T1",
+        "files": 6,
+        "rawMiB": 0.06,
+        "retainedMiB": 0.01,
+        "retainedTokens": 2016,
+        "cumulativeTokens": 2348
+      },
+      {
+        "name": "T2",
+        "files": 71,
+        "rawMiB": 0.49,
+        "retainedMiB": 0.1,
+        "retainedTokens": 26827,
+        "cumulativeTokens": 33488
+      },
+      {
+        "name": "T3",
+        "files": 24,
+        "rawMiB": 0.81,
+        "retainedMiB": 0.32,
+        "retainedTokens": 84646,
+        "cumulativeTokens": 119461
+      },
+      {
+        "name": "T4",
+        "files": 23,
+        "rawMiB": 0.55,
+        "retainedMiB": 0.1,
+        "retainedTokens": 26754,
+        "cumulativeTokens": 147542
+      },
+      {
+        "name": "T5",
+        "files": 17,
+        "rawMiB": 0.4,
+        "retainedMiB": 0.03,
+        "retainedTokens": 6570,
+        "cumulativeTokens": 155107
+      },
+      {
+        "name": "T6",
+        "files": 26,
+        "rawMiB": 0.08,
+        "retainedMiB": 0.01,
+        "retainedTokens": 3885,
+        "cumulativeTokens": 160651
+      },
+      {
+        "name": "T7",
+        "files": 49,
+        "rawMiB": 0.36,
+        "retainedMiB": 0.07,
+        "retainedTokens": 17707,
+        "cumulativeTokens": 181344
+      },
+      {
+        "name": "T8",
+        "files": 53,
+        "rawMiB": 0.78,
+        "retainedMiB": 0.07,
+        "retainedTokens": 19536,
+        "cumulativeTokens": 203866
+      },
+      {
+        "name": "T9",
+        "files": 27,
+        "rawMiB": 0.33,
+        "retainedMiB": 0.17,
+        "retainedTokens": 43930,
+        "cumulativeTokens": 249455
+      },
+      {
+        "name": "T10",
+        "files": 82,
+        "rawMiB": 1.75,
+        "retainedMiB": 0.53,
+        "retainedTokens": 139757,
+        "cumulativeTokens": 394188
+      },
+      {
+        "name": "T11",
+        "files": 42,
+        "rawMiB": 0.67,
+        "retainedMiB": 0.21,
+        "retainedTokens": 55603,
+        "cumulativeTokens": 452445
+      },
+      {
+        "name": "T12",
+        "files": 42,
+        "rawMiB": 0.54,
+        "retainedMiB": 0.14,
+        "retainedTokens": 37902,
+        "cumulativeTokens": 493001
+      }
+    ],
+    "all": {
+      "files": 462,
+      "rawMiB": 6.82,
+      "retainedMiB": 1.77,
+      "retainedTokens": 465133
+    },
+    "finalEstimateTokens": 493001,
+    "assumptions": [
+      "Retention ratios come from run B's ledger on the same brief shape, not from this image.",
+      "4 bytes per token is a flat divisor; CJK corpus (T11, T12) will under- or over-read against it.",
+      "The 1,327 B overhead applies only to shaped (tool-result) replies, at the measured run-B rate.",
+      "Estimate is transcript-only, the same quantity the mount's half-window trigger reads."
+    ]
+  },
+  "expectedFiresNote": "The mount prunes at half of --window-tokens 400 000, so the bar is ~200 000 tokens. The cumulative estimate passes 200 000 during T8 (181k after T7, 204k after T8) and passes 400 000 during T11 (394k after T10, 452k after T11). So fire 1 lands in T8; fire 2 lands in T11, at the host's native compaction bar, and therefore races compaction rather than clearing it early. If fire 2 loses that race the round records one fire: an informative partial, not a failed run. Method: retention bands 0.695/0.431/0.196/0.04/0.02, divisor 4 bytes per token. This note covers the first thirteen records; later fires are not projected.",
+  "provenance": {
+    "derivedAt": "2026-11-10",
+    "tools": [
+      "dev/bench/bench-brief-extended-33.md 'The bound' table (per-set Files and KiB; bytes = KiB x 1024)",
+      "dev/bench/dist-hash.mjs distTreeSha256 (dist block, recomputed 2026-11-09)"
+    ],
+    "note": "The 31-set task list and totals are transcribed from the brief's bound table; the brief states 1272 reads over 1124 distinct files. T32 adds one deliverable and no reads. The dist block is informational: no launcher gate reads it."
+  },
+  "deliverables": {
+    "count": 33,
+    "source": "the brief's final explicit list",
+    "note": "32 numbered records before T32; T1 writes both 00-index.md and 01-orientation.md, so 31 read sets produce 32 files, and T32 adds the 33rd. No launcher gate reads this block; the gate resolves the list from the brief."
+  }
+}

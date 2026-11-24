@@ -19,9 +19,15 @@ const PACKAGES = [
 ];
 const REPO = 'https://github.com/zman406986/Agent-Memory-CREMATOR';
 const NODE_RANGE = '>=22.13.0 <23.0.0 || >=23.4.0';
+// The two adapters: each declares its dependency on core in `dependencies`.
+const ADAPTERS = PACKAGES.filter(({ dir }) => dir.startsWith('packages/adapters/'));
 
 function manifest(dir) {
   return JSON.parse(readFileSync(join(ROOT, dir, 'package.json'), 'utf8'));
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 // Parse the exact comparator set shape used in `engines.node`: whitespace-separated
@@ -75,8 +81,10 @@ test('the Node range excludes 23.0-23.3 and is the one sentence the README state
   assert.ok(satisfies('23.4.0', NODE_RANGE));
   assert.ok(satisfies('24.0.0', NODE_RANGE));
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
-  assert.ok(readme.includes(NODE_RANGE),
-    'README does not state the manifest Node range');
+  assert.ok(readme.includes(`Node \`${NODE_RANGE}\``),
+    'README Requirements does not state the manifest range');
+  assert.ok(readme.includes('23.0.0–23.3.x are excluded'),
+    'README support sentence does not name the excluded range');
 });
 
 test('source maps are off in every build config, and src is not in files', () => {
@@ -89,10 +97,19 @@ test('source maps are off in every build config, and src is not in files', () =>
   }
 });
 
-test('the adapter manifests declare the core dependency range', () => {
-  for (const dir of ['packages/adapters/dsh', 'packages/adapters/opencode']) {
-    const dependencies = manifest(dir).dependencies ?? {};
-    assert.equal(dependencies['@cremator/core'], '^0.1.0',
-      `${dir} does not declare the core dependency`);
+// The version and the range come from the package files, never from a typed-in
+// copy here: a release moves the manifests and the README together, and this
+// case does not change. It still fails when the README and a manifest disagree.
+test('the publishing section names core first and the adapter dependency range', () => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const { version } = manifest('packages/core');
+  assert.match(readme, /publish in\s+dependency order/iu);
+  // The lookahead ends the version: without it 0.1.1 also matches 0.1.10 and 0.1.1-rc.1.
+  const coreFirst = new RegExp(`@cremator/core@${escapeRegExp(version)}(?![\\w.+-]).*first`, 'isu');
+  assert.match(readme, coreFirst, `README Publishing does not name @cremator/core@${version} first`);
+  for (const { dir } of ADAPTERS) {
+    const range = manifest(dir).dependencies['@cremator/core'];
+    assert.ok(readme.includes(`"@cremator/core": "${range}"`),
+      `README Publishing does not state the core range ${dir} declares: ${range}`);
   }
 });

@@ -115,7 +115,7 @@ import {
 } from '@cremator/core';
 import { createHash } from 'node:crypto';
 import {
-  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
   renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, parse, resolve } from 'node:path';
@@ -246,11 +246,15 @@ export const OPENCODE_MOUNT_SEAMS: readonly string[] = Object.freeze([
  */
 export type OpencodeJournalKind =
   | 'mounted'
-  // A plugin activation (one host location) joined the process-wide mount for
-  // its durable root, or created it. The host activates a plugin once per
-  // location; without sharing, the second activation's mount was refused as a
-  // duplicate and that folder got no hooks and no `/cremate`.
+  // A plugin activation (one host location), or a second mount of one durable
+  // root, joined the live mount for that root instead of building another. The
+  // host activates a plugin once per location, and ISSUE-563 makes a second
+  // process/terminal a join too, never a refusal.
   | 'mount-shared'
+  // ISSUE-563: this mount's record in the root's `mounts/` folder could not be
+  // made or written. The mount goes on without one (nothing is admitted on a
+  // record), so the line says which folder and why.
+  | 'mount-record-error'
   | 'capabilities'
   | 'storage-plan'
   | 'storage-unavailable'
@@ -1831,48 +1835,24 @@ export function createFileJournalSink(path: string): OpencodeJournalSink {
   };
 }
 
-/** The named refusal a second mount on one durable root raises (ISSUE-424, ISSUE-444). */
-export const OPENCODE_DUPLICATE_MOUNT_CODE = 'duplicate-mount';
-
 /**
- * A second live mount on one durable root (ISSUE-424, narrowed by ADR-0066 and
- * ISSUE-444). Two mounts would open two ledgers for the same session and
- * register duplicate asks and cards; the refusal is by name and names the
- * durable root it collides on, so a host log line says what happened.
+ * The directory one live mount records itself in, under its durable root
+ * (ISSUE-563, which supersedes the single-owner claim file of ISSUE-497).
  */
-export class OpencodeDuplicateMountError extends Error {
-  readonly code = OPENCODE_DUPLICATE_MOUNT_CODE;
-  readonly key: string;
+export const OPENCODE_MOUNT_DIRECTORY = 'mounts';
 
-  constructor(key: string, holder: string | null = null) {
-    super(`cremator-opencode: a mount for the durable root ${JSON.stringify(key)} is already `
-      + `active${holder === null ? '' : ` in another process (${holder})`}; refusing the second `
-      + 'mount rather than open a second ledger for the same session');
-    this.name = 'OpencodeDuplicateMountError';
-    this.key = key;
-  }
-}
-
-/** The OS-level claim file one live mount holds on its durable root (ISSUE-497). */
-export const OPENCODE_MOUNT_LOCK_FILE = 'mount.lock';
-
-/** What a claim file records: the process that holds it and a token of its own. */
-interface MountRootHolder {
+/** What one mount's record says: the process that holds it and a token of its own. */
+export interface MountRootHolder {
   readonly pid: number;
   readonly atMs: number;
   readonly token: string;
 }
 
-/** One held claim: the file to release and the token that proves this mount wrote it. */
+/** One joined mount: the record to release and the token that proves this mount wrote it. */
 export interface MountRootLock {
   readonly path: string;
   readonly token: string;
 }
-
-/** What claiming a root answered: this mount's claim, or the live holder found. */
-export type MountRootClaim =
-  | { readonly lock: MountRootLock }
-  | { readonly heldBy: string | null };
 
 /** Whether an error carries one filesystem code. */
 function hasErrorCode(error: unknown, code: string): boolean {
@@ -1887,7 +1867,7 @@ function processAlive(pid: number): boolean {
   catch (error) { return hasErrorCode(error, 'EPERM'); }
 }
 
-/** The claim one file records, or null when it is absent, partial or unreadable. */
+/** The record one file holds, or null when it is absent, partial or unreadable. */
 function readMountRootHolder(path: string): MountRootHolder | null {
   let raw: unknown;
   try { raw = JSON.parse(readFileSync(path, 'utf8')); }
@@ -1902,93 +1882,92 @@ function readMountRootHolder(path: string): MountRootHolder | null {
 }
 
 /**
- * Contract the OS-level claim on one durable root (ISSUE-497; ADR-0066
- * decision 2 kept across processes). The in-process registry above cannot see
- * another process, so two `opencode --resume` terminals would open two ledgers on
- * one `ledger.sqlite` and two mount-state writers over one file.
+ * Join the live mounts on one durable root (ISSUE-563; owner ruling 2026-11-24:
+ * a second terminal must be allowed, never refused). A mount cannot be shared
+ * as an in-process object across processes, but its durable state is shared:
+ * every mount opens the same session ledger, whose own `BEGIN IMMEDIATE` write
+ * lock serializes the rows, and a `mount-state` write takes that same lock
+ * (`mount-state.ts`). So joining records this mount under its own unique name in
+ * the root's directory — a create that can never collide, never waits and never
+ * refuses — and no mount opens a second ledger.
  *
- * The claim is one file created with the exclusive-create flag — the filesystem's
- * own atomic test-and-set, so no read-modify-write race exists — and it is held
- * for the mount's lifetime. There is no wait window, no retry count and no expiry
- * (ADR-0066 decision 5): a live holder refuses this mount at once with the named
- * duplicate-mount error. A claim whose recorded process is gone is a crashed
- * mount's evidence, not a lease, so it is cleared and the claim retried once; a
- * recycled pid can only make a mount refuse (the safe side, never two mounts).
+ * The record is published by rename onto its final name, so it is either absent
+ * or complete. Nothing holds it for the mount's lifetime: a crashed mount's
+ * record is evidence only, and the next join sweeps it.
+ *
+ * Nothing is admitted on a record, so a record that cannot be made or written —
+ * a stray `mounts` file, an ACL on that folder, a full disk — is reported to
+ * `onError` and answered `null`: the terminal still mounts, with no record to
+ * release (ISSUE-563).
  */
-export function claimMountRoot(root: string): MountRootClaim {
-  return takeMountRootClaim(root, join(root, OPENCODE_MOUNT_LOCK_FILE));
-}
-
-/**
- * The claim itself. A filesystem failure that is not EEXIST is the root being
- * unusable right now, so it is named as a storage failure at the claim path
- * instead of surfacing as a bare errno from mount construction.
- */
-function takeMountRootClaim(root: string, path: string): MountRootClaim {
-  try { mkdirSync(root, { recursive: true }); }
-  catch (error) { throw mountClaimFailure(path, error); }
-  const token = `${String(process.pid)}-${String(Date.now())}-${Math.random().toString(16).slice(2)}`;
-  const create = (): boolean => {
-    try {
-      const fd = openSync(path, 'wx');
-      try {
-        const record: MountRootHolder = { pid: process.pid, atMs: Date.now(), token };
-        writeFileSync(fd, JSON.stringify(record));
-        fsyncSync(fd);
-      } finally { closeSync(fd); }
-      return true;
-    } catch (error) {
-      if (hasErrorCode(error, 'EEXIST')) return false;
-      throw mountClaimFailure(path, error);
-    }
+export function joinMountRoot(
+  root: string, onError?: (message: string) => void,
+): MountRootLock | null {
+  const failed = (path: string, error: unknown): null => {
+    onError?.(mountRecordProblem(path, error));
+    return null;
   };
-  if (create()) return { lock: { path, token } };
-  const holder = readMountRootHolder(path);
-  if (holder !== null && processAlive(holder.pid)) {
-    return { heldBy: `pid ${String(holder.pid)}` };
+  const dir = join(root, OPENCODE_MOUNT_DIRECTORY);
+  try { mkdirSync(dir, { recursive: true }); }
+  catch (error) { return failed(dir, error); }
+  sweepCrashedMountRecords(dir);
+  const token = `${String(process.pid)}-${String(Date.now())}-${Math.random().toString(16).slice(2)}`;
+  const path = join(dir, `${token}.json`);
+  const temp = `${path}.partial`;
+  try {
+    writeFileSync(temp,
+      JSON.stringify({ pid: process.pid, atMs: Date.now(), token }), 'utf8');
+    renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* the temp may never exist */ }
+    return failed(path, error);
   }
-  breakCrashedMountRootClaim(path);
-  if (create()) return { lock: { path, token } };
-  const successor = readMountRootHolder(path);
-  return { heldBy: successor === null ? null : `pid ${String(successor.pid)}` };
+  return { path, token };
 }
 
-/** This root's claim path, named on a storage failure (ISSUE-497). */
-function mountClaimFailure(path: string, error: unknown): OpencodeStorageError {
-  const reason = error instanceof Error ? error.message : String(error);
-  return new OpencodeStorageError('durable-open-failed',
-    `racoons: cannot take the mount claim at ${path}: ${reason}`, path, { cause: error });
+/** One root's mount records, as plain data; an unreadable folder reads as none. */
+export function readMountRootHolders(root: string): MountRootHolder[] {
+  const dir = join(root, OPENCODE_MOUNT_DIRECTORY);
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const holders: MountRootHolder[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const holder = readMountRootHolder(join(dir, name));
+    if (holder !== null) holders.push(holder);
+  }
+  return holders;
 }
 
 /**
- * Clear a crashed mount's claim, never a successor's (ISSUE-320's rule, no age
- * bound). Rename first, then verify the moved record: a mount that replaced the
- * dead claim while this one judged it keeps its claim, and only the copy this
- * mount renamed is removed.
+ * Remove the records a crashed mount left (ISSUE-563). A record naming a dead
+ * process, or one this build cannot read, is not a holder: nothing waits on a
+ * record, so this is tidiness and it never fails a join. A live mount's record
+ * is written by rename onto its final name, never edited in place, so a record
+ * at that name is always complete.
  */
-function breakCrashedMountRootClaim(path: string): void {
-  const tombstone = `${path}.stale-${String(process.pid)}-${String(Date.now())}-`
-    + Math.random().toString(16).slice(2);
-  try { renameSync(path, tombstone); }
-  catch (error) {
-    if (hasErrorCode(error, 'ENOENT')) return;
-    throw mountClaimFailure(path, error);
+function sweepCrashedMountRecords(dir: string): void {
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const path = join(dir, name);
+    const holder = readMountRootHolder(path);
+    if (holder !== null && processAlive(holder.pid)) continue;
+    try { unlinkSync(path); } catch { /* a later join sweeps what this could not remove */ }
   }
-  const moved = readMountRootHolder(tombstone);
-  if (moved !== null && processAlive(moved.pid)) {
-    // A successor claimed the root after this mount read the dead owner: put its
-    // claim back (a live claim at the path refuses the rename; the copy is then
-    // just dropped).
-    try { renameSync(tombstone, path); } catch { try { unlinkSync(tombstone); } catch { /* gone */ } }
-    return;
-  }
-  try { unlinkSync(tombstone); } catch { /* a later mount clears what this could not */ }
+}
+
+/** The named reason a mount record could not be made (ISSUE-563). */
+function mountRecordProblem(path: string, error: unknown): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `racoons: cannot record the mount at ${path}: ${reason}`;
 }
 
 /**
- * Release this mount's claim, and only its own: the token must match, so a
- * successor's claim is never deleted (ISSUE-320). A failure to release is not a
- * mount failure — the next process sees a dead owner and clears it.
+ * Remove this mount's record, and only its own: the token must match, so a
+ * joining mount's record is never deleted (ISSUE-320's rule). A failure to
+ * release is not a mount failure — the next join sweeps a dead record.
  */
 export function releaseMountRoot(lock: MountRootLock): void {
   const holder = readMountRootHolder(lock.path);
@@ -1997,14 +1976,24 @@ export function releaseMountRoot(lock: MountRootLock): void {
 }
 
 /**
- * The process-level registry (ISSUE-424, narrowed by ADR-0066): the one live
- * mount per durable root. A mount's ledger paths depend on the resolved root
- * and the session id only — never on the journal, exclusion, grammar or dedupe
- * options — so two mounts on one root would eventually open the same ledger. A
- * `':memory:'` mount has no durable identity and is not tracked, so tests may
- * build as many as they need.
+ * The process-level registry (ISSUE-424, ISSUE-563). A mount's ledger paths
+ * depend on the resolved root and the session id only — never on the journal,
+ * exclusion, grammar or dedupe options — so two mounts on one root would open
+ * the same ledger. A second mount therefore JOINS the live mount instead of
+ * building another: it gets the same object, the same session map and the same
+ * ledger, and the mount closes when its last holder releases it. A `':memory:'`
+ * mount has no durable identity and is not tracked, so tests may build as many
+ * as they need.
  */
-const activeMounts = new Map<string, OpencodeMount>();
+interface ActiveMount {
+  readonly mount: OpencodeMount;
+  /** The options the live mount was built with; a later join compares against them. */
+  readonly policy: SharedMountPolicy;
+  /** Live handles on this mount; the mount closes when the last one releases. */
+  shares: number;
+}
+
+const activeMounts = new Map<string, ActiveMount>();
 
 /**
  * The identity "same durable root" means for the registry (ADR-0066, ISSUE-444):
@@ -2309,34 +2298,51 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   // first request. A relative root and a durable pair are typed refusals (C3).
   const selection = resolveStorage(options.storage);
   /**
-   * ISSUE-424 / ADR-0066: one live mount per durable root. The check runs here,
-   * before any session is opened, so a second mount can never construct a second
-   * ledger for the same session. A memory mount has no durable identity and is
-   * not tracked. `createOpencodePlugin` reaches this guard only for its first
-   * activation of a root: later per-location activations join that mount
-   * through `sharedAcquire` instead of constructing a second one.
+   * ISSUE-563 (owner ruling 2026-11-24): a second mount of one durable root
+   * JOINS the live mount. Two terminals on one project must both work, so this
+   * never refuses: the caller gets the live mount, whose session map and ledger
+   * handles are the ones already open, and every option it passed is ignored
+   * the way a later plugin activation's are (`mount-shared` names it). A memory
+   * mount has no durable identity and is not tracked. `createOpencodePlugin`
+   * reaches this guard only for its first activation of a root: later per-
+   * location activations join that mount through `sharedAcquire`.
    */
   const registryKey = mountRegistryKey(selection);
-  if (registryKey !== null && activeMounts.has(registryKey)) {
-    // The refusal names the root this caller passed, not its normalized form.
-    throw new OpencodeDuplicateMountError(
-      selection.kind === 'durable' ? selection.root : registryKey);
+  if (registryKey !== null) {
+    const live = activeMounts.get(registryKey);
+    if (live !== undefined) {
+      live.shares += 1;
+      // ISSUE-563: the live mount's options win, and the line names every
+      // option this mount passed that did not follow, exactly as a later
+      // plugin activation's `mount-shared` line does.
+      const mismatch = sharedPolicyMismatch(live.policy, sharedMountPolicyOf(options));
+      journal('mount-shared', {
+        status: 'reused', scope: 'process',
+        storageRoot: selection.kind === 'durable' ? selection.root : registryKey,
+        mounts: live.shares,
+        ...(mismatch.length === 0 ? {} : { policy: 'first-wins', optionsMismatch: mismatch }),
+      });
+      return live.mount;
+    }
   }
   /**
-   * ISSUE-497 / ADR-0066 decision 2 across processes: the registry above is
-   * process-local, so two processes on one durable root would still open two
-   * ledgers for the same session and two writers over one mount-state file. The
-   * root's own claim file is the OS-level test-and-set, taken here — before any
-   * session ledger can open — and held for the mount's life; a live holder is
-   * refused with the same named duplicate-mount error. No wait window, retry
-   * count or expiry is added (ADR-0066 decision 5).
+   * ISSUE-497 / ISSUE-563: the registry above is process-local, so another
+   * process on one durable root records itself in the root's `mounts/` folder
+   * and this mount joins it there. Nothing is refused and nothing waits: the
+   * shared ledger's own write lock, and `mount-state`'s use of it, are what keep
+   * two mounts of one root from corrupting state. An unwritable record is
+   * journalled and the mount goes on without one — no mount is admitted on a
+   * record, so the terminal still works.
    */
-  const mountClaim = registryKey === null ? null : claimMountRoot(registryKey);
-  if (mountClaim !== null && 'heldBy' in mountClaim) {
-    throw new OpencodeDuplicateMountError(
-      selection.kind === 'durable' ? selection.root : registryKey ?? '', mountClaim.heldBy);
-  }
-  const mountLock = mountClaim !== null && 'lock' in mountClaim ? mountClaim.lock : null;
+  const mountLock = registryKey === null ? null : joinMountRoot(registryKey, message => {
+    journal('mount-record-error', {
+      storageRoot: selection.kind === 'durable' ? selection.root : registryKey,
+      message,
+    });
+  });
+  // This mount is live whether or not its record landed, so it counts.
+  const liveMounts = registryKey === null ? 1
+    : Math.max(1, readMountRootHolders(registryKey).length);
   const sessions = new Map<string, OpencodeSessionEntry>();
   /**
    * Set once `close()` starts (ISSUE-393). The per-session release awaits
@@ -2677,12 +2683,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
      * ledger is read once here: an `applied` row joined to its prepared event's
      * archive sources names every unit that process banked. A ledger read that
      * throws seeds nothing (the safe side: the unit is a first-time offer) and
-     * never blocks the request.
+     * never blocks the request — but it is NAMED, so "nothing banked" and "the
+     * ledger was unreadable" are not the same record (ISSUE-575; ADR-0065
+     * decision 4).
      */
     let seededAppliedPlans: readonly OpencodeAppliedPlan[] = [];
     try {
       seededAppliedPlans = await opencodeAppliedPlansFromLedger(ledger, sessionId);
-    } catch { /* the request proceeds without a seed; nothing is claimed */ }
+    } catch (error) {
+      journal('mount-state-error', { sessionId, fact: 'applied-plans',
+        message: error instanceof Error ? error.message : String(error) });
+    }
     /**
      * ISSUE-448: the durable receipts a previous process wrote at the host
      * write. The ledger read above seeds what was *applied*; these seed what
@@ -4907,8 +4918,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     ...selection.kind === 'durable' ? { storageRoot: selection.root }
       : { storage: ':memory:' },
     ...(options.journalFile === undefined ? {} : { journalFile: options.journalFile }),
-    /** The root's OS-level claim this mount holds (ISSUE-497). */
-    ...(mountLock === null ? {} : { lock: mountLock.path }),
+    /** This mount's record in the root's `mounts/` folder (ISSUE-563). */
+    ...(mountLock === null ? {} : { record: mountLock.path }),
+    /** Live mounts this process can see on the root, this one included. */
+    mounts: liveMounts,
     /** The full additive inventory this mount registers, not a subset. */
     tools: [tool.name, ...(forgetTool === null ? [] : [forgetTool.name])].join(','),
     forgetTool: forgetTool !== null,
@@ -4978,6 +4991,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     set idleAskOnEvent(value: boolean) { idleAskOnEvent = value; },
     get disposed(): boolean { return closing; },
     close: async () => {
+      // ISSUE-563: a second mount of this root joined this one. Releasing a
+      // handle the mount outlived must not close the ledgers the other holder
+      // is still using, so only the last release closes anything.
+      if (registryKey !== null) {
+        const held = activeMounts.get(registryKey);
+        if (held !== undefined && held.mount === mount) {
+          held.shares -= 1;
+          if (held.shares > 0) return;
+          activeMounts.delete(registryKey);
+        }
+      }
       // Drain in-flight transforms and asks before closing the ledgers
       // (ISSUE-356): a post-dispose ask resolution must not write a closed
       // ledger. Each entry then leaves through the same release the
@@ -4994,19 +5018,17 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       // ISSUE-420: cleanup clears the session pointer, so no later callback can
       // name a released session and no post-dispose call can reopen one.
       activeSessionId = null;
-      // ISSUE-424: the durable configuration is free again once the mount closes.
-      if (registryKey !== null && activeMounts.get(registryKey) === mount) {
-        activeMounts.delete(registryKey);
-      }
-      // ISSUE-497: the root's OS-level claim goes with it, and only this mount's
-      // own claim is removed (its token must match; a successor's is never deleted).
+      // ISSUE-563: this mount's record goes with it, and only its own is removed
+      // (its token must match; a joining mount's record is never deleted).
       if (mountLock !== null) releaseMountRoot(mountLock);
       // ISSUE-407: from here on a post-dispose call writes no journal line
       // (the ISSUE-420 contract); the in-progress refusal lines stop.
       disposeComplete = true;
     },
   };
-  if (registryKey !== null) activeMounts.set(registryKey, mount);
+  if (registryKey !== null) {
+    activeMounts.set(registryKey, { mount, shares: 1, policy: sharedMountPolicyOf(options) });
+  }
   return mount;
 }
 
@@ -5032,8 +5054,22 @@ function sharedMountPolicyOf(options: OpencodeMountOptions): SharedMountPolicy {
     askGrammar: options.askGrammar ?? null,
     contextWindowTokens: options.contextWindowTokens ?? null,
     pruneThresholdTokens: options.pruneThresholdTokens ?? null,
-    dedupeClasses: { ...(options.dedupeClasses ?? {}) },
+    dedupeClasses: canonicalDedupeClasses(options.dedupeClasses),
     askTimeoutMs: options.askTimeoutMs ?? null,
+  };
+}
+
+/**
+ * The dedupe switches in one fixed key order, so two equal policies written in
+ * a different key order compare equal (ISSUE-576). An absent switch and a
+ * `false` switch are the same policy: neither plans the class.
+ */
+function canonicalDedupeClasses(classes: DedupeClasses | undefined): DedupeClasses {
+  return {
+    supersededByReread: classes?.supersededByReread === true,
+    callEcho: classes?.callEcho === true,
+    launchReceipt: classes?.launchReceipt === true,
+    harnessCopy: classes?.harnessCopy === true,
   };
 }
 
@@ -5072,6 +5108,15 @@ interface SharedMountLease {
   /** The host's `session.generate` for this location, when the ask lane is on. */
   readonly askGenerate: ((input: OpencodeGenerateInput) => Promise<OpencodeGenerateOutput>) | null;
   readonly resolveModelWindow: ((ref: OpencodeModelRef) => number | null) | null;
+  /**
+   * This activation's own RPC event channel (ADR-0073), or null when its
+   * registration answered none. The shared mount has one emitter slot, so the
+   * slot holds a dispatcher over the live leases' channels instead of one
+   * activation's channel (ISSUE-569): the last setup to run must not take the
+   * pass lifecycle away from the location whose pass ran, and a lease that
+   * detaches takes its channel with it.
+   */
+  rpcEmit: OpencodeRpcEvents['emit'] | null;
   /**
    * True once this activation's awaited `experimental.idle` hook registered.
    * The shared mount's event path asks on `session.idle` only for an activation
@@ -5282,6 +5327,27 @@ function sharedResolveWindowFor(
 }
 
 /**
+ * Publish one pass lifecycle event on the RPC channel of the activation that
+ * owns the session (ISSUE-569). One mount serves every location on the root and
+ * has one emitter slot, so the slot cannot hold one activation's channel: the
+ * last setup to run would receive every later pass, and its cleanup would leave
+ * the slot pointing at a disposed channel. The owner is the same one
+ * `sharedGenerateFor` picks — the session's lease, else the primary lease — so
+ * a detached lease's channel is never chosen. A throwing channel is caught by
+ * the mount's own `emitRpcEvent`.
+ */
+function sharedRpcEmitFor(
+  group: SharedMountGroup, name: string, data: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  const sessionId = typeof data['sessionID'] === 'string' ? data['sessionID'] : null;
+  const owner = sessionId === null
+    ? undefined : group.leases.get(group.sessionLease.get(sessionId) ?? '');
+  const emit = owner?.rpcEmit ?? sharedPrimaryLease(group)?.rpcEmit ?? null;
+  if (emit === null) return Promise.resolve();
+  return Promise.resolve(emit(name, data));
+}
+
+/**
  * Detach one activation from the group before stopping its event consumer, so
  * an event already queued on its stream is routed to the remaining lease
  * instead of being dropped with the departing one.
@@ -5459,6 +5525,7 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
                 : `file:${resolve(merged.journalFile ?? '')}`),
             askGenerate: askGenerate ?? null,
             resolveModelWindow: resolveModelWindow ?? null,
+            rpcEmit: null,
           },
         });
         group = acquired.group;
@@ -5600,13 +5667,23 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
              * ADR-0073: the registration's event channel carries the pass
              * lifecycle to the menu parts. A host (or a fake) that answers
              * without one still mounts: the result is guarded and the mount
-             * simply publishes nothing.
+             * simply publishes nothing. A shared mount's single emitter slot
+             * holds a dispatcher over the live leases (ISSUE-569), so this
+             * activation's channel reaches it only while its lease lives and
+             * the location whose session owns the pass is the one that gets it.
              */
             const events = isRecord(registration) ? registration['events'] : undefined;
             if (isRecord(events) && typeof events['emit'] === 'function') {
               const emit = events['emit'] as OpencodeRpcEvents['emit'];
-              mount.setRpcEmitter((name, data) =>
-                Promise.resolve(emit.call(events, name, data)));
+              const channel: OpencodeRpcEvents['emit'] = (name, data) =>
+                Promise.resolve(emit.call(events, name, data));
+              if (group !== null && lease !== null) {
+                const owner = group;
+                lease.rpcEmit = channel;
+                mount.setRpcEmitter((name, data) => sharedRpcEmitFor(owner, name, data));
+              } else {
+                mount.setRpcEmitter(channel);
+              }
             }
             /**
              * The RPC registry keeps the LAST registration for an id. Dispose

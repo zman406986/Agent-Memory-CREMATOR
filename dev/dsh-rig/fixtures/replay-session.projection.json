@@ -1,0 +1,89 @@
+{
+  "request_keys": [
+    [
+      0,
+      []
+    ],
+    [
+      2,
+      [
+        "read",
+        "read"
+      ]
+    ],
+    [
+      4,
+      [
+        "pwsh",
+        "pwsh"
+      ]
+    ]
+  ],
+  "assistant_texts": [
+    "<replay turn 2: 186 chars>",
+    "<replay turn 3: 8252 chars>"
+  ],
+  "tool_calls": [
+    {
+      "id": "rig_0_0",
+      "name": "read"
+    },
+    {
+      "id": "rig_0_1",
+      "name": "read"
+    },
+    {
+      "id": "rig_1_0",
+      "name": "pwsh"
+    },
+    {
+      "id": "rig_1_1",
+      "name": "pwsh"
+    }
+  ],
+  "tool_results": [
+    "<path><evidence>\\work\\replay\\file-1.md</path>\n<type>file</type>\n<content>\n1: # Note one\n2: \n3: replayed read one\n\n(End of file - total 3 lines)\n</content>",
+    "<path><evidence>\\work\\replay\\file-2.md</path>\n<type>file</type>\n<content>\n1: # Note two\n2: \n3: replayed read two\n\n(End of file - total 3 lines)\n</content>",
+    "replay: recorded shell command withheld\r\n",
+    "replay: recorded shell command withheld\r\n"
+  ],
+  "event_types": [
+    "session",
+    "permission/preset",
+    "sandbox/mode",
+    "approval/policy",
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "system/message",
+    "user/message",
+    "user/message",
+    "user/message",
+    "user/message",
+    "request/header",
+    "request/context",
+    "assistant/message",
+    "tool/call",
+    "tool/call",
+    "tool/result",
+    "tool/result",
+    "step/end",
+    "step/start",
+    "assistant/message",
+    "tool/call",
+    "job/registered",
+    "job/settled",
+    "tool/result",
+    "tool/call",
+    "job/registered",
+    "job/settled",
+    "tool/result",
+    "step/end",
+    "step/start",
+    "assistant/message",
+    "step/end",
+    "turn/end"
+  ],
+  "title_requests_observed": 1
+}

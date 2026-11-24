@@ -106,7 +106,8 @@ seal's negative-fact records, and (when the entry ask is enabled) its answers st
 
 ## Install
 
-Node `>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`).
+Node `>=22.13.0 <23.0.0 || >=23.4.0`: `node:sqlite` is flagless from 22.13.0, and Node
+23.0.0–23.3.x are excluded.
 
 ```sh
 npm install cremator-dsh
@@ -172,6 +173,12 @@ message still triggers the same pass.
 
 Install with `npm install cremator-dsh` or `npm install cremator-opencode`;
 `@cremator/core` installs as a dependency.
+
+## Publishing
+
+Publish in dependency order: `@cremator/core@0.1.2` first, then `cremator-dsh@0.1.2` and
+`cremator-opencode@0.1.2`. Both adapters declare `"@cremator/core": "^0.1.0"`, so the core release
+must exist on the registry before either adapter tarball can install.
 
 ## License
 

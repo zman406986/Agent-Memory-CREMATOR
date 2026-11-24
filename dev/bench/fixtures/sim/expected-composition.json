@@ -1,0 +1,223 @@
+{
+  "schema": "racoons-sim-composition/1",
+  "builtOn": "2026-10-27",
+  "floor": 1280,
+  "sessionId": "session-sim-5f1c0a2e",
+  "transcript": "sim.session.v4.jsonl",
+  "transcriptSha256": "c75c8454adf18d0688255f3e1b12c06bda3ded493aa3cd9e777b250a682817b0",
+  "controlTranscript": "sim-control.session.v4.jsonl",
+  "controlSha256": "46d481d4199cf2a4016b2574e80d77e1f258d4f714f601a13ab45bfa7be37ad9",
+  "note": "The composition this fixture was built to hold, and the five render terms of every shaped row. `compositionRules` is the converter's own block, copied at build time; the test checks the copy is still the converter's.",
+  "landedRows": 8,
+  "units": 7,
+  "compositionTable": {
+    "keepall": 1,
+    "forget-with-partials": 3,
+    "forget-all": 1,
+    "ask-failed-fail-open": 1,
+    "below-floor": 1,
+    "machinery-censored": 1
+  },
+  "compositions": {
+    "keepall": 1,
+    "forget-with-partials": 3,
+    "forget-all": 1,
+    "ask-failed-fail-open": 1
+  },
+  "censoring": {
+    "below-floor": 1,
+    "machinery-censored": 1
+  },
+  "compositionRules": {
+    "keepall": "entry-apply rows appends:1 resultSeq:null; surface: the ask rewind whose prompt names this result's own facts block (ISSUE-081), with no shaped sibling at its seq; a prompt stating no facts falls back to \"after the result and before the next landed one\"",
+    "forget-with-partials": "a same-seq replace at the result seq whose body carries a shipped full-form marker line and keeps at least one line",
+    "forget-all": "a same-seq replace at the result seq whose body carries the shipped empty-form marker line",
+    "ask-failed-fail-open": "no shaped sibling and no ask rewind between the result and the next landed one (refusal codes or off)",
+    "machinery-censored": "a same-seq replace at the result seq whose whole body is one [not retained] ... recall <id> receipt: an at-rest receipt replaced unit, not a decision",
+    "below-floor": "a landed result under the 1280-byte floor; never a unit"
+  },
+  "moments": [
+    {
+      "name": "lead-gap",
+      "seq": 5,
+      "step": 1,
+      "path": "C:\\sim\\arm\\alpha.txt",
+      "originalSha256": "eae45391c2a38a716bb7f4d10af1cf5af3f6c1aa7b580d79bfc8f79e93935479",
+      "bytes": 2594,
+      "class": "forget-with-partials",
+      "keptBytes": 2432,
+      "gaps": 1,
+      "markerBytes": 148,
+      "summaryBytes": 45,
+      "framingBytes": 0,
+      "droppedBytes": 162,
+      "recallId": "recall:sha256:4b4cd28d71a24769f82d8ee4e260c8a1081a68cf841b4287535e4b0607c8a0f6",
+      "ranges": [
+        {
+          "startLine": 4,
+          "endLineInclusive": 41
+        }
+      ],
+      "marker": "[racoons] kept lines 4–41 of 41 · 162 bytes dropped · necromancy recall:sha256:4b4cd28d71a24769f82d8ee4e260c8a1081a68cf841b4287535e4b0607c8a0f6",
+      "shapedBytes": 2625,
+      "shapedSha256": "e6edd3b8ad3caa13442ce95b7cc2f4b851c65bceb2cf992e01c2cf9c3662a588"
+    },
+    {
+      "name": "multi-gap",
+      "seq": 16,
+      "step": 3,
+      "path": "C:\\sim\\arm\\bravo.txt",
+      "originalSha256": "5a4072776db786488b9e857475021ed0f2c9e1677f431f530aac4e9476dd4e93",
+      "bytes": 1570,
+      "class": "forget-with-partials",
+      "keptBytes": 482,
+      "gaps": 3,
+      "markerBytes": 164,
+      "summaryBytes": 42,
+      "framingBytes": 0,
+      "droppedBytes": 1088,
+      "recallId": "recall:sha256:0ba23524134ca09380c9c8e5c5369ec27cf99cced904ba278efa0fb232c4a6ab",
+      "ranges": [
+        {
+          "startLine": 1,
+          "endLineInclusive": 2
+        },
+        {
+          "startLine": 6,
+          "endLineInclusive": 8
+        },
+        {
+          "startLine": 12,
+          "endLineInclusive": 14
+        }
+      ],
+      "marker": "[racoons] kept lines 1–2, 6–8, 12–14 of 25 · 1088 bytes dropped · necromancy recall:sha256:0ba23524134ca09380c9c8e5c5369ec27cf99cced904ba278efa0fb232c4a6ab",
+      "shapedBytes": 1016,
+      "shapedSha256": "68e0e81b7cec28543a2aa80f585bc0cd65ad9f8de27a86d2b855ea4dce656bd9"
+    },
+    {
+      "name": "forget-all",
+      "seq": 27,
+      "step": 5,
+      "path": "C:\\sim\\arm\\charlie.txt",
+      "originalSha256": "b03a4b1da1d70514ec0cc54c41b89b2f24e3762099d2ea5d06871c0d010d8f9e",
+      "bytes": 2016,
+      "class": "forget-all",
+      "keptBytes": 0,
+      "gaps": 1,
+      "markerBytes": 122,
+      "summaryBytes": 32,
+      "framingBytes": 0,
+      "droppedBytes": 2016,
+      "recallId": "recall:sha256:5eb3009c8d909f8a44be4b288ab7f3423239798ee19b97ee604aa6b1e03778eb",
+      "ranges": [],
+      "marker": "[racoons] kept 0 of 31 lines · necromancy recall:sha256:5eb3009c8d909f8a44be4b288ab7f3423239798ee19b97ee604aa6b1e03778eb",
+      "shapedBytes": 154,
+      "shapedSha256": "94c7016741caae8915e3f104b4878c1b683ea6cae7aefd1c2484cd22353bf472"
+    },
+    {
+      "name": "keepall",
+      "seq": 38,
+      "step": 7,
+      "path": "C:\\sim\\arm\\delta.txt",
+      "originalSha256": "1f3d190665259bd241250c731c809a6e04a57672c37eeaa5a12cc6a34998527d",
+      "bytes": 1570,
+      "class": "keepall",
+      "keptBytes": null,
+      "gaps": 0,
+      "markerBytes": 0,
+      "summaryBytes": 0,
+      "framingBytes": null,
+      "droppedBytes": 0,
+      "recallId": null,
+      "ranges": null,
+      "rewindSpan": {
+        "startSeq": 41,
+        "endSeq": 42
+      },
+      "keepallVia": "surface-rewind"
+    },
+    {
+      "name": "machinery",
+      "seq": 48,
+      "step": 9,
+      "path": "C:\\sim\\arm\\echo.txt",
+      "originalSha256": "5bab42e6cf5207fe3022ee1a16d23682a3c5f520e83c395997903048b53a1739",
+      "bytes": 1671,
+      "class": "machinery-censored",
+      "keptBytes": null,
+      "gaps": 0,
+      "markerBytes": 0,
+      "summaryBytes": 0,
+      "framingBytes": null,
+      "droppedBytes": 0,
+      "recallId": null,
+      "ranges": null,
+      "censoredClass": "machinery-at-rest-removal",
+      "receipt": {
+        "recallId": "recall:sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "target": "C:\\sim\\arm\\echo.txt"
+      }
+    },
+    {
+      "name": "ask-failed-fail-open",
+      "seq": 57,
+      "step": 11,
+      "path": "C:\\sim\\arm\\foxtrot.txt",
+      "originalSha256": "1d9c0b8fdcf4d3e69f4a5fe5a29b673e74cdbe1afb322f40f7104fae0e7b39a1",
+      "bytes": 1488,
+      "class": "ask-failed-fail-open",
+      "keptBytes": null,
+      "gaps": 0,
+      "markerBytes": 0,
+      "summaryBytes": 0,
+      "framingBytes": null,
+      "droppedBytes": 0,
+      "recallId": null,
+      "ranges": null,
+      "censoredClass": "refused-ask"
+    },
+    {
+      "name": "below-floor",
+      "seq": 62,
+      "step": 12,
+      "path": "C:\\sim\\arm\\golf.txt",
+      "originalSha256": "a576adcf7cf0d33444549770a9dfc64a160a429df008d751432e24012d799987",
+      "bytes": 285,
+      "class": "below-floor",
+      "keptBytes": null,
+      "gaps": 0,
+      "markerBytes": 0,
+      "summaryBytes": 0,
+      "framingBytes": null,
+      "droppedBytes": 0,
+      "recallId": null,
+      "ranges": null
+    },
+    {
+      "name": "trailing-gap",
+      "seq": 67,
+      "step": 13,
+      "path": "C:\\sim\\arm\\hotel.txt",
+      "originalSha256": "a430ac08c02de1743c630545ee47cdc6833a20dbc58607718080c75d3889be55",
+      "bytes": 1314,
+      "class": "forget-with-partials",
+      "keptBytes": 482,
+      "gaps": 1,
+      "markerBytes": 147,
+      "summaryBytes": 42,
+      "framingBytes": 0,
+      "droppedBytes": 832,
+      "recallId": "recall:sha256:4cb7f9537461f50726a3549e6ff7be6c685c8ebaebd3393255eeae22c1e6bd5f",
+      "ranges": [
+        {
+          "startLine": 1,
+          "endLineInclusive": 8
+        }
+      ],
+      "marker": "[racoons] kept lines 1–8 of 21 · 832 bytes dropped · necromancy recall:sha256:4cb7f9537461f50726a3549e6ff7be6c685c8ebaebd3393255eeae22c1e6bd5f",
+      "shapedBytes": 671,
+      "shapedSha256": "eada27387b7f82cd4c0333f94036c79f4bd8b0933b14aa90339f328069f44a17"
+    }
+  ]
+}

@@ -1,0 +1,276 @@
+{
+  "model": "mock-model",
+  "title": "opencode replay bench",
+  "task": "Read the large replay file, then read it again. Then read the stale replay file, write the same path, and read it again. Then read hello.txt, then reply with exactly: DONE",
+  "fixture": {
+    "readerCapBytes": 51200,
+    "productBarBytes": 512,
+    "files": [
+      {
+        "name": "big-replay.txt",
+        "sentinel": "RACOONS-FIXTURE-REPLAY-4a1e8d",
+        "bytes": 20923
+      },
+      {
+        "name": "big-stale-replay.txt",
+        "sentinel": "RACOONS-FIXTURE-REPLAY-STALE-6b2f70",
+        "bytes": 200000,
+        "markers": [
+          "RACOONS-PREWRITE-REPLAY-STALE-2f9b61"
+        ]
+      }
+    ],
+    "auxiliary": [
+      {
+        "name": "hello.txt",
+        "text": "offline bench fixture\n"
+      }
+    ],
+    "lanes": [
+      {
+        "name": "replay-single",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_replay_big_1_RS-REPLAY-BIG"
+        ],
+        "supersedingCalls": [
+          "call_replay_big_2"
+        ],
+        "unitFiles": [
+          "big-replay.txt"
+        ],
+        "markerSentinels": [
+          "RS-REPLAY-BIG"
+        ]
+      },
+      {
+        "name": "replay-stale",
+        "rule": "stale-read",
+        "unitCalls": [
+          "call_replay_stale_1_RS-REPLAY-STALE"
+        ],
+        "triggerCalls": [
+          "call_replay_stale_write"
+        ],
+        "supersedingCalls": [
+          "call_replay_stale_2"
+        ],
+        "unitFiles": [
+          "big-stale-replay.txt"
+        ],
+        "markerSentinels": [
+          "RS-REPLAY-STALE"
+        ],
+        "contentMarkers": [
+          "RACOONS-PREWRITE-REPLAY-STALE-2f9b61"
+        ]
+      }
+    ]
+  },
+  "replies": [
+    {
+      "name": "replay-turn-1",
+      "match": {
+        "main_turn": 0,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "This session already carries a history, so the only new work is the first of the two large reads the task names. Read big-replay.txt, let the host truncate it at its reader cap, and answer once the history plus this turn is in front of me. This thinking has to reach the next request, or the replay measured a smaller conversation than the agent had.",
+        "text": "Reading the large replay file once.",
+        "calls": [
+          {
+            "id": "call_replay_big_1_RS-REPLAY-BIG",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-replay.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-turn-2",
+      "match": {
+        "main_turn": 1,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-REPLAY-4a1e8d"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The first read is in the history. Read the same path again so the earlier copy is exactly superseded: the later copy carries identical bytes and stays, the earlier copy becomes the removable unit. This is what makes the replay a removal measurement and not only a reasoning replay.",
+        "text": "Reading the same large replay file again.",
+        "calls": [
+          {
+            "id": "call_replay_big_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-replay.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-stale-read",
+      "match": {
+        "main_turn": 2,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-REPLAY-4a1e8d"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Now the stale-read lane, so this one replay exercises both rules ADR-0045 and ADR-0046 name. Read the stale replay file whole; a later write of the same path makes these bytes stale, which is a different proof from a second read of unchanged bytes.",
+        "text": "Reading the stale replay file once.",
+        "calls": [
+          {
+            "id": "call_replay_stale_1_RS-REPLAY-STALE",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-stale-replay.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-stale-write",
+      "match": {
+        "main_turn": 3,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-REPLAY-STALE-6b2f70"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Write the same path the read observed. The write's own path evidence is the fact the stale-read rule needs: the file changed after the read, so the read's pre-write bytes are provably not what the file holds now. The write carries only the sentinel and a short line, never the pre-write content marker.",
+        "text": "Writing the same replay path.",
+        "calls": [
+          {
+            "id": "call_replay_stale_write",
+            "name": "write",
+            "input": {
+              "path": "{{WORK}}/big-stale-replay.txt",
+              "content": "RACOONS-FIXTURE-REPLAY-STALE-6b2f70\nafter the write\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-stale-reread",
+      "match": {
+        "main_turn": 4,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Read the same path after the write. This later read is the surviving twin for the stale-read lane: it proves the request still carries the file after the stale read was removed, so an absent first read cannot be the host dropping the tail.",
+        "text": "Reading the rewritten stale replay file.",
+        "calls": [
+          {
+            "id": "call_replay_stale_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-stale-replay.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-turn-3",
+      "match": {
+        "main_turn": 5,
+        "tools_present": true,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-FIXTURE-REPLAY-STALE-6b2f70"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The superseded read is now on the wire in this request and the twin is beside it. Read the small fixture file, which is far below the product bar and can never become a unit, so one more request exists after the removal and the rebuilt array must carry it again. The small file is the 22-byte hello.txt the task names.",
+        "text": "Reading hello.txt to keep the run moving.",
+        "calls": [
+          {
+            "id": "call_replay_hello_1",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/hello.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-restore",
+      "match": {
+        "main_turn": 6,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "offline bench fixture"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Both replay lanes have been removed and carried for a later request. Restore each one from the receipt id the product wrote, so the replay proves the archive gives the removed bytes back, not only that the old call id left.",
+        "text": "Restoring both replay removals by their receipt ids.",
+        "calls": [
+          {
+            "id": "call_replay_recall_big",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_replay_big_1_RS-REPLAY-BIG}}"
+            }
+          },
+          {
+            "id": "call_replay_recall_stale",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_replay_stale_1_RS-REPLAY-STALE}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "replay-turn-4",
+      "match": {
+        "main_turn": 7,
+        "last_user_contains": [
+          "reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "reasoning": "Both removals have been carried on later requests, the hello read is below the bar, and every read the task asked for is finished. Nothing else is asked for, so reply with the exact word the task names.",
+        "text": "DONE"
+      }
+    }
+  ]
+}

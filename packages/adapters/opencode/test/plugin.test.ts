@@ -5240,10 +5240,13 @@ test('a throwing ledger events read is fail-open: untouched array, one line, ret
     const messages = staleReadMessages();
     const before = structuredClone(messages);
     try {
-      // The seed read throws and is swallowed (`sessionFor` catches it); the
+      // The seed read throws and is named (`applied-plans`, ISSUE-575); the
       // pass's own read throws and becomes one `transform-error` line.
       await mount.transform(sessionId, messages);
       assert.deepEqual(messages, before, 'both failed reads leave the request byte-identical');
+      assert.equal(lines.of('mount-state-error')
+        .filter(record => record['fact'] === 'applied-plans').length, 1,
+      'the failed applied-plan seed read is named');
       assert.equal(lines.of('transform-error').length, 1, 'exactly one transform-error line');
       assert.equal(mount.sessions.has(sessionId), true, 'the session exists; only its reads failed');
 

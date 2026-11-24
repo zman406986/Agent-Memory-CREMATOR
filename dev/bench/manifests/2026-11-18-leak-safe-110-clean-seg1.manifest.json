@@ -1,0 +1,33 @@
+{
+  "schema": "racoons-bench-round-tasks/1",
+  "round": "2026-11-18-leak-safe-110-clean-seg1",
+  "brief": {
+    "path": "dev/bench/bench-brief-leak-safe-110-clean-seg1.md",
+    "taskSha256": "0405b366a3c02fee69d5884e97d5165e18df534608b6437ae5ab5eebefd03719",
+    "taskSha256Method": "sha256 over the first fenced block under 'Task text', trimmed (dev/bench/manifest-gate.mjs taskSha256); computed 2026-11-18 by dev/bench/make-round-manifest.mjs",
+    "taskBlockBytes": 37244
+  },
+  "imageRoot": "C:/Users/TZhen/Desktop/racoons-bench/clean-200k-2026-11-18-b/vanilla-arm",
+  "image": {
+    "source": "src",
+    "digest": "70b99f50d16e92d766d1946e946055d2adaf5cb02d96f6202d5f15c65e35268b",
+    "reMaterialized": "2026-11-18",
+    "files": 5890,
+    "bytes": 25980438
+  },
+  "provenance": {
+    "derivedAt": "2026-11-18",
+    "generator": "dev/bench/make-round-manifest.mjs",
+    "tools": [
+      "dev/bench/bench-brief-leak-safe-110-clean-seg1.md (the fenced 'Task text' block: taskSha256 and its character count)",
+      "C:/Users/TZhen/Desktop/racoons-bench/clean-200k-2026-11-18-b/vanilla-arm/manifest.json (image.digest = totals.multisetSha256, plus the image file and byte counts)",
+      "dev/bench/dsh-checkpoints.mjs deliverablesFromBrief over the task fence, the whole brief as fallback (deliverables.count; the same call the launcher makes)"
+    ],
+    "note": "Omitted informational blocks: tasks, totals, windowProjection, expectedFiresNote and dist. They describe the brief's bound table and a measured dist tree, which this generator does not read; no launcher gate reads them (dev/bench/manifest-gate.mjs manifestEnforcementRecord)."
+  },
+  "deliverables": {
+    "count": 20,
+    "source": "the brief-derived list (dev/bench/dsh-checkpoints.mjs deliverablesFromBrief)",
+    "note": "The count is the length of the list dev/bench/bench-run.mjs derives from this brief (20 path(s)); manifestDeliverablesGate compares this number to that list at launch, so a brief edited after this file was written fails the launch."
+  }
+}

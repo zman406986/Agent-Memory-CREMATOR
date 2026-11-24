@@ -1,0 +1,110 @@
+{
+  "schema": "racoons-live-fixture/1",
+  "extractedAt": "2026-10-26",
+  "note": "Extracted from the 040 live record and the vanilla r2 record by extract-fixture.mjs. scratchpad/ is disposable; this directory is what the offline gate reads.",
+  "arms": {
+    "racoons": {
+      "transcript": "racoons.session.v4.jsonl",
+      "armRoot": "C:\\Users\\AAAAA\\Desktop\\racoons\\scratchpad\\launch\\2026-10-25-040-live-racoons\\worlds\\racoons\\arm",
+      "sessionId": "session-1308e8d8-c82d-41d3-81ef-05afddd24439",
+      "source": "C:/Users/AAAAA/Desktop/racoons/scratchpad/launch/2026-10-25-040-live-racoons/worlds/racoons/evidence/sessions/--C-Users-AAAAA-Desktop-racoons-scratchpad-launch-2026-10-25-040-live-racoons-worlds-racoons-arm--/session-1308e8d8-c82d-41d3-81ef-05afddd24439/session.v4.jsonl",
+      "rows": 717,
+      "trim": {
+        "dropped": {
+          "permission/preset": 1,
+          "sandbox/mode": 1,
+          "approval/policy": 1,
+          "agent/inbox/spliced": 12,
+          "request/header": 3,
+          "request/context": 1,
+          "session/title": 1,
+          "job/registered": 67,
+          "job/settled": 67,
+          "todo/write": 2
+        },
+        "trimmedResult": 111,
+        "trimmedAssistant": 98,
+        "trimmedSystem": 1,
+        "droppedStream": 3067848,
+        "keptWhole": 90
+      },
+      "sha256": "45b994e1aeff46e4cd81ad1d887d28beb9b25aaddddbdeb9dd5e76d1573089ac"
+    },
+    "vanilla": {
+      "transcript": "vanilla.session.v4.jsonl",
+      "armRoot": "C:\\Users\\AAAAA\\Desktop\\racoons\\scratchpad\\launch\\2026-10-24-035-live-ab\\arms\\vanilla-arm-r2",
+      "sessionId": "session-d7f1af3f-b94b-43d5-8355-2f827cb8eec3",
+      "source": "C:/Users/AAAAA/Desktop/racoons/scratchpad/launch/2026-10-24-035-live-ab/bench-vanilla-r2/sessions/--C-Users-AAAAA-Desktop-racoons-scratchpad-launch-2026-10-24-035-live-ab-arms-vanilla-arm-r2--/session-d7f1af3f-b94b-43d5-8355-2f827cb8eec3/session.v4.jsonl",
+      "rows": 791,
+      "trim": {
+        "dropped": {
+          "permission/preset": 1,
+          "sandbox/mode": 1,
+          "approval/policy": 1,
+          "agent/inbox/spliced": 22,
+          "request/header": 2,
+          "request/context": 1,
+          "session/title": 1,
+          "job/registered": 79,
+          "job/settled": 79,
+          "assistant/attempt": 1,
+          "llm/retry": 1,
+          "llm/retry-started": 1
+        },
+        "trimmedResult": 111,
+        "trimmedAssistant": 133,
+        "trimmedSystem": 1,
+        "droppedStream": 2686141,
+        "keptWhole": 76
+      },
+      "sha256": "c6bec8611bab45a95fa30cc70efdc934aff7cb406759e97b73391dd68cb3dddd"
+    }
+  },
+  "pins": {
+    "note": "R-2 gate (d): the numbers a 1280 B conversion must reproduce. A change here is a change to the fixture or the converter, never a re-freeze.",
+    "floor": 1280,
+    "join": {
+      "T1": 13,
+      "sharedKeys": 13,
+      "pairs": 13,
+      "substitutions": {
+        "racoons": {
+          "arm": 269,
+          "tmp": 6
+        },
+        "vanilla": {
+          "arm": 97,
+          "tmp": 4
+        }
+      },
+      "rawJoinedUnits": 1
+    },
+    "units": 65,
+    "compositions": {
+      "ask-failed-fail-open": 65
+    },
+    "censoring": {
+      "never-seen": 43,
+      "unjoined-content": 52,
+      "refused-ask": 65,
+      "no-legal-answer": 0,
+      "unlabelable-used": 34,
+      "racoons-only": 52
+    },
+    "scored": {
+      "N_P": 13,
+      "pathBearing": 13,
+      "P": 1,
+      "RR": 0,
+      "UR": 1,
+      "P_b": null,
+      "sumDropped": 0,
+      "note": "Every joined unit is an ask that failed open: d = 0, so P = 1 and UR = 1 hold by arithmetic and measure nothing."
+    },
+    "scored8192": {
+      "N_P": 4,
+      "belowHonestN": true,
+      "note": "Below ADR-0021 honest n: the unit table is the deliverable and no percentage prints."
+    }
+  }
+}

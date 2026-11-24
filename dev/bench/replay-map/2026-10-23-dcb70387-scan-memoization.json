@@ -1,0 +1,25 @@
+{
+  "sourceSha256": "77cd7f6c87cebd43a69a165178dbe1fdd92b5784c7397dbd948d4ab5bec9af46",
+  "sourcePath": "<home>/.zcode/cli/agents/<sess_*>/<agent_dcb70387-*>/transcript.jsonl",
+  "converterVersion": 2,
+  "textMode": "placeholder",
+  "textCap": 4000,
+  "maxReplies": 200,
+  "turnCount": 41,
+  "scriptedTurns": 41,
+  "pathMap": {
+    "replay/file-1.ts": "other games reference material/enigmata-stellar-war/decompiled-flash-source/scripts/EnigmataTD_fla/MainTimeline.as",
+    "replay/file-2.ts": "docs/official-docs-mirror-en-us/knowledge/node-introduction/server-nodes/mhw66orrrfkm.md",
+    "replay/file-3.tsx": "archive/ms-paint-experiment-archive/EDITOR-FINDINGS.md"
+  },
+  "notes": [
+    "Built 2026-10-23 by dev/bench/mock-replay.mjs; no recorded prose, only synthetic keys and arm-relative targets.",
+    "Record is 20,069,608 B with 41 model requests and 41 scripted replies: no blocker at all. It is the longest blocker-free record in this device's 28-record set; the next is 24 replies, and every other record stops at its first TodoWrite.",
+    "maxReplies is 200 so the cap cannot be what stops the prefix; the record itself ends at 41, not the converter.",
+    "The recording was made against a different repository, so every recorded path is foreign; targets are chosen from the arm's own layout, not from the recording. All three are byte-identical in BOTH arms of the frozen image and are re-checked after each prep.mjs freeze.",
+    "Targets are chosen for read volume, not for content: each of the first two reads returns more than the host's 50 KiB per-read budget (tool-fs READ_MAX_BYTES), so a replay spends the whole budget instead of a short file. That is the only lever this record has on context size.",
+    "file-3 is read at offset 1080 (limit 130); its target has 1479 lines, so the window is inside the file. A shorter target would turn the read into FS_NOT_FOUND and the launcher's 'no tool result failed on a path' assertion would fail.",
+    "All 60 recorded pwsh calls are withheld by the converter (SAFE_COMMAND admits only a single read-only, pipe-free command, and none of these are), so no recorded shell command runs and no shell output enters the context. That is why 41 replies still build little context: the arm's per-turn context is the brief, the three reads, and the withheld-command placeholder.",
+    "textMode is placeholder because the converter's synthetic key form depends on it; a map built for one mode is refused under the other."
+  ]
+}

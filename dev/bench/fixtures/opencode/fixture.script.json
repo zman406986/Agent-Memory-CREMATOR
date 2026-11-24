@@ -1,0 +1,198 @@
+{
+  "model": "mock-model",
+  "title": "RACOONS-SYNTHETIC-SESSION-TITLE-0001",
+  "task": "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE",
+  "fixture": {
+    "readerCapBytes": 51200,
+    "productBarBytes": 512,
+    "files": [
+      {
+        "name": "big-b.log",
+        "sentinel": "RACOONS-FIXTURE-UNIT-BIG-B-0001",
+        "bytes": 20962
+      },
+      {
+        "name": "big-b-twin.txt",
+        "sentinel": "RACOONS-FIXTURE-TWIN-BIG-B-0001",
+        "bytes": 1320
+      }
+    ],
+    "auxiliary": [
+      {
+        "name": "hello.txt",
+        "text": "RACOONS-SYNTHETIC-HELLO-RESULT-0001: hello from the synthetic workspace\n",
+        "sentinel": "RACOONS-SYNTHETIC-HELLO-RESULT-0001: hello from the synthetic workspace"
+      }
+    ],
+    "lanes": [
+      {
+        "name": "fixture-unit-whole-restore",
+        "rule": "superseded-read",
+        "unitCalls": [
+          "call_fixture_big_b_1_RS-FIXTURE-UNIT-BIG-B"
+        ],
+        "supersedingCalls": [
+          "call_fixture_big_b_2"
+        ],
+        "unitFiles": [
+          "big-b.log"
+        ],
+        "markerSentinels": [
+          "RS-FIXTURE-UNIT-BIG-B"
+        ],
+        "twinCalls": [
+          "call_fixture_big_b_2",
+          "call_fixture_big_b_twin_marker"
+        ],
+        "twinFiles": [
+          "big-b.log",
+          "big-b-twin.txt"
+        ]
+      }
+    ]
+  },
+  "expectedReads": {
+    "big-b.log": {
+      "count": 2,
+      "sentinel": "RACOONS-FIXTURE-UNIT-BIG-B-0001"
+    },
+    "big-b-twin.txt": {
+      "count": 1,
+      "sentinel": "RACOONS-FIXTURE-TWIN-BIG-B-0001"
+    },
+    "hello.txt": {
+      "count": 1,
+      "sentinel": "RACOONS-SYNTHETIC-HELLO-RESULT-0001: hello from the synthetic workspace"
+    }
+  },
+  "replies": [
+    {
+      "name": "fixture-unit-read-1",
+      "match": {
+        "main_turn": 0,
+        "tool_results_count": 12,
+        "last_user_contains": [
+          "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE"
+        ],
+        "last_tool_result_contains": [
+          "RACOONS-SYNTHETIC-HELLO-RESULT-0001: hello from the synthetic workspace"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The seeded session is history, so the run starts from its own new work. Read big-b.log once; the whole 22417-byte result is one unit, and it is below the host reader cap, so a later restore can return all of it.",
+        "text": "Reading big-b.log once.",
+        "calls": [
+          {
+            "id": "call_fixture_big_b_1_RS-FIXTURE-UNIT-BIG-B",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-b.log"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fixture-unit-read-2",
+      "match": {
+        "main_turn": 1,
+        "tool_results_count": 12,
+        "last_user_contains": [
+          "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Steps 2 and 3: the second read is the required re-read of the same path, so the earlier copy is exactly superseded — identical bytes, no write between, so the first read is the removable unit and this one is its surviving twin. Read big-b-twin.txt as its own step so the control has a second, distinct result to find: the twin sentinel is not the unit sentinel.",
+        "text": "Reading big-b.log again, then big-b-twin.txt.",
+        "calls": [
+          {
+            "id": "call_fixture_big_b_2",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-b.log"
+            }
+          },
+          {
+            "id": "call_fixture_big_b_twin_marker",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/big-b-twin.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fixture-keepalive-read",
+      "match": {
+        "main_turn": 2,
+        "tool_results_count": 13,
+        "last_user_contains": [
+          "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "The re-read has landed, so the at-rest pass can remove the first copy. Read the fixture's small hello.txt to send one more request after that removal: the receipt and the surviving twin must both be on this request, or the removal was never carried by the host.",
+        "text": "Reading hello.txt to keep the run moving.",
+        "calls": [
+          {
+            "id": "call_fixture_keepalive",
+            "name": "read",
+            "input": {
+              "path": "{{WORK}}/hello.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fixture-restore-receipts",
+      "match": {
+        "main_turn": 3,
+        "tool_results_count": 14,
+        "last_user_contains": [
+          "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "tool_use",
+        "reasoning": "Two receipts are in context: the seeded read of the unit file and the scripted first read. Restore both, one necromancy call per receipt, by the recall id each receipt names; each archive is below the reader cap, so necromancy must return every byte.",
+        "text": "Restoring both removed reads of big-b.log.",
+        "calls": [
+          {
+            "id": "call_fixture_recall_seeded",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:RACOONS-SYNTHETIC-CALL-0005}}"
+            }
+          },
+          {
+            "id": "call_fixture_recall_unit",
+            "name": "necromancy",
+            "input": {
+              "id": "{{RECALL_ID:call_fixture_big_b_1_RS-FIXTURE-UNIT-BIG-B}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fixture-done",
+      "match": {
+        "main_turn": 4,
+        "tool_results_count": 16,
+        "last_user_contains": [
+          "Do these steps in order. 1) Read big-b.log. 2) Read big-b.log again at the same path; this second read is required, and it is a read of big-b.log, not of big-b-twin.txt. 3) Read big-b-twin.txt. 4) Read hello.txt. 5) Call necromancy once for each [not retained] receipt in context. 6) Reply with exactly: DONE"
+        ]
+      },
+      "reply": {
+        "type": "text",
+        "reasoning": "Both removed reads were carried on later requests with their receipts and restored byte for byte. Nothing else is asked for, so answer with the exact word the bounded task names.",
+        "text": "DONE"
+      }
+    }
+  ]
+}

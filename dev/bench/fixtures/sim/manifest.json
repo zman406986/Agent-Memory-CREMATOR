@@ -1,0 +1,108 @@
+{
+  "schema": "racoons-live-fixture/1",
+  "fixture": "sim",
+  "builtOn": "2026-10-27",
+  "note": "Synthetic shape fixture: a known composition over the shipped renderers, built by build-fixture.mjs. No live record, no clock and no randomness reach these bytes. The `vanilla` arm is a control pass of the SAME reads landed whole: it makes the join real, and nothing in it is scored. This is a render oracle, never a performance sample.",
+  "arms": {
+    "racoons": {
+      "transcript": "../sim/sim.session.v4.jsonl",
+      "armRoot": "C:\\sim\\arm",
+      "sessionId": "session-sim-5f1c0a2e",
+      "rows": 76,
+      "sha256": "c75c8454adf18d0688255f3e1b12c06bda3ded493aa3cd9e777b250a682817b0"
+    },
+    "vanilla": {
+      "transcript": "../sim/sim-control.session.v4.jsonl",
+      "armRoot": "C:\\sim\\arm",
+      "sessionId": "session-sim-5f1c0a2e",
+      "rows": 43,
+      "sha256": "46d481d4199cf2a4016b2574e80d77e1f258d4f714f601a13ab45bfa7be37ad9"
+    }
+  },
+  "pins": {
+    "note": "The oracle lives in expected-composition.json. A change there is a change to this fixture, never a re-freeze.",
+    "floor": 1280,
+    "expected": "expected-composition.json",
+    "units": 7,
+    "compositionTable": {
+      "keepall": 1,
+      "forget-with-partials": 3,
+      "forget-all": 1,
+      "ask-failed-fail-open": 1,
+      "below-floor": 1,
+      "machinery-censored": 1
+    }
+  },
+  "reasoning": {
+    "transcript": "sim.reasoning.session.v4.jsonl",
+    "usage": "sim.reasoning.result.json",
+    "source": {
+      "evidence": "scratchpad/launch/2026-10-29-full-rerun/worlds/vanilla/evidence",
+      "session": "xxxxxxx-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "sessionSha256": "9fb0584e1bd45ef1526c7942400fbaf82e5a9ca012af4621de170ef85ab8ff0c",
+      "resultSha256": "bbd79b8087b7aeff7e3e0a3b71d88d2915032e264dbd33f25944c5f969f6cfdb",
+      "selection": "the smallest prefix carrying at least 60 assistant turns and 60 reasoning parts, cut at or before step 139 so it stays before the first native compaction"
+    },
+    "stepRange": {
+      "start": 1,
+      "end": 80
+    },
+    "steps": 80,
+    "rows": 638,
+    "usageRows": 80,
+    "assistantTurns": 80,
+    "reasoningParts": 60,
+    "reasoningStreamBlocks": 60,
+    "toolHeaderSeq": 12,
+    "systemRowSeq": 7,
+    "files": {
+      "transcript": {
+        "sha256": "687d921b4345658104c05577bc76edccaf33cac2761aac79ddc0d5a8a95af741",
+        "bytes": 3074883,
+        "lines": 638
+      },
+      "usage": {
+        "sha256": "2dbae38f69eead83aed82bae5e97fbcf91add64eeae3a5193b4a284ac4a538cb",
+        "bytes": 21603,
+        "lines": 903
+      }
+    }
+  },
+  "prunes": {
+    "transcript": "sim.prunes.session.v4.jsonl",
+    "usage": "sim.prunes.result.json",
+    "source": {
+      "evidence": "scratchpad/launch/2026-10-29-full-rerun/worlds/vanilla/evidence",
+      "session": "xxxxxxx-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "sessionSha256": "9fb0584e1bd45ef1526c7942400fbaf82e5a9ca012af4621de170ef85ab8ff0c",
+      "resultSha256": "bbd79b8087b7aeff7e3e0a3b71d88d2915032e264dbd33f25944c5f969f6cfdb",
+      "selection": "the smallest prefix carrying at least 20 compaction/prune rows and 30 assistant turns with reasoning, cut at or before step 139 so it stays before the first native compaction"
+    },
+    "stepRange": {
+      "start": 1,
+      "end": 83
+    },
+    "steps": 83,
+    "rows": 763,
+    "usageRows": 83,
+    "assistantTurns": 83,
+    "reasoningParts": 61,
+    "reasoningStreamBlocks": 61,
+    "pruneRows": 53,
+    "turnsWithReasoning": 61,
+    "toolHeaderSeq": 12,
+    "systemRowSeq": 7,
+    "files": {
+      "transcript": {
+        "sha256": "d58f8efef08b97b00bd5abc40b8fad3ccbe6584a0c6092cd08a6bfef9abf84d5",
+        "bytes": 4184077,
+        "lines": 763
+      },
+      "usage": {
+        "sha256": "a6abc8214ae141e6c1839424237bbca8d5373241926e99bc8ac8b41b032fa102",
+        "bytes": 22385,
+        "lines": 936
+      }
+    }
+  }
+}

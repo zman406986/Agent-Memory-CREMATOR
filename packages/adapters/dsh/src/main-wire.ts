@@ -82,6 +82,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** One message's text, block by block, counting what the fork cannot carry. */
 function messageText(content: unknown): { text: string; dropped: number } {
+  // A plain string body is one text part, the shape `wire-request.ts` also
+  // accepts; the fork carries it as the turn's text (ISSUE-566).
+  if (typeof content === 'string') return { text: content, dropped: 0 };
   if (!Array.isArray(content)) return { text: '', dropped: 0 };
   const parts: string[] = [];
   let dropped = 0;
