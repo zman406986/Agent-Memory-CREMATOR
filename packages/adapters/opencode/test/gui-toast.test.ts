@@ -5,8 +5,13 @@
 // helper's test.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 interface Toast {
   readonly title?: string;
@@ -83,7 +88,7 @@ test('a no-rows refusal is shown, not silent', async () => {
   try {
     await host.run();
     assert.deepEqual(host.toasts, [{
-      title: 'CREMATOR', description: 'Cremation: no-rows.', variant: 'warning',
+      title: 'CREMATOR', description: 'Nothing to cremate.', variant: 'default',
     }]);
   } finally {
     host.cleanup();
@@ -95,7 +100,7 @@ test('a missing session is shown after a restart', async () => {
   try {
     await host.run();
     assert.deepEqual(host.toasts, [{
-      title: 'CREMATOR', description: 'Cremation: no-session.', variant: 'warning',
+      title: 'CREMATOR', description: 'No chat request to cremate yet.', variant: 'default',
     }]);
   } finally {
     host.cleanup();
@@ -109,9 +114,31 @@ test('a fired pass reports the row count', async () => {
     assert.deepEqual(host.toasts, [{
       title: 'CREMATOR',
       description: 'Cremation asked 2 row(s); removals apply at the next step.',
-      variant: 'info',
+      variant: 'success',
     }]);
   } finally {
     host.cleanup();
   }
+});
+
+test('a refusal while a pass runs is a notice, not an error', async () => {
+  const host = harness({ ok: true, fired: false, reason: 'ask-in-flight', rows: 0 });
+  try {
+    await host.run();
+    assert.deepEqual(host.toasts, [{
+      title: 'CREMATOR', description: 'A cremation is already running.', variant: 'default',
+    }]);
+  } finally {
+    host.cleanup();
+  }
+});
+
+test('the desktop bundle is self-contained and its twins match', () => {
+  const cjs = readFileSync(join(HERE, '..', 'ui', 'gui-experimental.cjs'), 'utf8');
+  const twin = readFileSync(join(HERE, '..', 'ui', 'gui-experimental.js'), 'utf8');
+  assert.equal(cjs, twin, 'the .js twin holds the same bytes');
+  assert.doesNotMatch(cjs, /require\(\s*['"]\.{1,2}\//u,
+    'the desktop loader refuses a local require; the bundle must inline it');
+  assert.doesNotMatch(cjs, /from\s*['"]\.{1,2}\//u,
+    'the desktop loader refuses a local import; the bundle must inline it');
 });

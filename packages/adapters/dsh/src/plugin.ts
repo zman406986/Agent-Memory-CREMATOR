@@ -460,13 +460,18 @@ export interface DshMountSession {
   eventAt?(seq: number): DshMountEvent | undefined;
   append(type: string, data: unknown, options?: Record<string, unknown>): DshMountEvent;
   /**
-   * The host's last request header (provider/model), read only to route an ask
-   * onto the same resolved model the session uses. Absent on a fake or an old
-   * host: the mount then refuses the ask with `not-configured` rather than
-   * inventing a route.
+   * The host's last request header: `config` (provider/model and the call
+   * scalars) plus the assembled tool schemas of the last request built under it
+   * (`dsh-session`'s `EpochHeader`, `lib/types/types.d.ts`, read back through
+   * `Session.requestHeader()`, `lib/types/index.d.ts`). The mount routes an ask
+   * onto this header's model and, when no main request has been observed yet,
+   * takes the seed's tool list from it (ISSUE-606). Absent on a fake or an old
+   * host: the mount then refuses the ask rather than inventing a route.
    */
-  requestHeader?(): { readonly config?: { readonly provider?: string; readonly model?: string } }
-    | undefined;
+  requestHeader?(): {
+    readonly config?: { readonly provider?: string; readonly model?: string };
+    readonly tools?: readonly unknown[];
+  } | undefined;
   /**
    * The host's own creation metadata. `cwd` is the session's workspace root,
    * which dsh validates absolute; it is the boundary the recall source lane may
@@ -482,6 +487,12 @@ export interface DshMountEvent {
   readonly data?: unknown;
   readonly surfaceOp?: unknown;
   readonly sourceEventSeqs?: readonly number[];
+}
+
+/** A request's fixed prefix: the system slot and the tool list it carries. */
+interface SeedPrefix {
+  readonly system: string;
+  readonly tools: readonly unknown[];
 }
 
 /** The structural slice of the Cordis context this mount uses. */
@@ -3356,9 +3367,11 @@ export function createRacoonsMount(options: {
    * `system`, `tools` and the route come from the capture when one exists: they
    * are the request's fixed prefix, and the surface carries the prompt as a
    * leading `system/message` (the loop's `in-history` shape), which the
-   * projection keeps where main put it. No capture means no tool list, and a
-   * fork with no tools would be a different conversation — so this returns null
-   * and the caller keeps its fail-open `no-seed`.
+   * projection keeps where main put it. With no capture — a restarted mount has
+   * observed no main request, because the session's earlier turns belong to the
+   * previous process — the prefix comes from the host's logged request header
+   * instead (`hostSeedPrefix`, ISSUE-606); when the host cannot supply it this
+   * returns null and the caller keeps its fail-open `no-seed`.
    *
    * Returns null when the surface never reaches `stopNodeId` (a prefix that
    * cannot name its own end is not a seed for that result), yields no message at
@@ -3371,9 +3384,12 @@ export function createRacoonsMount(options: {
   function surfaceWire(session: DshMountSession, sessionId: string,
     stopNodeId: string | null,
   ): CapturedMainRequest | null {
-    const captured = mainWire.last(sessionId);
-    if (captured === null) return null;
     const nodes = Array.isArray(session.surface?.nodes) ? session.surface.nodes : [];
+    const captured = mainWire.last(sessionId);
+    const prefix: SeedPrefix | null = captured !== null
+      ? { system: captured.wire.system, tools: captured.wire.tools }
+      : hostSeedPrefix(session, sessionId, nodes);
+    if (prefix === null) return null;
     const messages: unknown[] = [];
     let reached = false;
     for (const seq of nodes) {
@@ -3407,10 +3423,70 @@ export function createRacoonsMount(options: {
     }
     if (stopNodeId !== null && !reached) return null;
     if (messages.length === 0) return null;
-    return captureMainRequest({ sessionId, system: captured.wire.system,
-      tools: captured.wire.tools, messages,
-      ...(captured.provider === null ? {} : { provider: captured.provider }),
-      ...(captured.model === null ? {} : { model: captured.model }) });
+    return captureMainRequest({ sessionId, system: prefix.system,
+      tools: prefix.tools, messages,
+      ...(captured === null || captured.provider === null ? {} : { provider: captured.provider }),
+      ...(captured === null || captured.model === null ? {} : { model: captured.model }) });
+  }
+
+  /**
+   * The seed's fixed prefix from the host's own log when no main request has
+   * been observed yet (ISSUE-606).
+   *
+   * Why a capture can be missing over a healthy surface: after a restart the
+   * session's earlier turns were dispatched by the PREVIOUS process, so this
+   * mount's `llm/stream` observer has seen nothing, and the first request of the
+   * new process is the one that will carry the answer to this ask — a request
+   * cannot seed itself. The host logs the prefix durably anyway: every request
+   * appends its `request/header` (the call `config` plus the assembled tool
+   * schemas), and `Session.requestHeader()` returns the latest one
+   * (`@deepseek-ai/dsh-session` `lib/types/index.d.ts:311`; `EpochHeader` in
+   * `lib/types/types.d.ts:223`) — the same read this mount already trusts for
+   * the ask route (`./route.ts`).
+   *
+   * The system prompt is not in that header by design (`system?: never`): the
+   * host carries it as the surface's node 0, a `system/message` event, which the
+   * projection keeps where the host put it. So the prompt is checked for
+   * presence and never guessed, and the system slot stays `''` — exactly what a
+   * captured loop-built request states, because a loop-built request leaves the
+   * slot undefined and the prompt is the leading message.
+   *
+   * No prompt node, no header, no tools, a tool entry that is not a named schema
+   * (a blank name or a non-record is not a tool; a partial list is not a tool
+   * list), or a throw from the host read: null, one `seed-prefix` line naming
+   * the reason, and the caller keeps its named `no-seed`.
+   */
+  function hostSeedPrefix(session: DshMountSession, sessionId: string,
+    nodes: readonly number[],
+  ): SeedPrefix | null {
+    const refuse = (reason: string): null => {
+      journal('seed-prefix', { sessionId, source: 'request-header', reason });
+      return null;
+    };
+    const head = nodes[0];
+    const first = head === undefined ? undefined : session.eventAt?.(head);
+    // A seed whose surface carries no prompt would be a conversation with no
+    // system turn; refuse by name instead of shipping it.
+    if (first === undefined || first.type !== 'system/message') {
+      return refuse('no-system-prompt');
+    }
+    let header: unknown;
+    try {
+      header = typeof session.requestHeader === 'function' ? session.requestHeader() : undefined;
+    } catch (error) {
+      return refuse(`header-threw: ${messageOf(error)}`);
+    }
+    // No header at all (an old or fake host) is a different absence from a
+    // header that states no tools: name each one.
+    if (!isRecord(header)) return refuse('no-header');
+    const tools = Array.isArray(header['tools']) ? header['tools'] : null;
+    if (tools === null || tools.length === 0) return refuse('no-tools');
+    if (!tools.every(tool => isRecord(tool) && typeof tool['name'] === 'string'
+      && tool['name'].trim() !== '')) {
+      return refuse('malformed-tools');
+    }
+    journal('seed-prefix', { sessionId, source: 'request-header', tools: tools.length });
+    return { system: '', tools };
   }
 
   /** The surface wire as a request, for the entry/landing lane's `surface` slot. */

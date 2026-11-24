@@ -42,10 +42,11 @@ interface StatusModule {
   }): ContextStatus;
   formatBytes(bytes: number): string;
   passLabel(pass: { removals?: number; bytes?: number }): string;
+  refusalText(reason: string): string;
 }
 
-// The desktop part loads this module with `require`; the test does the same so
-// one plain-JavaScript source is covered rather than a TypeScript twin.
+// The terminal part imports this module; the test loads it with `require` so one
+// plain-JavaScript source is covered rather than a TypeScript twin.
 const require = createRequire(import.meta.url);
 const status = require('../ui/status.cjs') as StatusModule;
 
@@ -157,4 +158,14 @@ test('passLabel names the units and marks the byte figure approximate', () => {
   assert.equal(status.passLabel({ removals: 1, bytes: 1536 }), '1 unit · ~1.5 KB');
   assert.equal(status.passLabel({ removals: 4, bytes: 900 }), '4 units · ~900 B');
   assert.equal(status.passLabel({ removals: 0, bytes: 0 }), '0 units · ~0 B');
+});
+
+test('refusalText says a refusal in plain words and names an unknown reason', () => {
+  assert.equal(status.refusalText('no-rows'), 'Nothing to cremate.');
+  assert.equal(status.refusalText('no-session'), 'No chat request to cremate yet.');
+  assert.equal(status.refusalText('ask-in-flight'), 'A cremation is already running.');
+  assert.equal(status.refusalText('claimed-unit'), 'Nothing new to cremate.');
+  assert.equal(status.refusalText('no-fire'), 'Nothing was removed.');
+  assert.equal(status.refusalText('odd'), 'Cremation: odd.');
+  assert.equal(status.refusalText(''), 'Cremation: no reason given.');
 });

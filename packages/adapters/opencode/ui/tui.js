@@ -96,8 +96,8 @@ export default {
         return;
       }
       context.ui.toast.show({
-        message: `Cremation skipped: ${words(data.reason, 'no reason given')}.`,
-        variant: 'warning',
+        message: status.refusalText(words(data.reason, 'no-fire')),
+        variant: 'info',
       });
     }));
 
@@ -107,9 +107,13 @@ export default {
         draft.running = false;
         draft.expectApplied = false;
       });
+      // A refusal is a normal outcome, not an error: "no rows" means the pass
+      // ran and found nothing. Only the thrown-pass reason is a failure.
+      const reason = words(data.reason, 'no reason given');
+      const failure = reason === 'error';
       context.ui.toast.show({
-        message: `Cremation failed: ${words(data.reason, 'no reason given')}.`,
-        variant: 'error',
+        message: failure ? 'Cremation failed.' : status.refusalText(reason),
+        variant: failure ? 'error' : 'info',
       });
     }));
 

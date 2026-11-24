@@ -261,6 +261,11 @@ export const CREMATOR_JOURNAL_KINDS = [
   // live route, so the seed is invalidated by name instead of serving a prefix
   // that belongs to the old model.
   'seed-model-stale',
+  // ISSUE-606: no main request has been observed yet (a restarted mount), so the
+  // seed's tool list came from the host's logged request header instead of a
+  // capture; `tools` counts them. With `reason` instead, that fallback was
+  // refused by name and the ask keeps its `no-seed`.
+  'seed-prefix',
   // the routed model's context window (ADR-0071, ADR-0072): `window-resolved`
   // names the route and the source when the host model-info seam answers;
   // `window-unresolved` names why a route's lookup produced no window, once per

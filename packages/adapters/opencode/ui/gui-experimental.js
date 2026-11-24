@@ -13,7 +13,9 @@
  * `Command` and `ComposerPill` are the host's registry tokens. Each token is the
  * public `{ kind: 'registry', id }` shape; building one here keeps this part free
  * of a runtime import from the host SDK, so it loads before the desktop provides
- * that module.
+ * that module. The status arithmetic is inlined for the same reason: the
+ * desktop's GUI bundle loader shares no local module, and a local status require
+ * kept this entire part from loading (ISSUE-604).
  *
  * The pill subscribes to the RPC's lifecycle events lazily, once per server and
  * only when a composer asks for the pill. A guarded loop keeps retrying a closed
@@ -23,8 +25,6 @@
  */
 
 'use strict';
-
-const status = require('./status.cjs');
 
 const Command = Object.freeze({ kind: 'registry', id: 'command' });
 const ComposerPill = Object.freeze({ kind: 'registry', id: 'composer-pill' });
@@ -41,6 +41,123 @@ const STARTED = EVENTS[0];
 const ENDED = EVENTS[1];
 const FAILED = EVENTS[2];
 const APPLIED = EVENTS[3];
+
+/**
+ * The status arithmetic the pill shows, inlined on purpose. The desktop loads a
+ * plugin's GUI bundle with a fixed set of shared modules and refuses a local
+ * `require` — `./status.cjs` was the load error that kept this whole part from
+ * registering (ISSUE-604). The terminal part still shares `status.cjs`; this is
+ * that helper's copy for this bundle, with the same arithmetic.
+ */
+const TOKEN_FIELDS = Object.freeze(['input', 'output', 'reasoning']);
+const CACHE_FIELDS = Object.freeze(['read', 'write']);
+const KB = 1024;
+const MB = 1024 * 1024;
+
+function isObject(value) {
+  return value !== null && typeof value === 'object';
+}
+
+function count(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** The tokens one step billed: input, cache read, cache write, output, reasoning. */
+function usedTokens(message) {
+  if (!isObject(message)) return null;
+  const tokens = message.tokens;
+  if (!isObject(tokens)) return null;
+  let total = 0;
+  for (const field of TOKEN_FIELDS) total += count(tokens[field]);
+  const cache = tokens.cache;
+  for (const field of CACHE_FIELDS) total += count(isObject(cache) ? cache[field] : 0);
+  return total;
+}
+
+/** The newest usage-bearing assistant step after the last completed compaction. */
+function lastAssistantWithUsage(messages, boundaryMessageID) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  let start = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isObject(message) && message.type === 'compaction' && message.status === 'completed') {
+      start = index + 1;
+      break;
+    }
+  }
+  let end = messages.length;
+  if (typeof boundaryMessageID === 'string' && boundaryMessageID !== '') {
+    const boundary = messages.findIndex((message) => isObject(message) && message.id === boundaryMessageID);
+    if (boundary >= 0) end = boundary;
+  }
+  for (let index = end - 1; index >= start; index -= 1) {
+    const message = messages[index];
+    if (!isObject(message)) continue;
+    if (message.type !== 'assistant') continue;
+    if (!isObject(message.tokens)) continue;
+    return message;
+  }
+  return null;
+}
+
+/** `{ used, limit, percent }`; all nulls until usage and a positive limit exist. */
+function contextStatus(input) {
+  const source = isObject(input) ? input : {};
+  const used = usedTokens(lastAssistantWithUsage(source.messages, source.boundary));
+  const limit = source.limit;
+  if (used === null || typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
+    return { used: null, limit: null, percent: null };
+  }
+  const percent = Math.round((used / limit) * 100);
+  return { used, limit, percent: percent < 0 ? 0 : percent > 100 ? 100 : percent };
+}
+
+function oneDecimal(value) {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function formatBytes(bytes) {
+  const value = typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  if (value >= MB) return `${oneDecimal(value / MB)} MB`;
+  if (value >= KB) return `${oneDecimal(value / KB)} KB`;
+  return `${Math.round(value)} B`;
+}
+
+/** `1 unit · ~1.5 KB` — one pass's removals and its approximate bytes. */
+function passLabel(pass) {
+  const source = isObject(pass) ? pass : {};
+  const removals = typeof source.removals === 'number' && Number.isFinite(source.removals) && source.removals > 0
+    ? Math.floor(source.removals)
+    : 0;
+  const bytes = typeof source.bytes === 'number' && Number.isFinite(source.bytes) && source.bytes > 0
+    ? source.bytes
+    : 0;
+  return `${removals} ${removals === 1 ? 'unit' : 'units'} · ~${formatBytes(bytes)}`;
+}
+
+/**
+ * Plain text for a refusal reason, inlined for the same bundle reason. A
+ * refusal is not a failure: "no rows" means the pass ran and found nothing.
+ */
+const REFUSAL_TEXT = Object.freeze({
+  'no-rows': 'Nothing to cremate.',
+  'no-session': 'No chat request to cremate yet.',
+  'no-array': 'No chat request to cremate yet.',
+  'ask-off': 'Cremation is off for this install.',
+  'ask-in-flight': 'A cremation is already running.',
+  'ask-standdown': 'Cremation skipped: the ledger is not healthy.',
+  'claimed-unit': 'Nothing new to cremate.',
+  'claimed-revision': 'This request was already cremated.',
+  'request-unreadable': 'The saved request could not be read.',
+  'closing': 'Cremation is shutting down.',
+  'no-fire': 'Nothing was removed.',
+});
+
+function refusalText(reason) {
+  const named = typeof reason === 'string' && reason !== '' ? reason : 'no reason given';
+  return REFUSAL_TEXT[named] ?? `Cremation: ${named}.`;
+}
 
 /** One event's `data` object; an unexpected payload reads as empty, never throws. */
 function payload(event) {
@@ -113,7 +230,7 @@ function fillOf(data, session, info) {
   const boundary = info === undefined || info.revert === undefined || info.revert === null
     ? undefined
     : info.revert.messageID;
-  return status.contextStatus({
+  return contextStatus({
     messages: data.session.message.list(session.id),
     limit: limitOf(data, session, info),
     boundary,
@@ -161,8 +278,8 @@ function applyEvent(ctx, setStore, server, event) {
     toastOnce(ctx, `${key}\n${fired ? 'fired' : reason}`,
       fired
         ? `Cremation asked ${whole(data.rows)} row(s); removals apply at the next step.`
-        : `Cremation: ${reason}.`,
-      fired ? 'info' : 'warning');
+        : refusalText(reason),
+      fired ? 'success' : 'default');
     return;
   }
   if (event.type === FAILED) {
@@ -171,7 +288,10 @@ function applyEvent(ctx, setStore, server, event) {
       entry.running = false;
       entry.failed = reason;
     });
-    toastOnce(ctx, `${key}\n${reason}`, `Cremation: ${reason}.`, 'warning');
+    const failure = reason === 'error';
+    toastOnce(ctx, `${key}\n${reason}`,
+      failure ? 'Cremation failed.' : refusalText(reason),
+      failure ? 'error' : 'default');
     return;
   }
   if (event.type === APPLIED) {
@@ -249,8 +369,8 @@ function cremate(ctx, setStore, session) {
     toastOnce(ctx, `${session.server.id}\n${session.id}\n${fired ? 'fired' : reason}`,
       fired
         ? `Cremation asked ${rows} row(s); removals apply at the next step.`
-        : `Cremation: ${reason}.`,
-      fired ? 'info' : 'warning');
+        : refusalText(reason),
+      fired ? 'success' : 'default');
   }).catch((error) => {
     const reason = reasonOf(error);
     update(setStore, session.key, (entry) => {
@@ -280,7 +400,7 @@ function pillView(ctx, store, setStore, loops, input) {
 
   let label;
   if (running) label = 'Cremating…';
-  else if (last !== null) label = status.passLabel(last);
+  else if (last !== null) label = passLabel(last);
   else if (fill.percent !== null) label = `${fill.percent}% ctx`;
   else label = 'CREMATOR';
 
@@ -305,6 +425,25 @@ const plugin = {
   setup(ctx) {
     const [store, setStore] = ctx.storage.memory('cremator-status', { initial: { byKey: {} } });
     const loops = new Map();
+
+    /**
+     * Subscribe to every listed server's events as soon as one exists. The
+     * lifecycle events are the only feedback a pass started by the
+     * location-scoped `/cremate` command produces, and that command does not
+     * call this part. The pill starts the same loop when it renders;
+     * `ensureLoop` keeps one per server. A host without the servers seam still
+     * mounts: discovery is a no-op.
+     */
+    const discover = () => {
+      if (ctx.servers === undefined || typeof ctx.servers.list !== 'function') return;
+      for (const id of ctx.servers.list()) {
+        const server = ctx.servers.get(id);
+        if (server !== undefined && server !== null) ensureLoop(ctx, setStore, loops, server);
+      }
+    };
+    discover();
+    const discovery = setInterval(discover, 1000);
+    if (typeof discovery.unref === 'function') discovery.unref();
 
     const removeCommand = ctx.add(Command, () => ({
       id: 'cremate',
@@ -331,6 +470,7 @@ const plugin = {
     }));
 
     return () => {
+      clearInterval(discovery);
       removeCommand();
       removePill();
       for (const controller of loops.values()) controller.abort();

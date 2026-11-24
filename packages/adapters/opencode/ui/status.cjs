@@ -5,8 +5,8 @@
  * the status surfaces show: how full the context is, how large the last applied
  * pass was, and the label both the desktop composer pill and the terminal
  * `/cremate` command display. Plain CommonJS, so the terminal part (ESM) can
- * default-import it and the desktop part (CommonJS) can `require` it without a
- * build step.
+ * default-import it. The desktop GUI bundle inlines a copy: its loader shares no
+ * local module (ISSUE-604).
  *
  * Context fill follows the host's own rule: the newest assistant step that
  * carries token usage, after the last compaction that COMPLETED, and before the
@@ -133,10 +133,35 @@ function passLabel(pass) {
   return `${removals} ${removals === 1 ? 'unit' : 'units'} · ~${formatBytes(bytes)}`;
 }
 
+/**
+ * Plain text for a refusal reason. A refusal is not a failure: "no rows" means
+ * the pass ran and found nothing to table, so the surfaces show it as a normal
+ * notice instead of an error. An unknown reason names itself.
+ */
+const REFUSAL_TEXT = Object.freeze({
+  'no-rows': 'Nothing to cremate.',
+  'no-session': 'No chat request to cremate yet.',
+  'no-array': 'No chat request to cremate yet.',
+  'ask-off': 'Cremation is off for this install.',
+  'ask-in-flight': 'A cremation is already running.',
+  'ask-standdown': 'Cremation skipped: the ledger is not healthy.',
+  'claimed-unit': 'Nothing new to cremate.',
+  'claimed-revision': 'This request was already cremated.',
+  'request-unreadable': 'The saved request could not be read.',
+  'closing': 'Cremation is shutting down.',
+  'no-fire': 'Nothing was removed.',
+});
+
+function refusalText(reason) {
+  const named = typeof reason === 'string' && reason !== '' ? reason : 'no reason given';
+  return REFUSAL_TEXT[named] ?? `Cremation: ${named}.`;
+}
+
 module.exports = {
   usedTokens,
   lastAssistantWithUsage,
   contextStatus,
   formatBytes,
   passLabel,
+  refusalText,
 };
