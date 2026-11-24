@@ -1598,15 +1598,16 @@ export function spendReading({ captured, host = null, grant = null }) {
  * generate usage as a replay-only `session.usage.recorded` row (source
  * `generate`) that the plugin event stream cannot request, so the host step
  * reading stays main-lane only and the ask lane is outside it. The grant total
- * therefore adds the ask lane's captured prompt/completion estimate on top of
- * the host reading when `hostIncludesAskStep` is false. A host or mock whose own
+ * therefore adds the ask lane's measured host reading when the generate answer
+ * stated one, else its captured prompt/completion estimate, on top of the host
+ * reading when `hostIncludesAskStep` is false. A host or mock whose own
  * reading covers the generate call passes `hostIncludesAskStep: true` and the
  * ask is already a subset, never added twice. The ask's exact host reading is
  * separate: a `session.generate` answer that declares `{tokens, cost}` is
  * journalled as `usageSource: "host-generate"` and read by `askRecordOf`; the
  * estimate here remains the fallback when the answer states none. Both numbers
  * stay visible: `hostReading` is the host-only reading, `addedAskPromptTokens` /
- * `addedAskCompletionTokens` are the ask estimate the total added, and
+ * `addedAskCompletionTokens` are the ask lane total the grant added, and
  * `totalBasis` names which shape produced the total.
  *
  * `totalPromptTokens`/`totalCompletionTokens`/`totalTokens` are that grant
@@ -1620,15 +1621,33 @@ export function spendReading({ captured, host = null, grant = null }) {
  * @param {object[]} askRows the ask request rows (kind `ask` or `generate`)
  * @param {number|null} [grant]
  * @param {{exactSplit?: boolean, hostIncludesAskStep?: boolean,
- *   askMetering?: 'host-generate'|'unmeasured-host'|'partial'}} [options]
+ *   askUsage?: object|null, askMetering?: 'host-generate'|'estimate'|'partial'}} [options]
  *   `exactSplit` is `true` only when the caller knows every row carries its own
  *   kind; `hostIncludesAskStep` states whether the host's own step reading
  *   already covers the ask/generate call (the 2.4.0 step stream declares no ask
- *   row: false); `askMetering` is the
+ *   row: false); `askUsage` is the journal's measured ask reading
+ *   (`askLaneReadingOf`'s `hostUsage`), added in place of the captured estimate
+ *   only when `askMetering` is `host-generate` (`partial` keeps the estimate so
+ *   the cap never drops the unmeasured fires); `askMetering` is the
  *   journal-derived label when the caller has it
  */
 export function withAskLane(reading, askRows, grant = null, options = {}) {
   const ask = capturedSpend(askRows, null);
+  /**
+   * The ask lane's measured host reading, when the journal has one for every
+   * fired line. It is the figure the grant total adds in place of the
+   * captured-body estimate, so the cap and the lane's label read the same
+   * value; a `partial` lane keeps the estimate because the measured subset
+   * would cap below the estimate for the unmeasured fires, and no measurement
+   * means the estimate is the figure and the label says `estimate` (ISSUE-524).
+   */
+  const askUsage = options.askMetering === 'host-generate'
+    ? (options.askUsage ?? null) : null;
+  const askPromptTokens = askUsage === null
+    ? ask.billedPromptTokens : Number(askUsage.promptTokens ?? askUsage.inputTokens ?? 0);
+  const askCompletionTokens = askUsage === null
+    ? ask.billedCompletionTokens
+    : Number(askUsage.completionTokens ?? askUsage.outputTokens ?? 0);
   const capturedMainPromptTokens = Number(
     reading?.capturedEstimatePromptTokens ?? reading?.capturedPromptTokens
       ?? reading?.billedPromptTokens ?? 0,
@@ -1659,16 +1678,21 @@ export function withAskLane(reading, askRows, grant = null, options = {}) {
    * already contains it.
    */
   const addedAskPromptTokens = hostComplete && !hostIncludesAskStep && askRowCount > 0
-    ? ask.billedPromptTokens : 0;
+    ? askPromptTokens : 0;
   const addedAskCompletionTokens = hostComplete && !hostIncludesAskStep && askRowCount > 0
-    ? ask.billedCompletionTokens : 0;
+    ? askCompletionTokens : 0;
+  /**
+   * The mixed branch adds the ask figure even when no captured ask row exists:
+   * the journal can witness a measured fire the capture missed. The complete
+   * host branch keeps its `askRowCount > 0` gate.
+   */
   const totalPromptTokens = hostComplete
     ? hostPromptTokens + addedAskPromptTokens
-    : Math.max(capturedMainPromptTokens, mixedHostPromptTokens ?? 0) + ask.billedPromptTokens;
+    : Math.max(capturedMainPromptTokens, mixedHostPromptTokens ?? 0) + askPromptTokens;
   const totalCompletionTokens = hostComplete
     ? hostCompletionTokens + addedAskCompletionTokens
     : Math.max(capturedMainCompletionTokens, mixedHostCompletionTokens ?? 0)
-      + ask.billedCompletionTokens;
+      + askCompletionTokens;
   const totalTokens = totalPromptTokens + totalCompletionTokens;
   const value = Number.isFinite(grant) ? Number(grant) : null;
   /**
@@ -1681,13 +1705,15 @@ export function withAskLane(reading, askRows, grant = null, options = {}) {
    */
   const exactSplit = options.exactSplit === true;
   /** Which shape produced the grant total; the field a reader checks. */
+  const askBasis = askUsage === null ? 'estimate' : 'measured';
   const totalBasis = exactSplit
     ? 'captured-rows-exact'
     : hostComplete
       ? (hostIncludesAskStep
         ? 'host-step-includes-ask'
-        : (askRowCount > 0 ? 'host-main-plus-ask-estimate' : 'host-main-only'))
-      : 'conservative-max-plus-ask';
+        : (askRowCount > 0 ? `host-main-plus-ask-${askBasis}` : 'host-main-only'))
+      : (askRowCount > 0
+        ? `conservative-max-plus-ask-${askBasis}` : 'conservative-max-plus-ask');
   const grantBasis = exactSplit
     ? 'main lane + ask; the captured bodies carry each row\'s kind, so the split is exact'
     : hostComplete
@@ -1697,17 +1723,22 @@ export function withAskLane(reading, askRows, grant = null, options = {}) {
         : (askRowCount > 0
           ? 'the complete host step reading is main-lane only (the measured 2.2.5 route printed '
             + 'no ask step row; 2.4.0 declares none on the step stream), so '
-            + 'the grant total adds the ask lane\'s captured prompt/completion estimate; this is '
-            + 'conservative and the host reading is kept separately in `hostReading`'
+            + 'the grant total adds the ask lane\'s '
+            + (askUsage === null
+              ? 'captured prompt/completion estimate; this is conservative'
+              : 'measured host reading; this is conservative')
+            + ' and the host reading is kept separately in `hostReading`'
           : 'the complete host step reading is the grant total; no ask rows exist to add'))
       : 'the host reading is incomplete or absent, so the grant total is the larger of the '
-        + 'captured main lane and the host step reading, plus the ask lane estimate; this is NOT '
-        + 'an exact ask/main split and the total is conservative';
+        + 'captured main lane and the host step reading, plus the ask lane '
+        + (askUsage === null ? 'estimate' : 'measured host reading')
+        + '; this is NOT an exact ask/main split and the total is conservative';
   const note = 'billed* is the reading the meter chose: the host step reading when every host '
     + 'step row is complete, otherwise the captured main lane. The grant total is computed '
     + 'separately: when the complete host reading is main-lane only (the measured 2.2.5 route '
     + 'printed no ask/generate step row; 2.4.0 declares none on the step stream) the ask lane\'s '
-    + 'captured prompt/completion estimate is added and '
+    + (askUsage === null ? 'captured prompt/completion estimate' : 'measured host reading')
+    + ' is added and '
     + 'named under `addedAsk*`; when the host reading includes the ask step it is a subset and '
     + 'is not added. `fired` compares that conservative total with the grant, never the host '
     + 'reading alone. `hostReading` keeps the host-only figures. The capture-main-only bytes/3 '
@@ -1727,7 +1758,11 @@ export function withAskLane(reading, askRows, grant = null, options = {}) {
       complete: hostComplete,
       includesAskStep: hostIncludesAskStep,
     },
-    /** The ask estimate the grant total added when the host reading is main-only. */
+    /**
+     * The ask lane total the grant added when the host reading is main-only:
+     * the measured host reading when the generate answer stated one, else the
+     * captured prompt/completion estimate.
+     */
     addedAskPromptTokens,
     addedAskCompletionTokens,
     totalBasis,
@@ -1741,12 +1776,11 @@ export function withAskLane(reading, askRows, grant = null, options = {}) {
       source: ask.source,
       /**
        * The label the caller derived from the run journal when it has one
-       * (`askRecordOf`). The default is the fallback: no host reading is known
-       * yet, so the lane is host-unmetered. A journal line that carries
-       * `usageSource: "host-generate"` (the generate answer declared tokens and
-       * cost) overrides it in the result.
+       * (`askLaneReadingOf`). The default follows the reading: `host-generate`
+       * when the measured usage was used, otherwise `estimate`, the captured
+       * body being the lane's only figure.
        */
-      metering: options.askMetering ?? 'host-unmetered',
+      metering: options.askMetering ?? (askUsage === null ? 'estimate' : 'host-generate'),
       split: exactSplit ? 'exact' : 'not-exact',
     },
     grantBasis,
@@ -1790,6 +1824,40 @@ function askApplyRequestKey(row) {
   const eventId = typeof row?.eventId === 'string' ? row.eventId : null;
   if (eventId === null || eventId.length === 0) return null;
   return eventId.replace(/#\d+$/u, '');
+}
+
+/**
+ * The ask lane's one reading from the mount journal: the host's own usage,
+ * summed, when the generate answers state it, and the metering label the spend
+ * cap and the result both read. `hostUsage` is null when no fired line states a
+ * reading (a vanilla arm has no journal at all); `metering` is then `estimate`,
+ * because the captured-body estimate is the lane's only figure. `host-generate`
+ * means every fired line stated one, `partial` that only some did.
+ * @param {object|null} journal a `readJournal` result
+ * @returns {{hostUsage: object|null, metering: string}}
+ */
+export function askLaneReadingOf(journal) {
+  const journalAsks = journal !== null && journal.available === true
+    && Array.isArray(journal.asks) ? journal.asks : [];
+  const fired = journalAsks.filter(row => row?.status === 'read');
+  const measured = fired.filter(row => row?.usageSource === 'host-generate'
+    && row?.usage !== null && row?.usage !== undefined && typeof row.usage === 'object');
+  const hostUsage = measured.length === 0 ? null : {
+    rows: measured.length,
+    inputTokens: measured.reduce((sum, row) => sum + Number(row.usage.inputTokens ?? 0), 0),
+    outputTokens: measured.reduce((sum, row) => sum + Number(row.usage.outputTokens ?? 0), 0),
+    cachedInputTokens: measured.reduce(
+      (sum, row) => sum + Number(row.usage.cachedInputTokens ?? 0), 0),
+    cacheReadTokens: measured.reduce(
+      (sum, row) => sum + Number(row.cacheReadTokens ?? 0), 0),
+    cacheWriteTokens: measured.reduce(
+      (sum, row) => sum + Number(row.cacheWriteTokens ?? 0), 0),
+    metering: 'host-generate',
+  };
+  const metering = fired.length === 0 || measured.length === 0
+    ? 'estimate'
+    : (measured.length === fired.length ? 'host-generate' : 'partial');
+  return { hostUsage, metering };
 }
 
 /**
@@ -1861,40 +1929,12 @@ export function askRecordOf({
   const dropped = journalDropped.length;
   /**
    * The ask's own reading, when the host stated one on the generate answer
-   * (ISSUE-300 item 7; ISSUE-538). 2.4.0's `session.generate` answer declares
-   * `{text, tokens, cost}`, so a real route states one; a null is recorded as
-   * `unmeasured-host`, never as zero, and the captured-body estimate under
-   * `usage` stays the separate, named figure.
+   * (ISSUE-300 item 7; ISSUE-538), and the lane's metering label. The spend cap
+   * reads the same helper, so a lane labelled `host-generate` is capped on that
+   * measured reading; a lane with only the captured estimate is labelled
+   * `estimate` and capped on the estimate (ISSUE-524).
    */
-  const hostUsageRows = journalAsks.filter(row => row?.status === 'read'
-    && row?.usage !== null && row?.usage !== undefined && typeof row.usage === 'object');
-  /**
-   * The ask lane's metering label, derived from the journal's fired lines: a
-   * generate answer that states its own usage is `host-generate`; a fire with
-   * none is `unmeasured-host`; a mix is `partial`. No journal or no fire means
-   * nothing was measured, never a claim that the lane was host-metered.
-   */
-  const firedJournalRows = journalAsks.filter(row => row?.status === 'read');
-  const hostMeteredRows = firedJournalRows.filter(row =>
-    row?.usageSource === 'host-generate'
-    && row?.usage !== null && row?.usage !== undefined && typeof row.usage === 'object');
-  const metering = !journalAvailable || firedJournalRows.length === 0
-    ? 'unmeasured-host'
-    : (hostMeteredRows.length === firedJournalRows.length
-      ? 'host-generate'
-      : (hostMeteredRows.length === 0 ? 'unmeasured-host' : 'partial'));
-  const hostUsage = hostUsageRows.length === 0 ? null : {
-    rows: hostUsageRows.length,
-    inputTokens: hostUsageRows.reduce((sum, row) => sum + Number(row.usage.inputTokens ?? 0), 0),
-    outputTokens: hostUsageRows.reduce((sum, row) => sum + Number(row.usage.outputTokens ?? 0), 0),
-    cachedInputTokens: hostUsageRows.reduce(
-      (sum, row) => sum + Number(row.usage.cachedInputTokens ?? 0), 0),
-    cacheReadTokens: hostUsageRows.reduce(
-      (sum, row) => sum + Number(row.cacheReadTokens ?? 0), 0),
-    cacheWriteTokens: hostUsageRows.reduce(
-      (sum, row) => sum + Number(row.cacheWriteTokens ?? 0), 0),
-    metering: 'host-generate',
-  };
+  const { hostUsage, metering } = askLaneReadingOf(journal);
   /**
    * The seam origins the journal's `ask` lines name: `step` when the fire came
    * from the `context` hook, `idle` when it came from the `session.idle`
@@ -2107,12 +2147,13 @@ export function askRecordOf({
     /**
      * The lane's metering label from the journal: `host-generate` when every
      * fired ask line states a host reading, `partial` when only some do, and
-     * `unmeasured-host` when none do or no journal exists.
+     * `estimate` when none do or no journal exists.
      */
     metering,
     meteringBasis: 'journal ask lines with status "read": host-generate when every fired line '
       + 'carries usageSource "host-generate" and a usage object; partial when only some do; '
-      + 'unmeasured-host when none do or no journal exists',
+      + 'estimate when none do or no journal exists (the captured-body estimate is then the '
+      + 'only figure)',
     note: 'The ask tables every eligible unit at or above the product floor (no row cap) and '
       + 'calls session.generate once per depth crossing (the bench-only per-revision lane is the '
       + '--ask-every-revision opt-in). The pass is core planPrunePass: L1 (stale-exact-reread, '
@@ -4400,8 +4441,9 @@ export const VANILLA_COMPACTION_LABEL = 'host compaction observed; no product re
  * The compaction facts a run records. A compaction request is recognised by the
  * host's own compaction prompt in the captured body, never by a `kind` label
  * alone; a journal compaction event is the mount's witness when no capture
- * exists. `allowed` is the flag, `observed` is the fact, and `label` is present
- * only when the flag permitted an observed compaction.
+ * exists. `allowed` is the flag, `observed` is a completed journal fact, and
+ * `label` is present only when the flag permitted a compaction witnessed by a
+ * captured request or a completed journal event (ISSUE-524).
  *
  * A journal `compacted` event has four phases (`started`, `delta`, `ended`,
  * `failed`): only `ended` means a compaction completed. Counting every phase
@@ -4412,14 +4454,18 @@ export const VANILLA_COMPACTION_LABEL = 'host compaction observed; no product re
  * request count (a request proves the host asked, not that the rewrite
  * finished); `compactionCompleted` is the number of `ended` journal events.
  * `count` is `compactionCompleted`. `observed` is true only for a completed
- * compaction, so a request with only `started`/`failed` phases does not label
- * the run. A request still fails a run that did not pass
- * `--allow-native-compaction` (ADR-0043), named through `refusal`.
+ * compaction. The label accepts either witness (ISSUE-524): a permitted
+ * captured request labels the run, because it is the vanilla replay's only
+ * witness that the host rewrote the transcript. A request still fails a run
+ * that did not pass `--allow-native-compaction` (ADR-0043), named through
+ * `refusal`.
  *
  * `invalidatesTranscript` is the wider predicate the four transcript checks
  * read (ISSUE-251): a permitted captured request rewrites the transcript
  * whether or not a journal `ended` event is present, and a vanilla run has no
- * journal at all. It is still false when the flag is off, so an unpermitted
+ * journal at all. The label reads the same predicate (ISSUE-524), so a
+ * journal-less vanilla replay that compacted is labelled and its seeded-row
+ * checks stand down. It is still false when the flag is off, so an unpermitted
  * compaction keeps failing, and false when nothing was captured or completed,
  * so the checks keep their ordinary force.
  * @param {{allowNativeCompaction?: boolean, requests?: object[],
@@ -4480,7 +4526,7 @@ export function nativeCompactionRecord(input = {}) {
     atMainRequests,
     journalEvents,
     journalCompleted: compactionCompleted,
-    label: allowed && observed
+    label: allowed && (observed || requestObserved)
       ? (input.arm === 'vanilla' ? VANILLA_COMPACTION_LABEL : NATIVE_COMPACTION_LABEL)
       : null,
     refusal: !allowed && (requestObserved || observed)
@@ -24417,7 +24463,16 @@ async function runCaptureLogReplay(opts) {
       /** The run's own step_finish rows, when present; completion is output + reasoning. */
       host: replayHostUsage,
       grant: null,
-    }), capturedAskRows, opts.tokenGrant, { exactSplit: false }));
+    }), capturedAskRows, opts.tokenGrant, {
+      exactSplit: false,
+      /**
+       * The replay's cap and label read the same journal-derived reading the
+       * replay record carries; a measured answer caps on the measured tokens,
+       * otherwise the estimate (ISSUE-524).
+       */
+      askUsage: result.ask?.hostUsage ?? null,
+      askMetering: result.ask?.metering,
+    }));
   if (replaySpend.ask !== null && typeof replaySpend.ask === 'object'
     && result.ask !== null && result.ask !== undefined) {
     replaySpend.ask.metering = result.ask.metering;
@@ -24814,17 +24869,14 @@ export function benchWireRun(context = {}) {
   const skipped = [];
   const schemaProblems = ledgerSchemaProblems(ledger);
   /**
-   * A host compaction rewrites the transcript. Two predicates, two subjects:
-   *
-   * - `compactionInvalidated` (a completed journal event) also stands the
-   *   seeded-copy replay checks down, because the host proved it rewrote the
-   *   stored rows.
-   * - `transcriptInvalidated` (a permitted captured request **or** a completed
-   *   event) stands the four transcript checks down. A vanilla run has no
-   *   journal, so its captured compaction request is the only witness there
-   *   is; it shows the host rewrote the transcript even without an `ended`
-   *   line (ISSUE-251). Both stay false when the flag is off, so an
-   *   unpermitted compaction keeps failing as before.
+   * A host compaction rewrites the transcript. One predicate, two witnesses:
+   * `compactionInvalidated` is true for a permitted captured compaction request
+   * **or** a completed journal event (ISSUE-524). A vanilla run has no journal,
+   * so its captured compaction request is the only witness there is; it shows
+   * the host rewrote the stored rows and the transcript even without an `ended`
+   * line (ISSUE-251). The seeded-copy replay checks and the four transcript
+   * checks read the same predicate (`transcriptInvalidated`). It stays false
+   * when the flag is off, so an unpermitted compaction keeps failing as before.
    */
   const compaction = nativeCompactionRecord({
     allowNativeCompaction: opts.allowNativeCompaction === true,
@@ -24838,8 +24890,8 @@ export function benchWireRun(context = {}) {
    * seq, a journal `ended` event without one is recorded unplaced.
    */
   const compactionBoundaries = compactionBoundariesOf(compaction);
-  const compactionInvalidated = compaction.allowed && compaction.observed;
   const transcriptInvalidated = compaction.invalidatesTranscript === true;
+  const compactionInvalidated = transcriptInvalidated;
   const record = (name, status, detail, options = {}) => assertions.push({
     name,
     status,
@@ -27712,11 +27764,22 @@ async function main() {
     if (loopbackRoute) return capturedSpendLanes(rows, opts.tokenGrant);
     const askRows = rows.filter(isAskRequestRow);
     const mainRows = rows.filter((row) => !isAskRequestRow(row));
+    /**
+     * The ask lane's measured reading, read from the journal written beside
+     * this arm. The cap adds it in place of the captured estimate when the
+     * generate answer states one, so a lane labelled `host-generate` is capped
+     * on the reading it claims (ISSUE-524). No journal (a vanilla arm) leaves
+     * `hostUsage` null and the estimate is the figure.
+     */
+    const askLane = askLaneReadingOf(readJournal(journalPath));
     return withAskLane(spendReading({
       captured: capturedSpend(mainRows, null),
       host: stepUsageFromStdout(stdout),
       grant: null,
-    }), askRows, opts.tokenGrant);
+    }), askRows, opts.tokenGrant, {
+      askUsage: askLane.hostUsage,
+      askMetering: askLane.metering,
+    });
   };
   let spendTimer = null;
   if (opts.tokenGrant !== null) {
@@ -27812,13 +27875,18 @@ async function main() {
      */
     const finalAskRows = requests.filter(isAskRequestRow);
     const finalMainRows = requests.filter((row) => !isAskRequestRow(row));
+    /** The same measured ask reading the poller used, on the finished journal. */
+    const finalAskLane = loopbackRoute ? null : askLaneReadingOf(readJournal(journalPath));
     const finalSpend = loopbackRoute
       ? capturedSpendLanes(requests, opts.tokenGrant)
       : withAskLane(spendReading({
         captured: capturedSpend(finalMainRows, null),
         host: stepUsageFromStdout(stdout),
         grant: null,
-      }), finalAskRows, opts.tokenGrant);
+      }), finalAskRows, opts.tokenGrant, {
+        askUsage: finalAskLane.hostUsage,
+        askMetering: finalAskLane.metering,
+      });
     spend.billedPromptTokens = finalSpend.billedPromptTokens;
     spend.billedCompletionTokens = finalSpend.billedCompletionTokens;
     spend.billedTokens = finalSpend.billedTokens;
@@ -29765,7 +29833,8 @@ async function main() {
       },
       /**
        * The run-level label. It is present only when a host compaction was
-       * permitted and observed: that run mixes product removals with host
+       * permitted and witnessed (a captured request or a completed journal
+       * event): that run mixes product removals with host
        * compaction and makes no delay claim. Null keeps a normal run's claim
        * label under `claim.label`.
        */
@@ -29783,7 +29852,8 @@ async function main() {
        * `billed*` is whichever reading the meter chose, named in
        * `source`/`meterBasis`. The grant total (`total*`) is conservative: when
        * the complete host `step_finish` reading is main-lane only (2.4.0 prints
-       * no ask step row), it adds the ask lane's captured estimate and names it
+       * no ask step row), it adds the ask lane's measured host reading when the
+       * generate answer stated one, else its captured estimate, and names it
        * under `addedAsk*`; the host-only figures stay in `hostReading`. A fired
        * grant is a failed run, and the record keeps the number the meter saw.
        */
@@ -29801,7 +29871,7 @@ async function main() {
        * ask lane from `spend.ask`. `recordOnly` is false when any applied line
        * exists. `metering` is derived from the journal: `host-generate` when
        * every fired ask line states a host reading, `partial` when only some do,
-       * and `unmeasured-host` when none do or no journal exists. The lane's
+       * and `estimate` when none do or no journal exists. The lane's
        * tokens are added to the grant total only when the host reading is
        * main-lane only (`spend.addedAsk*` names the addition).
        */

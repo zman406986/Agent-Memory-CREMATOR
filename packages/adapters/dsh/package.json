@@ -57,6 +57,14 @@
   "engines": {
     "node": ">=22.13.0 <23.0.0 || >=23.4.0"
   },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.0.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
   "scripts": {
     "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc -p tsconfig.build.json",

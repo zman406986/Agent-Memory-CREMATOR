@@ -14,6 +14,12 @@ npm install cremator-dsh
 `@cremator/core` installs as a dependency. Requires Node
 `>=22.13.0 <23.0.0 || >=23.4.0`.
 
+Host: `@deepseek-ai/dsh`, declared as an optional peer with the open range
+`>=0.0.0-0`.
+Tested against `0.2.1-rc.2` and `0.2.2-rc.1`. Any older or newer host resolves
+and is accepted: the adapter never refuses a host by version, so a future dsh
+keeps mounting.
+
 ### Install as a dsh bundle
 
 The package declares `dsh.bundle.patch` (`cordis.patch.yml`). Add it to a profile:
