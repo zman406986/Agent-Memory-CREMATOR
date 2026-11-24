@@ -80,9 +80,10 @@ export function checkSources(c: CheckContext, plans: readonly RulePlan[]): void 
     op.kind === "verdict" || op.kind === "proof" ? [[op.removalId, op.kind] as const] : [])));
   for (const plan of plans) {
     const report = reporter(c, plan.ruleId, null);
-    if (plan.baseRevision !== c.value.snapshot.revision) {
-      report("stale-revision", `Plan revision ${plan.baseRevision} differs from snapshot ${c.value.snapshot.revision}`);
-    }
+    // The plan's own revision is not compared (ISSUE-605): the stability claim
+    // is the removal span's node identity, which every source check below
+    // proves by node id, hash and length. A transcript that only appended
+    // outside that span leaves every claim true, so it never refuses here.
     const removalIds = new Set<string>();
     for (const removal of plan.removals) {
       if (removalIds.has(removal.id) || removal.sources.length === 0) {

@@ -32,6 +32,28 @@ const result = (status: EngineResult['status'], validation: ValidationResult | n
 type EntryDecisionCode = EntryShapeRefusal | 'missing-stamp' | 'keepall';
 
 /**
+ * ISSUE-605: the stability check reads the selected removal span's node
+ * identities, not the session's revision. A transcript is append-only, so a
+ * node appended after the span cannot falsify a removal already selected: every
+ * removed source must still sit at its own index with its own id. Only when all
+ * of them do is the plan prepared again against the live nodes; a span node
+ * that moved, changed or vanished is not recoverable that way, and the port's
+ * whole-session `stale-revision` refusal stays the answer. A plan with no
+ * removal has no span to check, so it keeps the revision refusal it had.
+ */
+function removalSpanIntact(
+  plans: readonly RulePlan[], prepared: SessionSnapshot, live: SessionSnapshot,
+): boolean {
+  const removed = plans.flatMap(plan => plan.removals.flatMap(removal =>
+    removal.sources.map(source => source.source.nodeId)));
+  if (removed.length === 0) return false;
+  return removed.every(id => {
+    const index = prepared.nodes.findIndex(node => node.id === id);
+    return index >= 0 && live.nodes[index]?.id === id;
+  });
+}
+
+/**
  * Optional cancellation for one `process` call. A signal or deadline releases
  * the queue even while a host call is still hung; the pass then answers
  * `recovery-pending`, because nothing it attempted can be proved safe.
@@ -627,14 +649,23 @@ export class RacoonsEngine {
     if ((o as FencedOptions)[PASS_FENCE]?.cancelled === true) {
       return this.cancelled(input, 'the pass was cancelled before validation');
     }
-    const validation = await guard.validate({ input, snapshot,
+    // ISSUE-605: one preflight against the live session. When it moved since
+    // the snapshot these plans were made from and every removal source is still
+    // at its own index (appends only), the same plans are prepared again
+    // against the live nodes — which re-prices the revert — and applied with
+    // the live base revision. There is no second look: a change after this
+    // point is refused by the port's existing `stale-revision` reason.
+    const live = await o.port.snapshot();
+    const target = live.revision !== snapshot.revision && removalSpanIntact(plans, snapshot, live)
+      ? live : snapshot;
+    const validation = await guard.validate({ input, snapshot: target,
       capabilities: o.capabilities, config: o.config, plans,
       sealedEpisodeIds, nowMs });
     const validationEvent = { kind: 'validation' as const, sessionId: o.sessionId,
       eventKey: `engine-validation:${JSON.stringify([o.sessionId, input.eventId])}`,
       atMs: nowMs, eventId: input.eventId, ok: validation.ok,
       issues: validation.ok ? [] : validation.issues, breaker: validation.breaker,
-      engineTurnOrdinal: snapshot.currentTurnOrdinal };
+      engineTurnOrdinal: target.currentTurnOrdinal };
     this.emit({ kind: 'validation', eventId: input.eventId, ok: validation.ok,
       issues: validationEvent.issues, breaker: validation.breaker });
     // A transient storage refusal is not the event's verdict (ISSUE-313 is the

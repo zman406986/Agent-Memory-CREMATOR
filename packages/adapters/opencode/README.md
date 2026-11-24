@@ -187,7 +187,9 @@ Each flag is true only where a code path honours it, and false only where the re
 
 One durable ledger per session (ADR-0013): `<crematorStorageRoot>/sessions/<sessionId>/ledger.sqlite`
 with its blob tree in the sibling `blobs/` directory. A recall id keeps working after a restart of
-the same session. `':memory:'` is for tests only; no configuration value selects it.
+the same session. The same directory holds `mount-state.json` (durable ask and install facts,
+ADR-0063) and `last-request.json` (the last assembled request, ADR-0076), so `/cremate` works right
+after a restart. `':memory:'` is for tests only; no configuration value selects it.
 
 The default root is `~/.cremator/opencode` (`C:\Users\TZhen\.cremator\opencode` on one owner
 device, `C:\Users\TZ\.cremator\opencode` on the other). The host's own data directory is never guessed and

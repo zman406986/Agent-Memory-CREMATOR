@@ -120,7 +120,23 @@ function fillOf(data, session, info) {
   });
 }
 
-/** Applies one lifecycle event to the store; `failed` also raises a toast. */
+/**
+ * One toast per pass. The RPC reply and the event stream both describe the same
+ * pass; whichever lands first shows it, and its twin inside the window is
+ * dropped. A pass started by the location-scoped server command has only the
+ * event, so the event path still reports it.
+ */
+let lastToastKey = '';
+let lastToastAt = 0;
+function toastOnce(ctx, key, description, variant) {
+  const now = Date.now();
+  if (lastToastKey === key && now - lastToastAt < 2000) return;
+  lastToastKey = key;
+  lastToastAt = now;
+  ctx.toast.show({ title: 'CREMATOR', description, variant });
+}
+
+/** Applies one lifecycle event to the store; a finished pass raises one toast. */
 function applyEvent(ctx, setStore, server, event) {
   if (event === null || typeof event !== 'object') return;
   const data = payload(event);
@@ -134,9 +150,19 @@ function applyEvent(ctx, setStore, server, event) {
     return;
   }
   if (event.type === ENDED) {
+    const fired = data.fired === true;
+    const reason = words(data.reason, fired ? 'table' : 'no-fire');
     update(setStore, key, (entry) => {
       entry.running = false;
+      entry.fired = fired;
+      entry.reason = reason;
+      entry.rows = whole(data.rows);
     });
+    toastOnce(ctx, `${key}\n${fired ? 'fired' : reason}`,
+      fired
+        ? `Cremation asked ${whole(data.rows)} row(s); removals apply at the next step.`
+        : `Cremation: ${reason}.`,
+      fired ? 'info' : 'warning');
     return;
   }
   if (event.type === FAILED) {
@@ -145,11 +171,7 @@ function applyEvent(ctx, setStore, server, event) {
       entry.running = false;
       entry.failed = reason;
     });
-    ctx.toast.show({
-      title: 'CREMATOR',
-      description: `Cremation failed: ${reason}.`,
-      variant: 'error',
-    });
+    toastOnce(ctx, `${key}\n${reason}`, `Cremation: ${reason}.`, 'warning');
     return;
   }
   if (event.type === APPLIED) {
@@ -216,12 +238,19 @@ function cremate(ctx, setStore, session) {
   }).then((result) => {
     const output = outputOf(result);
     const fired = output.fired === true;
+    const reason = words(output.reason, fired ? 'table' : 'no-fire');
+    const rows = whole(output.rows);
     update(setStore, session.key, (entry) => {
       entry.running = false;
       entry.fired = fired;
-      entry.reason = words(output.reason, fired ? 'table' : 'no-fire');
-      entry.rows = whole(output.rows);
+      entry.reason = reason;
+      entry.rows = rows;
     });
+    toastOnce(ctx, `${session.server.id}\n${session.id}\n${fired ? 'fired' : reason}`,
+      fired
+        ? `Cremation asked ${rows} row(s); removals apply at the next step.`
+        : `Cremation: ${reason}.`,
+      fired ? 'info' : 'warning');
   }).catch((error) => {
     const reason = reasonOf(error);
     update(setStore, session.key, (entry) => {

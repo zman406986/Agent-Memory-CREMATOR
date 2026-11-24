@@ -107,6 +107,8 @@ const DECLARED = {
   appendRecords: false,
   // The applied-plan index is seeded from the ledger at open, so a restart
   // re-applies the banked removals instead of treating them as new (ISSUE-409).
+  // The last assembled request is saved beside the ledger for the manual pass
+  // (ADR-0076); the host conversation itself is still rebuilt by the host.
   rehydrateOnResume: false,
 } as const;
 

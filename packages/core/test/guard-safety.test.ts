@@ -12,9 +12,14 @@ function guard(): Guard {
   return new Guard({ ledger: ledger(), initialState: { consecutiveValidationFailures: 0, disabled: false } });
 }
 
-/** A refusal streak of one: the same valid plan with a stale base revision. */
-function stalePlan(value: ValidationInput): ValidationInput {
-  return { ...value, plans: value.plans.map(p => ({ ...p, baseRevision: "old" })) };
+/**
+ * A refusal streak of one: the same valid plan with one operation kind no check
+ * accepts. The stale base revision this used to forge is no longer a refusal
+ * (ISSUE-605: only the removal span's node identities are compared).
+ */
+function refusedPlan(value: ValidationInput): ValidationInput {
+  return { ...value, plans: value.plans.map(p => ({ ...p,
+    operations: [{ kind: "not-an-op" }] as unknown as typeof p.operations })) };
 }
 
 /**
@@ -113,7 +118,7 @@ test("snapshot and plan rows: every broken row is refused by name, the honest ro
 });
 
 test("the breaker quiets after the limit, re-arms on a completed validation, and concurrent refusals cannot race past breaker-disabled", async () => {
-  const g = guard(), v = seal(), invalid = stalePlan(v);
+  const g = guard(), v = seal(), invalid = refusedPlan(v);
 
   await g.validate(invalid);
   assert.equal(g.state().consecutiveValidationFailures, 1, "row: one refusal — the streak is one");
@@ -134,7 +139,7 @@ test("the breaker quiets after the limit, re-arms on a completed validation, and
     "row: a real application after the quiet — it passes again");
 
   // recordNoPlan is queued like a validation, so a refusal cannot be overtaken.
-  const queued = guard(), w = seal(), bad = stalePlan(w);
+  const queued = guard(), w = seal(), bad = refusedPlan(w);
   const [refusal, noPlan, valid] = await Promise.all(
     [queued.validate(bad), queued.recordNoPlan(), queued.validate(w)]);
   assert.equal(refusal.ok, false, "row: queued — one refusal is refused");
@@ -144,7 +149,7 @@ test("the breaker quiets after the limit, re-arms on a completed validation, and
   assert.equal(noPlan, undefined, "row: queued — recordNoPlan writes no ledger event");
 
   // The race: two concurrent refusals must reach the quiet one at a time.
-  const raced = guard(), base = entry(), stale = stalePlan(base);
+  const raced = guard(), base = entry(), stale = refusedPlan(base);
   const [first, second, third] = await Promise.all(
     [raced.validate(stale), raced.validate(stale), raced.validate(base)]);
   assert.equal(first.breaker.consecutiveValidationFailures, 1,

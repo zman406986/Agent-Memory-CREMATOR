@@ -36,7 +36,6 @@ function replaceSealOp(v: ValidationInput): ValidationInput {
  */
 const PLAN_CASES: readonly [ValidationCode, () => ValidationInput][] = [
   ["invalid-plan", () => replan(entry(), { operations: [{ kind: "not-an-op" }] as unknown as readonly Operation[] })],
-  ["stale-revision", () => replan(entry(), { baseRevision: "old" })],
   ["wrong-rule", () => replan(entry(), { ruleId: "seal" })],
   ["unknown-source", () => sourceChange(entry(), { nodeId: "missing" })],
   ["source-hash-mismatch", () => sourceChange(entry(), { sha256: "0".repeat(64) })],

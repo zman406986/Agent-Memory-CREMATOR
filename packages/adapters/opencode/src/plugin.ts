@@ -154,6 +154,9 @@ import {
   writeDurableInstall, writeDurableReceipt, writeDurableAskState,
 } from './mount-state.js';
 import type { DurableAskState, DurableAskVerdict } from './mount-state.js';
+import {
+  readRequestSnapshot, requestSnapshotPath, writeRequestSnapshot,
+} from './request-snapshot.js';
 import { OPENCODE_RECORD_PREFIX, opencodeToolNodeId } from './snapshot.js';
 import { OpencodeStorageError, openLedger, resolveStorage, sessionStorage } from './storage.js';
 import type { OpencodeStorageOptions, StorageSelection, StorageTarget } from './storage.js';
@@ -278,6 +281,11 @@ export type OpencodeJournalKind =
   // journal can tell a missing `/cremate` menu entry from a failed registration.
   | 'command-registration'
   | 'cremate'
+  // ADR-0076: the array the last request shipped was saved beside the ledger,
+  // a save failed by name, or a fresh process restored a save for `/cremate`.
+  | 'request-saved'
+  | 'request-save-error'
+  | 'request-restored'
   | 'ask'
   | 'ask-error'
   | 'ask-apply'
@@ -574,6 +582,14 @@ export interface OpencodeSessionEntry {
    * pass commits, and the idle fallback reads it after that commit.
    */
   lastMessages: readonly OpencodeMessage[] | null;
+  /**
+   * ADR-0076 (ISSUE-604): the session's saved-request sidecar path, or null for
+   * a `':memory:'` target. The transform writes the array that ships here, and
+   * a manual pass with no live array reads it back.
+   */
+  readonly requestPath: string | null;
+  /** The revision last written to `requestPath`; a repeat skips the write. */
+  savedRequestRevision: string | null;
   /**
    * The estimates of the requests this mount has measured, oldest first. Each
    * `session.step.ended` row consumes one entry, so a row that arrives after the
@@ -1740,7 +1756,7 @@ export interface OpencodeMountPort extends ApplicationPort {
 export type OpencodeCremateReason =
   | 'closing' | 'no-session' | 'no-array' | 'ask-off' | 'ask-in-flight'
   | 'ask-standdown' | 'no-rows' | 'claimed-unit' | 'error'
-  | 'table' | 'no-fire' | 'claimed-revision';
+  | 'request-unreadable' | 'table' | 'no-fire' | 'claimed-revision';
 
 /** What one manual pass answers (ADR-0073 decision 2). */
 export interface OpencodeCremateResult {
@@ -2995,7 +3011,8 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       parametersDerivedFrom: null, observedModel: null,
       dedupeClasses: options.dedupeClasses ?? {},
       ownedLedger: options.openLedger === undefined,
-      lastMessages: null, pendingEstimates: [], droppedEstimates: 0,
+      lastMessages: null, requestPath: requestSnapshotPath(target),
+      savedRequestRevision: null, pendingEstimates: [], droppedEstimates: 0,
       usageSeen: new Set<string>(),
       askedUnitIds: new Set<UnitId>(
         (seededAsk?.askedUnitIds ?? []) as readonly UnitId[]),
@@ -3186,6 +3203,33 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   function recordShippedNodes(entry: OpencodeSessionEntry, shipped: SessionSnapshot): void {
     entry.pendingSeenNodeIds.clear();
     for (const node of shipped.nodes) entry.pendingSeenNodeIds.add(node.id);
+  }
+
+  /**
+   * ADR-0076 (ISSUE-604): save the array this request ships, so a later process
+   * can run `/cremate` without waiting for a new request. A memory target has no
+   * session directory and skips; an unchanged revision skips; a save after the
+   * session was released skips. A write failure is named and changes nothing
+   * about the request.
+   */
+  function persistRequest(
+    entry: OpencodeSessionEntry, sessionId: string,
+    messages: readonly OpencodeMessage[], revision: string | null,
+  ): void {
+    if (entry.requestPath === null || messages.length === 0) return;
+    if (sessions.get(sessionId) !== entry) return;
+    if (revision !== null && revision === entry.savedRequestRevision) return;
+    const written = writeRequestSnapshot(entry.requestPath, {
+      sessionId, revision, atMs: clock.nowMs(), messages,
+    });
+    if (!written.ok) {
+      journal('request-save-error', { sessionId, path: entry.requestPath,
+        message: written.message });
+      return;
+    }
+    entry.savedRequestRevision = revision;
+    journal('request-saved', { sessionId, revision, messages: messages.length,
+      bytes: written.bytes });
   }
 
   /**
@@ -3391,6 +3435,12 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     const observeRequest = (array: readonly OpencodeMessage[]): SessionSnapshot =>
       entry.port.observe(array, entry.completedThroughTurnOrdinal === null
         ? {} : { completedThroughTurnOrdinal: entry.completedThroughTurnOrdinal });
+    /**
+     * ADR-0076: the revision the array that ships carries. The save below names
+     * it, and a failed pass (null) still saves the request, because the host
+     * ships it unmodified.
+     */
+    let shippedRevision: string | null = null;
     try {
       let observed = observeRequest(messages);
       // The event id names the request's content and how many times that content
@@ -3703,6 +3753,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       // changed it, so re-derive instead of describing the pre-commit bytes.
       const shipped: SessionSnapshot = committed
         ? observeRequest(messages) : await entry.port.snapshot();
+      shippedRevision = shipped.revision;
       // The array that ships is the request the model receives, so its nodes
       // become eligible at the next transform (ADR-0054 decision 7).
       recordShippedNodes(entry, shipped);
@@ -3727,6 +3778,10 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       }
       journal('transform-error', { sessionId,
         message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      // ADR-0076: the array the host ships is saved whether the pass succeeded
+      // or not, so a restart can still run the manual pass over it.
+      persistRequest(entry, sessionId, messages, shippedRevision);
     }
   }
 
@@ -4426,6 +4481,59 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     });
   }
   /**
+   * ADR-0076 (ISSUE-604): the manual pass's fallback when this process has no
+   * live array. The saved request is the array the last transform shipped, so
+   * its nodes are marked as the shipped set exactly as that transform left
+   * them, and the same table pass runs over it. Only `/cremate` calls this; no
+   * automatic trigger reads the save.
+   */
+  type RequestRestore =
+    | { readonly kind: 'none' }
+    | { readonly kind: 'restored'; readonly entry: OpencodeSessionEntry }
+    | { readonly kind: 'refused' };
+
+  async function restoreRequest(sessionId: string): Promise<RequestRestore> {
+    let target: StorageTarget;
+    try {
+      target = sessionStorage(selection, sessionId);
+    } catch {
+      // An id storage refuses is named by the open path; the manual pass keeps
+      // its existing answer instead of opening a ledger for it.
+      return { kind: 'none' };
+    }
+    const read = readRequestSnapshot(requestSnapshotPath(target), sessionId);
+    if (read.snapshot === null) {
+      if (read.rejected !== undefined) {
+        journal('mount-state-error', { sessionId, fact: 'request', message: read.rejected });
+        return { kind: 'refused' };
+      }
+      return { kind: 'none' };
+    }
+    const entry = await sessionFor(sessionId, false);
+    if (entry === null) return { kind: 'none' };
+    /**
+     * A context hook may have shipped a live array while the read ran. The live
+     * array wins; the save is never applied over a newer request.
+     */
+    if (entry.lastMessages === null) {
+      try {
+        const shipped = entry.port.observe(read.snapshot.messages);
+        entry.lastMessages = read.snapshot.messages;
+        recordShippedNodes(entry, shipped);
+        entry.savedRequestRevision = read.snapshot.revision;
+        journal('request-restored', { sessionId, revision: read.snapshot.revision,
+          messages: read.snapshot.messages.length, atMs: read.snapshot.atMs });
+      } catch (error) {
+        journal('mount-state-error', { sessionId, fact: 'request',
+          message: 'the saved request could not be observed: '
+            + (error instanceof Error ? error.message : String(error)) });
+        return { kind: 'refused' };
+      }
+    }
+    return { kind: 'restored', entry };
+  }
+
+  /**
    * One manual `/cremate` (ADR-0050 Amendment 2026-11-18, second): the same
    * table pass as the depth trigger, on demand. The latch is not consulted, but
    * the same-revision guard and every ask guard still apply, and the pass
@@ -4462,12 +4570,28 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       }
       return refuse('closing');
     }
-    const entry = sessions.get(sessionId);
+    let entry = sessions.get(sessionId);
+    if ((entry === undefined || entry.lastMessages === null) && askGrammar !== undefined) {
+      /**
+       * ADR-0076: a restart loses the in-memory array. The session's save is
+       * the last request this mount shipped, so the manual pass can run over it
+       * without waiting for a new message. A corrupt save is named, never read
+       * as an empty request.
+       */
+      const restored = await restoreRequest(sessionId);
+      if (restored.kind === 'refused') {
+        journal('cremate', { sessionId: sessionId || null, fired: false,
+          reason: 'request-unreadable' });
+        return refuse('request-unreadable');
+      }
+      if (restored.kind === 'restored') entry = restored.entry;
+    }
     if (entry === undefined || entry.lastMessages === null) {
       const reason: OpencodeCremateReason = entry === undefined ? 'no-session' : 'no-array';
       journal('cremate', { sessionId: sessionId || null, fired: false, reason });
       return refuse(reason);
     }
+    const messages = entry.lastMessages;
     if (askGrammar === undefined) {
       journal('cremate', { sessionId, fired: false, reason: 'ask-off' });
       return refuse('ask-off');
@@ -4508,7 +4632,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       let batch: OpencodeAskBatch | null = null;
       try {
         batch = buildOpencodeAskBatch({
-          sessionId, messages: entry.lastMessages, port: entry.port,
+          sessionId, messages, port: entry.port,
           seenNodeIds: entry.seenNodeIds, askedUnitIds: entry.askedUnitIds,
           round: entry.passRound, classes: entry.dedupeClasses,
           appliedPlans: entry.appliedPlans,
