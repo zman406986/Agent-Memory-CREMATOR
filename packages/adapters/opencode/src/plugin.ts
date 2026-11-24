@@ -45,10 +45,11 @@
  *     settled to the outgoing array and change nothing else: no depth reading,
  *     no table, no model call, no meter/latch/idle/ask-state movement, and
  *     never the host's compaction `result`.
- *   - `context.command.transform` (when the host exposes it) → the manual
- *     `/cremate` command. It runs the same table pass on demand, not gated by
+ *   - `context.rpc.register` → the server-wide `cremate` method the desktop and
+ *     terminal parts call. It runs the same table pass on demand, not gated by
  *     the depth latch; the same-revision guard still applies, and the pass
- *     re-arms the latch like any completed pass.
+ *     re-arms the latch like any completed pass. The parts own the `/cremate`
+ *     menu entry; the mount registers no location-scoped command (ISSUE-607).
  *   - `tool.transform` → the one declared tool: `necromancy` (restore). The
  *     manual `forget` tool is gone (ISSUE-518).
  *   - `session.idle` (event) → one turn-end observation. The shipped mount
@@ -176,8 +177,10 @@ export const OPENCODE_PLUGIN_NAME = 'cremator-opencode';
 export const OPENCODE_SUBAGENT_TOOL = 'subagent';
 
 /**
- * The manual command this mount registers through `context.command.transform`
- * when the host exposes that seam. The host lists and invokes it as `/cremate`.
+ * The manual command name the menu parts register — the desktop part's `Command`
+ * and the terminal part's keymap entry. The mount registers no command itself: a
+ * server-side registration is location-scoped and would duplicate the parts'
+ * entry (ISSUE-539, ISSUE-607).
  */
 export const OPENCODE_PRUNE_COMMAND = 'cremate';
 
@@ -5653,9 +5656,9 @@ async function sharedAcquire(
 
 /**
  * The plugin a host mounts through its `plugins` list. `setup` registers the
- * context hook, the tool, the manual `/cremate` command (when the host exposes
- * `context.command`) and the observer, starts one event consumer, and returns
- * the cleanup that stops it and closes every owned ledger.
+ * context hook, the tool, the server-wide RPC the menu parts call and the
+ * observer, starts one event consumer, and returns the cleanup that stops it
+ * and closes every owned ledger.
  */
 export function createOpencodePlugin(options: OpencodeMountOptions = {}): OpencodePluginDefinition {
   return Object.freeze({
@@ -5813,41 +5816,12 @@ export function createOpencodePlugin(options: OpencodeMountOptions = {}): Openco
           } catch { /* a journal sink must never change an outcome */ }
         }
         /**
-         * The manual `/cremate` command (2.4.0's `Context.command`, the seam the
-         * audit named as unused). It runs the mount's same table pass on demand.
-         * A host without the seam still mounts; a throwing registration is
-         * journalled and leaves the hooks working.
+         * The manual `/cremate` command is registered by the menu parts — the
+         * desktop `Command` and the terminal keymap layer — which call the
+         * server-wide RPC below. A command registered here through
+         * `context.command.transform` would belong to the server's own folder
+         * only and would duplicate the parts' entry (ISSUE-539, ISSUE-607).
          */
-        if (context.command !== undefined) {
-          try {
-            await context.command.transform((editor) => {
-              editor.add({
-                name: OPENCODE_PRUNE_COMMAND,
-                description: 'Run one CREMATOR table pass now.',
-                execute: async (input) => {
-                  if (inert()) return;
-                  const id = typeof input?.sessionID === 'string' ? input.sessionID : '';
-                  await mount.cremate(id);
-                },
-              });
-            });
-            try {
-              emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
-                status: 'registered', name: OPENCODE_PRUNE_COMMAND }));
-            } catch { /* a journal sink must never change an outcome */ }
-          } catch (error) {
-            try {
-              emit(Object.freeze({ kind: 'command-error', atMs: Date.now(),
-                reason: 'register-failed',
-                message: error instanceof Error ? error.message : String(error) }));
-            } catch { /* a journal sink must never change an outcome */ }
-          }
-        } else {
-          try {
-            emit(Object.freeze({ kind: 'command-registration', atMs: Date.now(),
-              status: 'absent', reason: 'no-command-seam', name: OPENCODE_PRUNE_COMMAND }));
-          } catch { /* a journal sink must never change an outcome */ }
-        }
         /**
          * The server-wide door the menu parts use. A command registered through
          * `context.command.transform` belongs to the server's own location; a

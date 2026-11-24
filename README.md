@@ -2,8 +2,7 @@
 
 Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
-Early stage. The packages are on npm. Install the adapter you use; dsh is not
-publicly distributed. The `examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
+Early stage. The packages are on npm. Install the adapter you use. The `examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
 been run against real dsh. The OpenCode adapter passes functional tests against a fake host only;
 its live-run evidence is withdrawn (see [its README](packages/adapters/opencode/README.md)). This
 library does not establish any effect on answer quality.
@@ -118,7 +117,7 @@ npm install cremator-opencode
 `@cremator/core` installs automatically. For a source checkout, run `npm install`
 and `npm run build` in the cloned repository.
 
-dsh is not publicly distributed. The only example that runs today without dsh is
+The only example that runs today without dsh is
 `examples/core-offline/`, which drives the core alone:
 
 ```sh

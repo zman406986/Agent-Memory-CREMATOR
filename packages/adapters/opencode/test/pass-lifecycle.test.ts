@@ -10,7 +10,7 @@ import {
   CREMATE_RPC_EVENT_FAILED, CREMATE_RPC_EVENT_STARTED,
 } from '../src/cremate-rpc.js';
 import type {
-  OpencodeCommandDefinition, OpencodeCommandInvocation, OpencodeHostEvent,
+  OpencodeHostEvent,
   OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext, OpencodeRpcRegistration,
   OpencodeSessionContext,
 } from '../src/host.js';
@@ -73,7 +73,6 @@ interface FakeHost {
   definition: unknown;
   runContext(messages: OpencodeMessage[]): Promise<void>;
   cremate(input: unknown): Promise<CremateReply>;
-  runCommand(input: unknown): Promise<void>;
 }
 
 /** `withEvents: false` answers a registration with no `events` channel. */
@@ -83,7 +82,6 @@ function fakeHost(options: { readonly withEvents?: boolean; readonly reply?: str
   const journal: OpencodeJournalRecord[] = [];
   let contextHook: ((input: OpencodeSessionContext) => Promise<void> | void) | null = null;
   let handler: ((input: unknown, context: unknown) => Promise<unknown> | unknown) | null = null;
-  let command: OpencodeCommandDefinition | null = null;
   const host: FakeHost = {
     emitted, journal, stream, definition: null,
     runContext: async (messages) => {
@@ -93,10 +91,6 @@ function fakeHost(options: { readonly withEvents?: boolean; readonly reply?: str
     cremate: async (input) => {
       assert.ok(handler !== null, 'the RPC handler registered');
       return await handler(input, {}) as CremateReply;
-    },
-    runCommand: async (input) => {
-      assert.ok(command !== null, 'the /cremate command registered');
-      await command.execute(input as OpencodeCommandInvocation);
     },
     context: {
       options: {},
@@ -117,9 +111,6 @@ function fakeHost(options: { readonly withEvents?: boolean; readonly reply?: str
         transform: async (callback) => { await callback({ add: () => {} }); return {}; },
         hook: async () => ({}),
       },
-      command: { transform: async (callback) => {
-        await callback({ add: (definition) => { command = definition; } }); return {};
-      } },
       rpc: { register: async (definition, handlers): Promise<OpencodeRpcRegistration> => {
         host.definition = definition;
         handler = handlers['cremate'] ?? null;
@@ -171,9 +162,9 @@ test('a fired manual pass publishes started then ended', async () => {
     assert.deepEqual(host.emitted[1]?.data,
       { sessionID: sessionId, fired: true, reason: 'table', rows: 2 });
 
-    // The command lane runs the same `mount.cremate`: a second /cremate at the
+    // The RPC lane runs the same `mount.cremate`: a second /cremate at the
     // same revision is refused by the durable unit claim, and `failed` goes out.
-    await host.runCommand({ sessionID: sessionId });
+    await host.cremate({ sessionID: sessionId });
     assert.deepEqual(host.emitted.at(-1),
       { name: CREMATE_RPC_EVENT_FAILED, data: { sessionID: sessionId, reason: 'claimed-unit' } });
     assert.equal(eventNames(host).filter(name => name === CREMATE_RPC_EVENT_STARTED).length, 1,

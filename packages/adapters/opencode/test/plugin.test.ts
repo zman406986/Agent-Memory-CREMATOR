@@ -32,12 +32,12 @@ import { createOpencodeCapabilities } from '../src/capabilities.js';
 import { buildOpencodeAskBatch } from '../src/ask.js';
 import { MOUNT_STATE_FILE, readDurableAskState } from '../src/mount-state.js';
 import type {
-  OpencodeAfterToolInput, OpencodeCommandDefinition, OpencodeGenerateInput,
+  OpencodeAfterToolInput, OpencodeGenerateInput,
   OpencodeHostEvent, OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext,
   OpencodeSessionContext, OpencodeToolDefinition, OpencodeToolResultValue,
 } from '../src/host.js';
 import {
-  OPENCODE_PRUNE_COMMAND, OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
+  OPENCODE_SUBAGENT_TOOL, OPENCODE_TEST_EXCLUDE_TOOLS,
   appliedRewritesAt, applyOpencodeAskVerdicts, createOpencodeMount, createOpencodePlugin,
   mountOptionsFromHost, opencodeAskStanddown, releaseCancelledUnits,
 } from '../src/plugin.js';
@@ -437,8 +437,6 @@ interface FakeHost {
   readonly context: OpencodePluginContext;
   readonly stream: FakeEventStream;
   readonly added: OpencodeToolDefinition[];
-  /** Every command the mount registered through `context.command.transform`. */
-  readonly commands: OpencodeCommandDefinition[];
   /** Every `session.generate` call the mount made, in order. */
   readonly generateCalls: OpencodeGenerateInput[];
   /**
@@ -460,7 +458,6 @@ function fakeHost(
 ): FakeHost {
   const stream = new FakeEventStream();
   const added: OpencodeToolDefinition[] = [];
-  const commands: OpencodeCommandDefinition[] = [];
   const generateCalls: OpencodeGenerateInput[] = [];
   const subscribedTypes: (readonly string[] | undefined)[] = [];
   const host: FakeHost = {
@@ -505,12 +502,6 @@ function fakeHost(
           return {};
         },
       },
-      command: {
-        transform: async (callback) => {
-          await callback({ add: definition => { commands.push(definition); } });
-          return {};
-        },
-      },
       event: {
         subscribe: (subscribeOptions?: { readonly types?: readonly string[] }) => {
           subscribedTypes.push(subscribeOptions?.types);
@@ -520,7 +511,6 @@ function fakeHost(
     },
     stream,
     added,
-    commands,
     generateCalls,
     subscribedTypes,
     generateReply: '{"1":{"forgetall":true,"summary":"mock ask answer"}}',
@@ -4560,50 +4550,44 @@ test('the ask mount option and its host-seam check', async () => {
   } finally { await cleanup(); }
 });
 
-test('the /cremate command runs the table pass on demand, below the bar', async () => {
+test('the manual pass runs the table on demand, below the bar', async () => {
   const lines = journalLines();
-  const host = fakeHost();
-  const plugin = createOpencodePlugin({
+  let asks = 0;
+  const mount = createOpencodeMount({
     storage: { databasePath: ':memory:' },
     contextWindowTokens: 400_000,
     pruneThresholdTokens: 60_000,
     askGrammar: 'prune-two-option',
+    askGenerate: async () => {
+      asks += 1;
+      return { text: '{"1":{"forgetall":true,"summary":"mock ask answer"}}' };
+    },
     journal: record => lines.records.push(record),
   });
-  const cleanup = await plugin.setup(host.context);
   try {
-    assert.equal(host.commands.length, 1, 'the host seam registered one command');
-    const command = host.commands[0];
-    assert.equal(command?.name, OPENCODE_PRUNE_COMMAND, 'the command is /cremate');
-    assert.match(String(command?.description), /table pass/u,
-      'the command says what it runs');
-    assert.ok(lines.records.some(record => record.kind === 'command-registration'
-      && record['status'] === 'registered'), 'the journal names the registered command');
     // Two revisions carry the unit; neither crosses the 60k bar.
-    await host.contextHook?.(sessionContext(largeHostMessages()));
-    await host.contextHook?.(sessionContext(largeHostMessages()));
-    assert.equal(host.generateCalls.length, 0,
-      'the automatic ask stays quiet below the bar');
-    await command?.execute({ sessionID: sessionId });
-    assert.equal(host.generateCalls.length, 1,
-      'the command runs the same table pass without a crossing');
+    await mount.transform(sessionId, largeHostMessages());
+    await mount.transform(sessionId, largeHostMessages());
+    assert.equal(asks, 0, 'the automatic ask stays quiet below the bar');
+    const first = await mount.cremate(sessionId);
+    assert.equal(first.fired, true, 'the manual pass tables without a crossing');
+    assert.equal(asks, 1, 'the manual pass runs the same table');
     const ask = lines.of('ask').at(-1);
-    assert.equal(ask?.['origin'], 'command', 'the fire names the command origin');
-    assert.equal(ask?.['rowCount'], 1, 'the command table names the carried unit');
+    assert.equal(ask?.['origin'], 'command', 'the fire names the manual origin');
+    assert.equal(ask?.['rowCount'], 1, 'the manual table names the carried unit');
     assert.equal(lines.of('cremate').at(-1)?.['fired'], true,
-      'the command journals its fire');
+      'the manual pass journals its fire');
     assert.equal(lines.of('cremate').at(-1)?.['reason'], 'table');
     // The same-revision guard still holds: one table per revision, however it
     // was requested. ISSUE-486: the carried unit is dropped by its durable
     // claim, so the refusal is named `claimed-unit`, not an empty `no-rows`.
-    await command?.execute({ sessionID: sessionId });
-    assert.equal(host.generateCalls.length, 1,
-      'a second /cremate at the same revision is guarded');
-    assert.equal(lines.of('cremate').at(-1)?.['reason'], 'claimed-unit',
-      'the only unit is still in the array, dropped by its durable unit claim');
+    const second = await mount.cremate(sessionId);
+    assert.equal(second.fired, false);
+    assert.equal(second.reason, 'claimed-unit');
+    assert.equal(asks, 1, 'a second pass at the same revision is guarded');
     assert.equal(lines.of('cremate').at(-1)?.['claims'], 1,
-      'the command line names the claimed row it suppressed');
-  } finally { await cleanup(); }
+      'the manual line names the claimed row it suppressed');
+  } finally { await mount.close(); }
 
   // With the ask off there is no table to run; the command says so instead of
   // pretending it did something.

@@ -6,7 +6,7 @@
 // locations against one root and pins the behaviour the owner saw broken:
 //
 //   - a session in the second folder reaches the mount, and `/cremate` (the
-//     command and the RPC the menu parts call) fires for it;
+//     RPC the menu parts call) fires for it;
 //   - the ask uses the activation that served the session, not the first one;
 //   - one event delivered to both location streams is processed once;
 //   - cleaning up one location leaves the other working; the last cleanup
@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type {
-  OpencodeAfterToolInput, OpencodeCommandDefinition, OpencodeCompactionContext,
+  OpencodeAfterToolInput, OpencodeCompactionContext,
   OpencodeHostEvent, OpencodeIdleHookInput, OpencodeMessage, OpencodePluginContext,
   OpencodeSessionContext, OpencodeToolDefinition,
 } from '../src/host.js';
@@ -75,7 +75,6 @@ interface FakeHost {
   readonly context: OpencodePluginContext;
   readonly stream: EventStream;
   readonly tools: OpencodeToolDefinition[];
-  readonly commands: OpencodeCommandDefinition[];
   readonly rpc: RegisteredRpc[];
   contextHook: ((input: OpencodeSessionContext) => Promise<void> | void) | null;
   idleHook: ((input: OpencodeIdleHookInput) => Promise<void> | void) | null;
@@ -85,10 +84,9 @@ interface FakeHost {
 function fakeHost(directory: string): FakeHost {
   const stream = new EventStream();
   const tools: OpencodeToolDefinition[] = [];
-  const commands: OpencodeCommandDefinition[] = [];
   const rpc: RegisteredRpc[] = [];
   const host: FakeHost = {
-    stream, tools, commands, rpc,
+    stream, tools, rpc,
     contextHook: null, idleHook: null, afterHook: null,
     context: {
       location: { directory },
@@ -122,12 +120,6 @@ function fakeHost(directory: string): FakeHost {
         ) => {
           if (name !== 'execute.after') throw new Error('unexpected tool hook');
           host.afterHook = callback;
-          return {};
-        },
-      },
-      command: {
-        transform: async (callback) => {
-          await callback({ add: (definition) => { commands.push(definition); } });
           return {};
         },
       },
@@ -210,10 +202,6 @@ test('a second folder reaches the shared mount; `/cremate` and the RPC fire for 
     assert.equal(lines.of('mounted').length, 1, 'one mount serves both locations');
     assert.deepEqual(lines.of('mount-shared').map(line => line['status']),
       ['created', 'reused'], 'the second activation joins the live mount');
-    assert.equal(hostA.commands.filter(command => command.name === 'cremate').length, 1,
-      'the first location registers its own /cremate');
-    assert.equal(hostB.commands.filter(command => command.name === 'cremate').length, 1,
-      'the second location registers its own /cremate');
 
     // The first folder's session is served by the first activation.
     await hostA.contextHook?.(contextOf([]));
@@ -236,19 +224,19 @@ test('a second folder reaches the shared mount; `/cremate` and the RPC fire for 
     assert.equal(secondAsks, 1, 'the ask uses the session-serving activation');
     assert.equal(firstAsks, 0, 'the first activation is not asked for another folder');
 
-    // The command registered at the second location remains live after the
-    // first location is disabled, and its own cleanup is what closes the mount.
-    // The stored verdict applies at the next request, exactly as `/cremate`
-    // documents; the new unit is tableable by the command after that.
+    // The RPC registered at the second location remains live after the first
+    // location is disabled, and its own cleanup is what closes the mount. The
+    // stored verdict applies at the next request, exactly as `/cremate`
+    // documents; the new unit is tableable by the RPC after that.
     await cleanupA();
-    const command = hostB.commands.find(def => def.name === 'cremate');
-    assert.ok(command !== undefined, 'the second location command survives');
+    const surviving = liveRpc(hostB);
+    assert.ok(surviving !== null, 'the second location RPC survives');
     const more = [...messages, ...readConversation('b2', 'more')];
     await hostB.contextHook?.(contextOf(more, folderBSession));
     assert.equal(more.some(message => message.id === 'msg_b_t1'), false,
       'the manual pass verdict applied at the next request');
-    await command.execute({ sessionID: folderBSession });
-    assert.equal(secondAsks, 2, 'the second location command still fires after the first left');
+    await surviving.handlers['cremate']?.({ sessionID: folderBSession });
+    assert.equal(secondAsks, 2, 'the second location RPC still fires after the first left');
 
     // The last cleanup released the root: a direct mount can claim it again.
     await cleanupB();
