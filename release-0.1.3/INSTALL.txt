@@ -1,0 +1,11 @@
+﻿CREMATOR 0.1.3
+
+Install from npm:
+  npm install cremator-dsh
+  npm install cremator-opencode
+
+Or install the local tarballs in this folder:
+  npm install .\cremator-dsh-0.1.3.tgz
+  npm install .\cremator-opencode-0.1.3.tgz
+
+@cremator/core installs automatically as a dependency.
