@@ -19,7 +19,7 @@
  *     deny rows from `subagent-deny.md` LAST. Later rows win, so neither the
  *     official-endpoint removal nor the deny can be re-opened by an earlier row.
  *   - The racoons arm mounts the SHIPPED entry
- *     (`packages/adapters/dsh/src/plugin.js` inside `--plugin-dist`, default
+ *     (`src/plugin.js` inside `--plugin-dist`, default
  *     `scratchpad/dsh-rig/dist` built by `dev/dsh-rig/build-dist.mjs`), with
  *     the cap pair named explicitly: capBytes 8192, capHeadBytes 8192,
  *     sealMaxLatencyTurns 1. The vanilla arm gets no mount; its native
@@ -654,7 +654,7 @@ const REAL_ROUTES = {
   },
 };
 /** The shipped entry inside a dist tree. */
-const PLUGIN_ENTRY = ['packages', 'adapters', 'dsh', 'src', 'plugin.js'];
+const PLUGIN_ENTRY = ['src', 'plugin.js'];
 /**
  * The rig's committed wrapper, which loads the same shipped entry and adds the
  * two seams a bench evidence dir needs: a journal sink and an on-disk ledger.
@@ -918,7 +918,7 @@ const DENY_ROWS = [
 const DENIED_TOOL_NAMES = ['subagent', 'subagent_fork', 'workflow', 'send_message', 'interrupt_agent', 'list_agents'];
 /**
  * The restore tool's model-facing name, as the shipped adapter registers it
- * (`packages/adapters/dsh/src/tools.ts`). One home for the name in this file: the
+ * (`src/tools.ts`). One home for the name in this file: the
  * mount's header row is read against it, so a rename on the product side fails
  * `dev/bench/tool-name.test.mjs` by name instead of failing a live run's row
  * (ISSUE-132; the rename to this name landed at `46b0d0b`, ISSUE-123).

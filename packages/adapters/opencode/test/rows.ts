@@ -9,12 +9,12 @@
  * a row without one, so a thrown helper error names the row too.
  *
  * Kept as a copy on purpose, not by accident — ISSUE-166 chose Option B, so the
- * twin is `packages/adapters/dsh/test/rows.ts` and the two are held in step by
+ * twin is `test/rows.ts` and the two are held in step by
  * hand. The invariant they share is the contract below: the
  * `row: <name>: <what>` label string, and `runRows`'s check that an error already
  * starting with `row: <name>` is not prefixed a second time. Every line from the
  * first `export` down is identical to the twin's; the gate that fails when it is
- * not is `packages/adapters/dsh/test/rows-drift.test.ts`, one test rather than a
+ * not is `test/rows-drift.test.ts`, one test rather than a
  * copy per side. A label-format change lands in both copies.
  */
 

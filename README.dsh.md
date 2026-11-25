@@ -12,7 +12,7 @@ npm install cremator-dsh
 ```
 
 `@cremator/core` installs as a dependency. Requires Node
-`>=22.13.0 <23.0.0 || >=23.4.0`.
+`>=22.16.0 <23.0.0 || >=24.0.0`.
 
 Host: `@deepseek-ai/dsh`, declared as an optional peer with the open range
 `>=0.0.0-0`.
@@ -46,7 +46,7 @@ The mount entry is the subpath export; the package's default entry has no host d
 ```yaml
 - insert:
     - id: racoons-mount
-      name: 'file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/dsh/dist/plugin.js'
+      name: 'file:///C:/Users/TZhen/Desktop/racoons/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply
@@ -60,7 +60,7 @@ The mount entry is the subpath export; the package's default entry has no host d
 The entry is a Cordis plugin (`name`, `inject`, `apply`) and also exports a default instance, so a
 `file:///` specifier or a bare package specifier both work. The example URL is for the
 `C:\Users\TZhen\` device; on the other use
-`file:///C:/Users/TZ/Desktop/racoons/packages/adapters/dsh/dist/plugin.js`. Config keys are the
+`file:///C:/Users/TZ/Desktop/racoons/dist/plugin.js`. Config keys are the
 mount's flat knobs:
 `barBytes`, `floorBytes`, `episodeNoNewPathSteps`, `sealMaxLatencyTurns`, `minCutFreedBytes`,
 `enforcement`, `recordName`, `anchors`, `judgeTimeoutMs`, `crematorStorageRoot`,

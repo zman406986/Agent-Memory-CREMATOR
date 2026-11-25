@@ -1430,6 +1430,11 @@ const ASK_ROWS: readonly Row[] = [
           at('the capability line records the mount-option id'));
         assert.equal(askBlock?.['promptGrammar'], 'jsonl-20-nokeepall',
           at('the capability line names the wire grammar that actually ran'));
+        assert.equal(askBlock?.['appliedBy'],
+          'the next agent-loop transform; the ask request itself removes nothing',
+          at('the capability line says where the verdicts apply (ISSUE-623)'));
+        assert.equal('applied' in (askBlock ?? {}), false,
+          at('the capability line no longer claims the ask applies nothing'));
         // Idle re-entry for the same array cannot loop the transient request.
         const deliveries = lines.of('ask').length;
         await mount.event({ type: 'session.idle', data: { sessionID: sessionId } });
@@ -3964,7 +3969,7 @@ test('with no bar or window the mount observes no depth and keeps the per-revisi
     } finally { await mount.close(); }
   });
 
-test('the depth-trigger mount options are validated by name', () => {
+test('the depth-trigger mount options are validated by name', async () => {
   const options = mountOptionsFromHost({
     crematorContextWindowTokens: 400_000, crematorPruneThresholdTokens: 60_000,
   });
@@ -3979,9 +3984,41 @@ test('the depth-trigger mount options are validated by name', () => {
   assert.throws(() => createOpencodeMount({ contextWindowTokens: 400_000, pruneThresholdTokens: 0 }),
     /pruneThresholdTokens must be null or a positive safe integer/u,
     'a zero bar fails by name at mount');
-  assert.throws(() => createOpencodeMount({ pruneThresholdTokens: 60_000 }),
-    /pruneThresholdTokens requires contextWindowTokens/u,
-    'a bar without a window is refused at mount');
+  // ISSUE-622: the dedupe switches are validated the same way, by name, at mount
+  // and in the host config, so a class this build cannot plan never reads "on"
+  // while the planner ignores it.
+  assert.deepEqual(
+    mountOptionsFromHost({ crematorDedupeClasses: { supersededByReread: true, callEcho: false } })
+      .dedupeClasses,
+    { supersededByReread: true, callEcho: false },
+    'both supported dedupe classes still reach the mount option');
+  assert.throws(() => mountOptionsFromHost({ crematorDedupeClasses: { launchReceipt: true } }),
+    /crematorDedupeClasses\.launchReceipt is not a class this build can plan/u,
+    'an unknown dedupe class in a host config is refused by name');
+  assert.throws(() => createOpencodeMount({ dedupeClasses: { harnessCopy: true } }),
+    /crematorDedupeClasses\.harnessCopy is not a class this build can plan/u,
+    'an unknown dedupe class from a programmatic caller is refused by name at mount');
+  // ADR-0078 / ISSUE-617: a bar with no window source is a sizing condition, not
+  // a mount failure, so the mount loads and names it once. No automatic depth
+  // reading runs while the window is unknown, so no `prune-threshold` line is
+  // written for the bar (the latch itself still arms in core; the mount is what
+  // holds the automatic pass off).
+  const lines = journalLines();
+  const mount = createOpencodeMount({
+    storage: { databasePath: ':memory:' },
+    pruneThresholdTokens: 60_000,
+    journal: record => lines.records.push(record),
+  });
+  try {
+    const unresolved = lines.of('window-unresolved').at(-1);
+    assert.equal(unresolved?.['scope'], 'mount', 'the bar is named at mount');
+    assert.equal(unresolved?.['reason'], 'no-model-info-seam',
+      'the host exposes no model-info seam at mount');
+    assert.equal(unresolved?.['pruneThresholdTokens'], 60_000, 'the line names the bar');
+    await mount.transform(sessionId, largeHostMessages());
+    assert.deepEqual(lines.of('prune-threshold'), [],
+      'automatic passes stay off while no window resolves');
+  } finally { await mount.close(); }
 });
 
 test('a summary past the reader tolerance is refused, retried once, then excluded', async () => {

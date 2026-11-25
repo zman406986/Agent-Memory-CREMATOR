@@ -1324,7 +1324,11 @@ test('the /prune trigger fires on the whole message only, and runs on the fork',
         + '{"3":{"forgetall":true,"summary":"an old copy"}}']);
       const records = collector();
       const mount = createRacoonsMount({
-        config: resolvePluginConfig({ barBytes: 64, capBytes: 1 << 20 }),
+        // A window is configured so the trigger's own rows still run a pass: a
+        // mount with no window stands down before the ask (ADR-0078; ISSUE-620),
+        // and this case is about which messages the trigger recognises.
+        config: resolvePluginConfig({ barBytes: 64, capBytes: 1 << 20,
+          contextWindowTokens: 1_000_000 }),
         storage: resolveStorage(undefined), journal: records.sink,
         ...scenario.seeded ? { llm } : {},
       });

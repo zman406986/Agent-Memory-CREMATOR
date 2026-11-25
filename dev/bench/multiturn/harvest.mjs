@@ -312,7 +312,7 @@ function planBoundary(session, turnOrdinal, tracker) {
     // Every superseded-read dedupe class off — the shipped default (ADR-0037). The
     // pins this module reproduces were taken before the dedupe pass existed, so a
     // class turned on here would move them. `{}` is what the mount sends when no
-    // operator names a class (`packages/adapters/dsh/src/prune.ts`).
+    // operator names a class (`src/prune.ts`).
     classes: {},
   });
   return {

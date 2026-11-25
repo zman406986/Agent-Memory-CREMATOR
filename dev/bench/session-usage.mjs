@@ -26,7 +26,7 @@
  * **Why the third term (ISSUE-173).** The host reports three DISJOINT buckets —
  * uncached input, cache read, cache write — and the product's own reader sums
  * all three into the one prompt it hands the meter
- * (`packages/adapters/dsh/src/usage.ts` `readAssistantUsage`: `input +
+ * (`src/usage.ts` `readAssistantUsage`: `input +
  * cacheTotal`). A bench that counted only two of them would be measuring a
  * different quantity under the same name, and on a route that writes cache its
  * `--token-grant` would be looser than the number the product bills by. The

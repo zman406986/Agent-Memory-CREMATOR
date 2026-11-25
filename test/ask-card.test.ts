@@ -281,8 +281,11 @@ test('ISSUE-404: a prune pass with zero ask rows says no ask was sent', async ()
   const llm = fakeLlm(answerChunks('{"1":{"forgetall":true,"summary":"an old copy"}}'));
   const mount = createRacoonsMount({
     // The bar sits above the fixture body, so the plan has no eligible unit.
+    // The window is configured because the case is about a pass that RUNS and
+    // has nothing to ask: a mount with no window now stands down before the ask
+    // (ADR-0078; ISSUE-620) and would never reach the empty-plan card.
     config: resolvePluginConfig({ barBytes: 1 << 20, capBytes: 1 << 20,
-      episodeNoNewPathSteps: null }),
+      episodeNoNewPathSteps: null, contextWindowTokens: 1_000_000 }),
     storage: resolveStorage(undefined), journal: () => {},
     llm: llm as never, judgeRoute: ROUTE,
   });
@@ -378,8 +381,11 @@ test('the bulk prune pass rides the same card, and closes it on a dead stream', 
   for (const scenario of scenarios) {
     const session = fakeSession(scenario.id);
     const mount = createRacoonsMount({
+      // A window is configured so the pass really asks: this case is about the
+      // card the ASK rides, and a mount with no window stands down before the
+      // ask (ADR-0078; ISSUE-620).
       config: resolvePluginConfig({ barBytes: 64, capBytes: 1 << 20,
-        episodeNoNewPathSteps: null }),
+        episodeNoNewPathSteps: null, contextWindowTokens: 1_000_000 }),
       storage: resolveStorage(undefined), journal: () => {},
       llm: scenario.llm as never, judgeRoute: ROUTE,
     });

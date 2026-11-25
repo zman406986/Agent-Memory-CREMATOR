@@ -225,11 +225,14 @@ export async function runRecordOnlyPrune(
     grammar: options.grammar ?? '3option',
     ...(settled === undefined ? {} : { settled }),
   });
+  // ISSUE-625: the counts alone never said which contract the pass asked the
+  // model to follow. The grammar the plan resolved rides this same line, so a
+  // run log answers that question without a second kind.
   journal('prune-plan', { sessionId, round: plan.round, units: units.length,
     askRows: plan.askRows.length, tables: plan.tables.length,
     l1Removals: plan.l1.removals.length, dedupeRemovals: plan.dedupe.removals.length,
     dedupeRefusals: plan.dedupe.refusals.length,
-    settledWithheld: plan.settledWithheld.length });
+    settledWithheld: plan.settledWithheld.length, grammar: plan.grammar });
 
   // ISSUE-349: ONE route snapshot per pass. The refusal check, the tables and
   // the correction all ride this single read, so a mid-pass config change

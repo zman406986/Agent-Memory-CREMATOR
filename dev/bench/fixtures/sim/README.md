@@ -34,7 +34,7 @@ this directory is refused: regenerating them from the private scratchpad source
 would write the owner's home path and private text back into the tree. A build
 with `--out <fresh-dir>` writes an inspection copy only, never the committed
 fixture. The builder still needs `packages/core/dist` and
-`packages/adapters/dsh/dist` (it imports the shipped renderers) for that path;
+`dist` at the repo root (it imports the shipped renderers) for that path;
 run `npm run build` first if they are absent.
 
 ## The seven moments, and why each one exists

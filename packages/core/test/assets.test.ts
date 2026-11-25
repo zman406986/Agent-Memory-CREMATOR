@@ -4,6 +4,9 @@ import { ENTRY_ASK_CLOSING_LINE, ENTRY_ASK_END_ANCHOR, ENTRY_ASK_SYSTEM_PROMPT, 
 // The lane F variant is deliberately not on `rules/assets.js` yet (T-8 wires the
 // caller), so this test is the only importer of it.
 import { ENTRY_ASK_FORGETLINES_SYSTEM_PROMPT, ENTRY_ASK_TWOFORM_SYSTEM_PROMPT } from '../src/rules/assets-templates.js';
+// ISSUE-613: the breaker notice is model-facing copy too, and its own test lane
+// (engine.test.ts) proves it lands; this pin proves what it says.
+import { BREAKER_DISABLED_NOTICE } from '../src/engine/notice.js';
 import { EntryAnswerError, isKeepEverythingAnswer, parseEntryAnswer } from '../src/verdicts/entry-wire.js';
 import { parseWireVerdict, WireVerdictError } from '../src/verdicts/wire.js';
 import type { WireStamp } from '../src/verdicts/wire.js';
@@ -946,4 +949,24 @@ test("model-facing inventory includes all templates and the exact recall descrip
   ]) {
     assert.ok(MODEL_FACING_STRINGS.includes(literal), literal);
   }
+  // ISSUE-613: the breaker notice is the one shipped string a model reads as a
+  // system directive (the host appends it as a role-'system' record), and the
+  // retired copy — "RACOONS disabled after two validation failures. Recall
+  // remains available." — named no boundary: a model read it as the harness
+  // going quiet and downgraded unrelated work (issue #3). So the copy may not
+  // carry the retired name (ADR-0059) and must state each of its limits: the
+  // pause covers this plugin's automatic removal only, it lifts by itself, and
+  // the recall tool keeps working under its real name.
+  assert.equal(BREAKER_DISABLED_NOTICE.includes("RACOONS"), false, "a live model-facing string carries no retired name");
+  assert.equal(BREAKER_DISABLED_NOTICE.includes("CREMATOR"), true, "the notice names the product");
+  assert.match(BREAKER_DISABLED_NOTICE, /only its automatic context removal \(pruning\/compaction\) is paused/u,
+    "the pause is scoped to this plugin's automatic removal");
+  assert.match(BREAKER_DISABLED_NOTICE,
+    /Every other tool, plugin, format and feature is unaffected\./u,
+    "every other tool, plugin, format and feature is stated unaffected");
+  assert.match(BREAKER_DISABLED_NOTICE, /breaker re-arms the moment a later validation succeeds/u,
+    "the copy states how the pause lifts, which is what the guard does");
+  assert.match(BREAKER_DISABLED_NOTICE, /necromancy tool still works and restores removed text by id/u,
+    "recall stays available under its real tool name");
+  assert.ok(BREAKER_DISABLED_NOTICE.length <= 400, "a notice a model reads stays short");
 });

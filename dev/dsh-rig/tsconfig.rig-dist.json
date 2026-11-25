@@ -11,11 +11,11 @@
     "types": ["node"],
     "paths": {
       "@cremator/core": ["../../packages/core/src/index.ts"],
-      "cremator-dsh": ["../../packages/adapters/dsh/src/index.ts"]
+      "cremator-dsh": ["../../src/index.ts"]
     }
   },
   "include": [
     "../../packages/core/src/**/*.ts",
-    "../../packages/adapters/dsh/src/**/*.ts"
+    "../../src/**/*.ts"
   ]
 }

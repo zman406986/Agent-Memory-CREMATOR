@@ -124,7 +124,7 @@ export function resolveStorage(options: OpencodeStorageOptions | undefined = und
   }
   if (!isAbsolute(root)) {
     throw new OpencodeStorageError('relative-root',
-      `racoons: crematorStorageRoot must be an absolute path: ${root}`, root);
+      `cremator: crematorStorageRoot must be an absolute path: ${root}`, root);
   }
   return { kind: 'durable', root };
 }
@@ -185,7 +185,7 @@ export function sessionStorage(selection: StorageSelection, sessionId: string): 
   const problem = sessionIdProblem(sessionId);
   if (problem !== null) {
     throw new OpencodeStorageError('invalid-session-id',
-      `racoons: session id ${JSON.stringify(sessionId)} ${problem}`, sessionId);
+      `cremator: session id ${JSON.stringify(sessionId)} ${problem}`, sessionId);
   }
   const sessionDir = join(selection.root, 'sessions', sessionDirSegment(sessionId));
   return Object.freeze({
@@ -217,7 +217,7 @@ export async function openLedger(target: StorageTarget, clock: Clock): Promise<L
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new OpencodeStorageError('durable-open-failed',
-      `racoons: cannot open the session ledger at ${target.databasePath}: ${reason}`,
+      `cremator: cannot open the session ledger at ${target.databasePath}: ${reason}`,
       target.databasePath, { cause: error });
   }
 }

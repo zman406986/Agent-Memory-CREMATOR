@@ -551,6 +551,12 @@ test('ISSUE-457: a fork resets the parent round, latch and first-ask flag', asyn
  * never blocked by it, and never writes an abandoned/applied row for it. A
  * prepared row under the child's own id does not exist on a fork (the copy was
  * written entirely by the parent).
+ *
+ * ADR-0077: the parent's own run also leaves its own rows in the copy — one
+ * `validation` row for the keepall answer its entry ask applied, which is the
+ * row only an apply writes — so the planted row is the NEWEST parent row, never
+ * row 0. The case pins that, and pins that the child's own step adds nothing
+ * under the parent's id.
  */
 test('ISSUE-459: a parent prepared row sits under the parent id and never blocks the child',
   async () => {
@@ -580,12 +586,30 @@ test('ISSUE-459: a parent prepared row sits under the parent id and never blocks
       const childRows: unknown[] = [];
       for await (const row of entry.ledger.events(fixture.child.id)) childRows.push(row);
       assert.equal(childRows.length, 0, 'the child\'s own view of the copied ledger is empty');
-      const parentRows: { readonly event: { readonly kind: string } }[] = [];
+      const parentRows: { readonly event: { readonly kind: string; readonly ok?: boolean } }[] = [];
       for await (const row of entry.ledger.events('session-parent')) parentRows.push(row);
-      assert.equal(parentRows[0]?.event.kind, 'prepared',
-        'the parent\'s row sits under the parent id');
+      const parentKinds = parentRows.map(row => row.event.kind);
+      // ADR-0077: the fixture's parent ran its own entry ask with no captured
+      // request and a header that states no tools, and core recorded the applied
+      // keepall answer as ONE `validation` row under the PARENT's own id
+      // (packages/core/src/engine/engine.ts:387-391, stamped with that id at
+      // :330-340). So the planted row is the newest parent row, never row 0 — the
+      // copy carries the parent's work, never the child's.
+      assert.equal(parentKinds.filter(kind => kind === 'validation').length, 1,
+        'the parent applied its own keepall answer under its own id');
+      assert.equal(parentRows.find(row => row.event.kind === 'validation')?.event.ok, true,
+        'and its own row is a passing validation, not a refusal');
+      assert.equal(parentRows.at(-1)?.event.kind, 'prepared',
+        'the planted parent row sits under the parent id, newest last');
+      assert.equal(parentKinds.filter(kind => kind === 'prepared').length, 1,
+        'and it is the only prepared row in the copy');
 
+      const parentCount = parentRows.length;
       await mount.runStep(fixture.child, { turn: 2, step: 1 });
+      const parentAfter: { readonly event: { readonly kind: string } }[] = [];
+      for await (const row of entry.ledger.events('session-parent')) parentAfter.push(row);
+      assert.equal(parentAfter.length, parentCount,
+        'the child writes nothing under the parent id');
       assert.notEqual(kinds(journal, 'at-rest').at(-1)?.['status'], 'recovery-pending',
         'the parent row never blocks the child');
     } finally {

@@ -624,7 +624,7 @@ export function buildIdentityOf(extraModules = {}) {
   return {
     node: process.version,
     core: versionOf("packages/core/package.json"),
-    adapter: versionOf("packages/adapters/dsh/package.json"),
+    adapter: versionOf("package.json"),
     coreDistSha256: CORE_DIST_SHA256,
     modules,
   };

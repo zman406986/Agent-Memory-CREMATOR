@@ -1,8 +1,8 @@
 # Bundle patch for cremator-dsh. Selected through `dsh.bundle.patch`.
 #
-# It contributes one row: the plugin itself. Install the package into a dsh
-# profile (`dsh plugin --profile <name> add link:<path>`), then select the
-# bundle; do not also insert the row by hand. Two rows with one id make the
+# It contributes one row: the plugin itself. Install with
+# `dsh plugin --profile web add cremator-dsh`: dsh selects this bundle on
+# install. Do not also insert the row by hand. Two rows with one id make the
 # settings form unaddressable.
 #
 # The config is the documented example, not a fixed policy: a profile patch

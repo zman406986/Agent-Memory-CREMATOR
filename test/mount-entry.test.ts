@@ -71,7 +71,7 @@ interface FakeSession extends DshMountSession {
  * node list, `eventAt`, `seq`, and frozen payloads — the host behaviour the
  * mount is written against (the same harness `plugin.test.ts` drives).
  */
-function fakeSession(id: string): FakeSession {
+function fakeSession(id: string, options: { readonly header?: boolean } = {}): FakeSession {
   const log: DshMountEvent[] = [];
   const surfaceNodes: number[] = [];
   const listeners = new Set<(session: FakeSession, event: DshMountEvent) => void>();
@@ -81,7 +81,10 @@ function fakeSession(id: string): FakeSession {
     get seq() { return log.length; },
     get surface() { return { nodes: surfaceNodes, contentGeneration: log.length }; },
     get log() { return log; },
-    requestHeader: () => ({ config: { provider: route.provider, model: route.model } }),
+    // `header: false` models an old or fake host with no logged request header
+    // at all, so a no-capture seed refuses `no-header` (ADR-0077).
+    requestHeader: () => options.header === false ? undefined
+      : ({ config: { provider: route.provider, model: route.model } }),
     setRoute(next: { readonly provider: string; readonly model: string }) {
       route = { provider: next.provider, model: next.model };
     },
@@ -245,8 +248,10 @@ function harness(params: {
   readonly entryAskGrammar?: EntryAskGrammar;
   readonly enforcement?: 'apply' | 'record-only';
   readonly ledger?: Ledger;
+  /** Model a host with no logged request header at all. */
+  readonly noHeader?: boolean;
 } = {}): Harness {
-  const session = fakeSession(params.id ?? 'session-entry');
+  const session = fakeSession(params.id ?? 'session-entry', { header: params.noHeader !== true });
   const journal: JournalLine[] = [];
   const llm = params.llm ?? fakeLlm(answerChunks('{"keepall":true}'));
   const mount = createRacoonsMount({
@@ -766,6 +771,8 @@ const FAIL_OPEN_ROWS: readonly {
   readonly deadStream?: boolean;
   /** Whether the stdlib timer must fire instead of the answer arriving. */
   readonly deadline?: boolean;
+  /** Whether the host has no logged request header at all (`no-header`). */
+  readonly noHeader?: boolean;
   /** What the fake seam answers; ignored when the stream dies. */
   readonly answer: string;
   /** The text the refusal row must carry, or null when it claims none. */
@@ -774,8 +781,11 @@ const FAIL_OPEN_ROWS: readonly {
   check?(context: { readonly refused: readonly ({ kind: string; [field: string]: unknown }
     | undefined)[]; readonly h: Harness; readonly at: Label }): void;
 }[] = [
+  // ADR-0077: the no-capture seed refuses only a REAL absence now, so this row
+  // models a host with no logged request header at all (the surface still
+  // carries the prompt node, which the seed records instead of refusing).
   { name: 'no seed', id: 'session-refused-0', code: 'no-seed', seed: false,
-    answer: '{"keepall":true}', raw: null },
+    noHeader: true, answer: '{"keepall":true}', raw: null },
   { name: 'dead stream', id: 'session-refused-1', code: 'stream-error', seed: true,
     deadStream: true, answer: '{"keepall":true}', raw: null },
   { name: 'no text', id: 'session-refused-2', code: 'empty-text', seed: true,
@@ -825,7 +835,8 @@ test('every ask refusal fails open, and its row says what the model answered', a
         }
         : scenario.answer === '' ? fakeLlm([{ type: 'finish', reason: 'stop' }])
           : fakeLlm(answerChunks(scenario.answer));
-      const h = harness({ id: scenario.id, entryAskGrammar: '3option', llm });
+      const h = harness({ id: scenario.id, entryAskGrammar: '3option', llm,
+        noHeader: scenario.noHeader === true });
       try {
         if (scenario.seed) wire(h);
         step(h.session, { turn: 1, step: 1, results: [{ callId: 'c1', body }] });
@@ -923,6 +934,12 @@ const STAND_DOWN_ROWS: readonly {
       await h.mount.runStep(h.session, { turn: 1, step: 2 });
       assert.equal(h.llm.calls.length, 0, at('no request leaves while the breaker is open'));
       assert.equal(resultText(h.session, 'c1'), body, at('the result lands whole'));
+      // ISSUE-615: this row's mount is configured `record-only`, and the name
+      // alone reads as "nothing is applied", so the per-session line must state
+      // the mode a run log has to read it by.
+      const capabilities = h.journal.find(line => line['kind'] === 'capabilities');
+      assert.equal(capabilities?.['enforcement'], 'record-only',
+        at('the capabilities line names the record-only mode in force'));
     },
   },
 ];

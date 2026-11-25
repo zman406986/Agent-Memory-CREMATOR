@@ -130,7 +130,7 @@ const REFUSAL_ROWS: readonly RefusalRow[] = [
     }, code: "hash-mismatch", message: /blob/iu },
   { name: "an archive of another kind is refused", break: "forge",
     edit: document => { document["kind"] = "racoons:other-archive"; },
-    code: "unsupported-schema", message: /RACOONS/iu },
+    code: "unsupported-schema", message: /CREMATOR/iu },
   { name: "an archive of another version is refused", break: "forge",
     edit: document => { document["version"] = 2; },
     code: "unsupported-schema", message: /version/iu },

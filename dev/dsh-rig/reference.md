@@ -20,7 +20,7 @@ importing TypeScript sources.
 
 ## What the mount does at each seam
 
-The mount is `packages/adapters/dsh/src/plugin.ts`; `rig-plugin.mjs` only loads it, routes its journal
+The mount is `src/plugin.ts`; `rig-plugin.mjs` only loads it, routes its journal
 and points `crematorStorageRoot` at a throwaway root under the evidence dir, so the entry's own durable
 seam writes the per-session ledger. The seams, for reference:
 

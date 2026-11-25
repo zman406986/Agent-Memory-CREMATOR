@@ -115,7 +115,7 @@ and must record zero `compaction/prune` events. The invalidation is inside the
 vanilla arm's billed rows; no separate charge is added.
 
 The ask lane's usage rows also carry `cachedInputTokens`, the cached part OF
-`inputTokens` (`packages/adapters/dsh/src/usage.ts:19-22`). Price an ask as
+`inputTokens` (`src/usage.ts:19-22`). Price an ask as
 `(input − cached) × $0.15/M + cached × $0.003/M`, not the whole prompt at the
 uncached rate. In the 2026-11-09 32-file n=3 runs 83–86% of the ask prompt was
 cached, so the ask lane costs $0.087–0.095 per run. Medians: product $0.340,
@@ -220,7 +220,7 @@ at `<evidenceDir>/storage` (ADR-0013: the entry opens its own per-session
 journal-gated route (`mock-replay` AND a real route — ISSUE-082) mounts that
 wrapper (`bench-run.mjs`: `rigWrapper`, from `mount-wiring.mjs`), so the racoons
 arm writes both under `<evidence>/racoons/`. `mock` still mounts the shipped
-entry (`packages/adapters/dsh/src/plugin.js`) directly, which has no sink and
+entry (`src/plugin.js`) directly, which has no sink and
 keeps a `:memory:` ledger. `--plugin-entry` always wins on every provider, so
 naming the shipped entry is the no-sink perturbation — and it does NOT disarm
 the gate, so the run fails by name.

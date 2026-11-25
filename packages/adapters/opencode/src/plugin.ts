@@ -279,6 +279,13 @@ export type OpencodeJournalKind =
   // none was suppressed — a named outcome distinct from a fire and from a
   // build failure.
   | 'prune-outcome'
+  // ADR-0078 / ISSUE-617: a configured bar has no context window at mount, so
+  // automatic prune passes stay off and the manual pass reports `no-window`.
+  // `scope: 'mount'` separates this line from the per-route `model-change` one.
+  | 'window-unresolved'
+  // ISSUE-618: a configured bar or window has no ask lane, so nothing can fire.
+  // The setting is named inert instead of refusing the whole mount.
+  | 'trigger-inert'
   | 'command-error'
   // ADR-0068 / ISSUE-530: the host command seam was present or absent, so a
   // journal can tell a missing `/cremate` menu entry from a failed registration.
@@ -1659,8 +1666,9 @@ export interface OpencodeMountOptions {
   /**
    * The product's depth trigger (ADR-0050): the absolute token bar and the host
    * window. With neither, the bench-only ask keeps its per-revision cadence.
-   * `pruneThresholdTokens` requires `contextWindowTokens` (the 75% skip line
-   * needs the window), refused at mount otherwise.
+   * `pruneThresholdTokens` without `contextWindowTokens` still mounts
+   * (ADR-0078 / ISSUE-617): the condition is journalled once
+   * (`window-unresolved`, `scope: 'mount'`) and automatic passes stay off.
    */
   readonly contextWindowTokens?: number | null;
   readonly pruneThresholdTokens?: number | null;
@@ -1679,8 +1687,10 @@ export interface OpencodeMountOptions {
   readonly dedupeClasses?: DedupeClasses;
   /**
    * The bench-only entry ask. Absent is off; `jsonl-20-nokeepall` asks one
-   * `session.generate` question per fire and applies nothing. A host config
-   * spells it `crematorAskGrammar`.
+   * `session.generate` question per fire. The fire's own request removes nothing:
+   * the verdicts it reads are applied by the next agent-loop transform, and every
+   * later request-only array re-applies the settled removals (ADR-0074). A host
+   * config spells it `crematorAskGrammar`.
    */
   readonly askGrammar?: OpencodeAskGrammar;
   /**
@@ -2001,7 +2011,7 @@ function sweepCrashedMountRecords(dir: string): void {
 /** The named reason a mount record could not be made (ISSUE-563). */
 function mountRecordProblem(path: string, error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
-  return `racoons: cannot record the mount at ${path}: ${reason}`;
+  return `cremator: cannot record the mount at ${path}: ${reason}`;
 }
 
 /**
@@ -2173,7 +2183,7 @@ function sameFileIdentity(left: string, right: string): boolean {
 function askGrammarOf(value: unknown): OpencodeAskGrammar | null {
   if (value === undefined || value === null || value === '') return null;
   if (value === OPENCODE_ASK_GRAMMAR) return value;
-  throw new TypeError(`racoons: crematorAskGrammar is ${JSON.stringify(value)}; `
+  throw new TypeError(`cremator: crematorAskGrammar is ${JSON.stringify(value)}; `
     + `the only grammar this build measures is "${OPENCODE_ASK_GRAMMAR}"`);
 }
 
@@ -2188,7 +2198,7 @@ function askGrammarOf(value: unknown): OpencodeAskGrammar | null {
 function askTimeoutMsOf(value: unknown): number | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'number') {
-    throw new TypeError(`racoons: crematorAskTimeoutMs is ${JSON.stringify(value)}; `
+    throw new TypeError(`cremator: crematorAskTimeoutMs is ${JSON.stringify(value)}; `
       + 'askTimeoutMs must be a number of milliseconds');
   }
   return value;
@@ -2228,18 +2238,30 @@ export function mountOptionsFromHost(options: unknown): OpencodeMountOptions {
  * can plan are accepted (`supersededByReread`, `callEcho`, ADR-0037); a value
  * that is not an object or a field that is not a boolean is refused by name, so
  * a typo cannot silently leave a class off (or on).
+ *
+ * ISSUE-622: the class NAME is refused by name too. Core's planner reads only
+ * those two switches (`packages/core/src/prune/dedupe/index.ts:64-71`) and core's
+ * own `validateConfig` refuses every other declared class by name
+ * (`packages/core/src/config.ts:362-366`), a check this adapter never runs. A
+ * forwarded `launchReceipt` or `harnessCopy` would mount reading "on" and plan
+ * nothing.
  */
 function dedupeClassesOf(value: unknown): DedupeClasses | null {
   if (value === undefined || value === null) return null;
   if (!isRecord(value)) {
-    throw new TypeError('racoons: crematorDedupeClasses must be an object of boolean switches');
+    throw new TypeError('cremator: crematorDedupeClasses must be an object of boolean switches');
+  }
+  for (const key of Object.keys(value)) {
+    if (key === 'supersededByReread' || key === 'callEcho') continue;
+    throw new TypeError(`cremator: crematorDedupeClasses.${key} is not a class this build `
+      + 'can plan; only supersededByReread and callEcho are shipped (ADR-0037)');
   }
   const classes: { supersededByReread?: boolean; callEcho?: boolean } = {};
   for (const key of ['supersededByReread', 'callEcho'] as const) {
     const raw = value[key];
     if (raw === undefined) continue;
     if (typeof raw !== 'boolean') {
-      throw new TypeError(`racoons: crematorDedupeClasses.${key} must be a boolean`);
+      throw new TypeError(`cremator: crematorDedupeClasses.${key} must be a boolean`);
     }
     classes[key] = raw;
   }
@@ -2292,23 +2314,22 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
   }
   // The product's depth trigger (ADR-0050). Both numbers are optional; with
   // neither, the bench-only ask keeps its per-revision cadence. A bar without a
-  // window is refused: the 75% skip line and the half-window compatibility path
-  // both need the window.
+  // window still mounts (ADR-0078 / ISSUE-617): core says the bar arms the latch
+  // on its own (`packages/core/src/prune/window-trigger.ts:6-9`, `:141-154`), and
+  // only the 75% skip line reads the window (`:166-168`). The condition is
+  // journalled by name below, and automatic passes stay off while no window
+  // resolves; nothing guesses one.
   const contextWindowTokens = resolveContextWindowTokens(options.contextWindowTokens ?? null);
   const pruneThresholdTokens = resolvePruneThresholdTokens(options.pruneThresholdTokens ?? null);
-  if (pruneThresholdTokens !== null && contextWindowTokens === null) {
-    throw new Error('cremator: pruneThresholdTokens requires contextWindowTokens '
-      + '(the 75% skip line needs the host window)');
-  }
   /**
    * A depth trigger with no ask lane schedules nothing: this adapter's only
-   * table is the ask, so a configured bar/window that cannot fire is refused at
-   * mount instead of riding the journal as an inert setting (ISSUE-300 item 13).
+   * table is the ask. That is a named inert state, not a mount-integrity
+   * failure (ISSUE-618): the at-rest L1 lane and `/cremate` still work and
+   * apply, so refusing the mount here would remove them for an unused setting.
+   * The line is written below, once, beside the mount-scoped window line.
    */
-  if (askGrammar === undefined && (contextWindowTokens !== null || pruneThresholdTokens !== null)) {
-    throw new Error('cremator: contextWindowTokens/pruneThresholdTokens configure the ask lane; '
-      + 'without askGrammar there is no table to fire, so the trigger would be inert');
-  }
+  const triggerInert = askGrammar === undefined
+    && (contextWindowTokens !== null || pruneThresholdTokens !== null);
   /**
    * Refuse a wrong-typed value here too, not only through
    * `mountOptionsFromHost`: a JSON config arrives as `unknown` and a
@@ -2326,6 +2347,15 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
     throw new Error('cremator: askTimeoutMs must not exceed the platform timer range '
       + `(${String(MAX_PLATFORM_TIMER_MS)} ms); a larger delay would fire at 1 ms`);
   }
+  /**
+   * ISSUE-622: `mountOptionsFromHost` refuses an unknown dedupe class by name for
+   * a JSON host config; this is the same refusal for a programmatic caller, which
+   * bypasses it. A class this build cannot plan must not mount reading "on" while
+   * the planner ignores it (core refuses those names in `validateConfig`, a check
+   * this adapter never runs). The returned object carries only the two supported
+   * switches.
+   */
+  const dedupeClasses = dedupeClassesOf(options.dedupeClasses);
   const clock: Clock = { nowMs: options.nowMs ?? (() => Date.now()) };
   const emit: OpencodeJournalSink = options.journal
     ?? (options.journalFile === undefined ? () => {} : createFileJournalSink(options.journalFile));
@@ -2334,6 +2364,40 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       emit(Object.freeze({ kind, atMs: clock.nowMs(), ...fields }));
     } catch { /* a journal sink must never change an outcome */ }
   };
+  /**
+   * ADR-0078 (ISSUE-617): a configured bar with no window source is a sizing
+   * condition, never a mount-integrity failure. The line names it once and the
+   * mount keeps serving every job that needs no window — at-rest L1, `/cremate`,
+   * forget/recall and the ask lane all still register. Automatic passes stay off
+   * by name (`observeDepth` returns false while no window is configured), and
+   * nothing guesses a window: the host's `resolveModelWindow` seam is keyed by a
+   * provider/model this mount does not know at construction, so no value can be
+   * read from it here; the manual pass keeps answering `no-window`.
+   */
+  if (pruneThresholdTokens !== null && contextWindowTokens === null) {
+    journal('window-unresolved', {
+      scope: 'mount', provider: null, model: null,
+      reason: options.resolveModelWindow === undefined
+        ? 'no-model-info-seam' : 'no-configured-window',
+      hostSeam: options.resolveModelWindow === undefined ? 'absent' : 'model-catalog',
+      pruneThresholdTokens,
+      message: 'pruneThresholdTokens has no context window: automatic prune passes stay '
+        + 'off until one is configured, and the manual pass reports no-window',
+    });
+  }
+  /**
+   * ISSUE-618: a bar or window with no ask lane is inert, not unsafe. The line
+   * names the setting once and the mount keeps the lanes that apply work with
+   * no ask: the at-rest L1 pass and `/cremate`.
+   */
+  if (triggerInert) {
+    journal('trigger-inert', {
+      scope: 'mount', reason: 'no-ask-grammar',
+      contextWindowTokens, pruneThresholdTokens,
+      message: 'crematorContextWindowTokens/crematorPruneThresholdTokens configure the ask '
+        + 'lane; with no crematorAskGrammar nothing can fire, so the trigger is inert',
+    });
+  }
   // Resolved once, at mount: an unusable root is a refusal now, not at a user's
   // first request. A relative root and a durable pair are typed refusals (C3).
   const selection = resolveStorage(options.storage);
@@ -2915,7 +2979,12 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
         ? {}
         : { ask: { grammar: askGrammar, promptGrammar: OPENCODE_ASK_PROMPT_GRAMMAR,
           transientModelCalls: 'one per fire',
-          applied: false, floorBytes: OPENCODE_ASK_FLOOR_BYTES,
+          // ISSUE-623: the status line states what happens. The fire's own request
+          // carries no removal; the verdicts it reads are applied by the next
+          // agent-loop transform, and a later request-only array re-applies the
+          // settled ones (ADR-0074).
+          appliedBy: 'the next agent-loop transform; the ask request itself removes nothing',
+          floorBytes: OPENCODE_ASK_FLOOR_BYTES,
           retry: OPENCODE_ASK_RETRY,
           // ADR-0063: the asked set, the revision claims and an unapplied
           // verdict are durable; a reload restores them instead of starting
@@ -3012,7 +3081,7 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
       engine, meter,
       pruneTrigger: new PruneWindowTrigger(contextWindowTokens, pruneThresholdTokens),
       parametersDerivedFrom: null, observedModel: null,
-      dedupeClasses: options.dedupeClasses ?? {},
+      dedupeClasses: dedupeClasses ?? {},
       ownedLedger: options.openLedger === undefined,
       lastMessages: null, requestPath: requestSnapshotPath(target),
       savedRequestRevision: null, pendingEstimates: [], droppedEstimates: 0,
@@ -3243,12 +3312,25 @@ export function createOpencodeMount(options: OpencodeMountOptions = {}): Opencod
    * port snapshot, so the session's first request can cross the bar; the last
    * `pendingEstimates` entry is the fallback when a caller has no snapshot. The
    * host-meter path is unchanged. Every evaluation is journaled, like the dsh
-   * mount, so a run can be audited after the fact.
+   * mount, so a run can be audited after the fact — except while no window
+   * resolves, where no evaluation runs at all (ADR-0078, below).
    */
   function observeDepth(
     entry: OpencodeSessionEntry, snapshot?: SessionSnapshot | null,
     prefix: RequestPrefix | null = entry.lastPrefix,
   ): boolean {
+    /**
+     * ADR-0078 (ISSUE-617): automatic passes stay off by name while no window
+     * resolves. The mount journals the condition once (`window-unresolved`,
+     * `scope: 'mount'`); here nothing is read, the latch is not observed, and no
+     * `prune-threshold` line is written — dsh's `windowReady` gate
+     * (`src/plugin.ts:5183-5186`) does the same. An explicit bar does arm the
+     * latch in core without a window, but the 75% skip line and the automatic
+     * pass's sizing both need one, and neither a default nor a measurement may
+     * stand in for it here, so no automatic pass may fire from such a bar. The
+     * manual and deferred apply lanes keep the sizing they already had.
+     */
+    if (contextWindowTokens === null) return false;
     /**
      * A host usage row wins. The local fallback exists only before the first
      * host row; it is never substituted for a host reading. A deferred pass's

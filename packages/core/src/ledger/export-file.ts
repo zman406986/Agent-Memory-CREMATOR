@@ -165,7 +165,7 @@ export function parseArchiveDocument(bytes: Bytes): LedgerArchiveDocument {
   }
   const root = record(raw, "archive");
   if (root["kind"] !== ARCHIVE_KIND) {
-    throw new LedgerError("unsupported-schema", "Archive is not a RACOONS ledger archive");
+    throw new LedgerError("unsupported-schema", "Archive is not a CREMATOR ledger archive");
   }
   if (root["version"] !== ARCHIVE_VERSION) {
     throw new LedgerError("unsupported-schema",

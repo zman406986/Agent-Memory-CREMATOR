@@ -46,7 +46,7 @@
  *
  * ISSUE-508 makes this message the BULK table's too: the dsh depth table sends
  * `entryBatchAskMessage(rows, "jsonl-20-nokeepall", firstTrigger)` byte for byte
- * (`packages/adapters/dsh/src/judge-tables.ts`). Its row therefore accepts the
+ * (`src/judge-tables.ts`). Its row therefore accepts the
  * prune renderer's two extra facts — the call's `path` and a refused anchor's
  * `refusal` — so the bulk row reads exactly as a prune row always did.
  *

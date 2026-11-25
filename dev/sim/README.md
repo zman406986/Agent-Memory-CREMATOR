@@ -92,7 +92,7 @@ read that field alone by design; TOP-LEVEL `cached_tokens` is 0 on all three cal
 
 **Offline by default.** `--plan` builds the exact three payloads, asserts the prefix relation and shipped-ask
 markers, prints the plan and criterion, and exits 0 without a socket. It needs a core build and an adapter build
-(`npm run build -w @cremator/core && npm run build -w cremator-dsh`), or a frozen adapter copy via
+(`npm run build -w @cremator/core && npm run build`), or a frozen adapter copy via
 `CREMATOR_ADAPTER_DIST`.
 
 **Live is a pending human gate.** `--live` refuses unless `--owner-authorized` is also passed; even then the

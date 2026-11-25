@@ -65,6 +65,29 @@ export async function persistBreaker(
 }
 
 /**
+ * The breaker notice's bytes, spelled once (ISSUE-613). The notice states its own
+ * scope because a model that read the retired sentence ("RACOONS disabled after
+ * two validation failures") took it for a wider disablement of the harness and
+ * downgraded unrelated work — the defect issue #3 reports. Every claim here is
+ * one the code makes true:
+ * - the product is CREMATOR (ADR-0059), a live model-facing string carries no
+ *   retired name;
+ * - only this plugin's automatic removal work is gated — the breaker counts
+ *   refusals of CREMATOR's own plan validations and nothing else (breaker.ts,
+ *   guard.ts), and no other tool, plugin, format or feature reaches it;
+ * - it restores itself: any completed validation resets the streak and re-arms a
+ *   disabled breaker, an empty pass included (guard.ts:37-42, 120-122);
+ * - recall never goes through the guard (engine.ts:200-205), so the "necromancy"
+ *   tool keeps returning removed text by id.
+ */
+export const BREAKER_DISABLED_NOTICE = [
+  'CREMATOR: only its automatic context removal (pruning/compaction) is paused, after two failed validations of its own removal plans.',
+  'Every other tool, plugin, format and feature is unaffected.',
+  'It restores itself: the breaker re-arms the moment a later validation succeeds.',
+  'The necromancy tool still works and restores removed text by id.',
+].join('\n');
+
+/**
  * The one record that tells the model (and the operator) the judge was stopped.
  * It is owed once per disable: the pass that trips the breaker writes the
  * `breaker-disabled` marker, and the next boundary appends the notice. The
@@ -98,7 +121,7 @@ export async function announceBreaker(
   const priorAttempts = entries.filter(({ event }) => event.kind === 'prepared'
     && abandoned.has(event.intentId) && metadata(event)?.noticeRecordId === recordId).length;
   const eventId = priorAttempts === 0 ? recordId : `${recordId}:retry:${String(priorAttempts)}`;
-  const bytes = new TextEncoder().encode('RACOONS disabled after two validation failures. Recall remains available.');
+  const bytes = new TextEncoder().encode(BREAKER_DISABLED_NOTICE);
   const record = { recordId, bytes, sha256: await sha256(bytes) };
   // The disabled Guard cannot issue a notice, so the engine states this
   // application itself. It contains no source replacements, archive removals or

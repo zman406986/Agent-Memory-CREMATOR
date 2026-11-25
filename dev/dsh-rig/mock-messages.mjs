@@ -67,7 +67,7 @@ export const DEFAULT_API_KEY = 'mock-key-not-real';
 export const TITLE_SYSTEM_MARKER = 'Create a concise title';
 /**
  * The opening of the frame every table ask starts with (`ASK_FRAME` in
- * `packages/adapters/dsh/src/judge-tables.ts`). Since ADR-0028 the bulk prune is
+ * `src/judge-tables.ts`). Since ADR-0028 the bulk prune is
  * the ONE table asker, and its ask is a fork of main's request, so it KEEPS the
  * tools array; a tool-count test cannot name it and this frame does. Copied, not
  * imported: this mock is a plain-Node harness and cannot import the workspace's

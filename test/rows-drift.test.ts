@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MINE = join(HERE, 'rows.ts');
-const TWIN = join(HERE, '..', '..', 'opencode', 'test', 'rows.ts');
+const TWIN = join(HERE, '..', 'packages', 'adapters', 'opencode', 'test', 'rows.ts');
 
 /** The code after the header comment, failing closed when the contract is absent. */
 function body(source: string, path: string): string {

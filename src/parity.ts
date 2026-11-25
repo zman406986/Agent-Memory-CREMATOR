@@ -61,13 +61,13 @@ export const DSH_PARITY_CHECKLIST: readonly DshParityRow[] = Object.freeze([
     racoonsEquivalent: 'The additive `forget` tool resolves a path and line ranges to one held unit '
       + 'and the mount applies it at its next boundary as one revert plus one receipt; a refused '
       + 'request applies nothing.', status: 'covered',
-    proof: 'packages/adapters/dsh/test/forget-tool.test.ts' },
+    proof: 'test/forget-tool.test.ts' },
   // PRD §6.6 stale read / superseded read.
   { id: 'proof-removals', microcompactBehaviour: 'Drop a read the transcript itself proves wrong or '
       + 'redundant.', racoonsEquivalent: 'Core registers the stale-read and superseded-read rules; '
       + 'both plan one `proof` op through the same revert lane a verdict uses (ADR-0018), and the '
       + 'mount applies them in its at-rest pass.', status: 'covered',
-    proof: 'packages/adapters/dsh/test/prune.test.ts' },
+    proof: 'test/prune.test.ts' },
   // PRD §6.6 "Coverage is metered in bytes per source path across all
   // result-producing calls". The meter is core's; the mount feeds it where the
   // snapshot is built, so this row is honest as covered.
@@ -75,7 +75,7 @@ export const DSH_PARITY_CHECKLIST: readonly DshParityRow[] = Object.freeze([
     racoonsEquivalent: 'Core ships `CoverageMeter` (tool-name agnostic, hit/miss/unknown split, '
       + 'proven by `packages/core/test/coverage.test.ts`), and the mount records every tool-result '
       + 'node it holds, handing the rows out on `SessionSnapshot.pathCoverage`.', status: 'covered',
-    proof: 'packages/adapters/dsh/test/plugin.test.ts' },
+    proof: 'test/plugin.test.ts' },
   // PRD §6.7 "recall falls back to re-reading the unchanged source when the
   // ledger misses — the two-device safety rule."
   { id: 'recall-source-fallback', microcompactBehaviour: 'Restore archived bytes after a ledger miss.',
@@ -83,12 +83,12 @@ export const DSH_PARITY_CHECKLIST: readonly DshParityRow[] = Object.freeze([
       + '(proven by `packages/core/test/recall-fallback.test.ts` and '
       + '`packages/core/test/recall-integrity.test.ts`); a changed file is a refusal, never a '
       + 'substitute.', status: 'covered',
-    proof: 'packages/adapters/dsh/test/plugin.test.ts' },
+    proof: 'test/plugin.test.ts' },
   // PRD §6.9 "authoritative counts reconcile from API usage (including cached
   // tokens) after each call."
   { id: 'usage-reconciliation', microcompactBehaviour: 'Reconcile the local estimate against the '
       + 'provider\'s own counts.', racoonsEquivalent: 'The mount reads the `assistant/message` usage '
       + 'row, maps the host\'s disjoint buckets onto the core\'s whole-prompt count with the cache '
       + 'share kept readable, and journals `usage-reconciled` or `usage-missing` once per request.',
-    status: 'covered', proof: 'packages/adapters/dsh/test/plugin.test.ts' },
+    status: 'covered', proof: 'test/plugin.test.ts' },
 ]);

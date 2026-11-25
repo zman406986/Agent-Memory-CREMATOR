@@ -4,7 +4,7 @@
  * A table answer that refused some rows is re-asked once, in a reduced table of
  * those rows only, as a new turn appended to the same fork. This module owns
  * that turn's bytes, and nothing else: the scheduling is the adapter's table
- * loop (`packages/adapters/dsh/src/judge-tables.ts`), the per-index reading is
+ * loop (`src/judge-tables.ts`), the per-index reading is
  * `./ask-answer.ts`, and the row renderer is `./ask-message.ts`.
  *
  * The message is the owner-approved text (ISSUE-113, 2026-10-29), with only its

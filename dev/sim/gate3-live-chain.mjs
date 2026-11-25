@@ -118,7 +118,7 @@
  *
  * The marker embeds the recall id, which is minted over the archive source's
  * node id. A live run's identity is the mount's own (`dsh:<session>:result:
- * <callId>`, `packages/adapters/dsh/src/mount-revert.ts:38`); the synthetic
+ * <callId>`, `src/mount-revert.ts:38`); the synthetic
  * fixture's builder names it `sim-result-<file>`. `--node-id auto` renders under
  * each form in that order and keeps the first that reproduces EVERY shaped body
  * — the transcript's own bytes are the oracle, and the form is printed and

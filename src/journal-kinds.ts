@@ -263,8 +263,10 @@ export const CREMATOR_JOURNAL_KINDS = [
   'seed-model-stale',
   // ISSUE-606: no main request has been observed yet (a restarted mount), so the
   // seed's tool list came from the host's logged request header instead of a
-  // capture; `tools` counts them. With `reason` instead, that fallback was
-  // refused by name and the ask keeps its `no-seed`.
+  // capture; `tools` counts them (`0` when the header states none — ADR-0077)
+  // and `promptNode` records whether surface node 0 was a `system/message`. With
+  // `reason` instead, that fallback was refused by name (`no-header`,
+  // `header-threw`, `malformed-tools`) and the ask keeps its `no-seed`.
   'seed-prefix',
   // the routed model's context window (ADR-0071, ADR-0072): `window-resolved`
   // names the route and the source when the host model-info seam answers;

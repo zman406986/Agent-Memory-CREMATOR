@@ -37,13 +37,18 @@ function textBlock(value: string): DshContentBlock {
   return { type: 'text', text: value };
 }
 
-/** One surface node as dsh exposes it: identity, type, blocks and the payload it rebuilds from. */
+/**
+ * One surface node as dsh exposes it: identity, type, blocks and the payload it
+ * rebuilds from. `pair` stamps a `user/message` with the `(turn, step)` it was
+ * appended in; the live mount appends an ask exchange's rows with none
+ * (ISSUE-074), so a caller that wants the paired shape must say so.
+ */
 function surfaceNode(
   id: string, seq: number, type: DshSurfaceType, blocks: readonly DshContentBlock[],
-  callId?: string,
+  callId?: string, pair?: { readonly turn: number; readonly step: number },
 ): DshSurfaceNode {
   const data: Record<string, unknown> = type === 'user/message'
-    ? { content: blocks, source: { kind: 'user' }, role: 'user', id }
+    ? { content: blocks, source: { kind: 'user' }, role: 'user', id, ...(pair ?? {}) }
     : { turn: 1, step: seq, message: {
         id, role: type === 'tool/result' ? 'tool' : type.replace('/message', ''),
         content: blocks,
@@ -181,12 +186,16 @@ function appendedText(session: FakeSession): readonly string[] {
  */
 function exchangeFixture(): { surface: readonly DshSurfaceNode[]; items: readonly DshTranscriptItem[] } {
   const base = keeplinesFixture();
-  return {
-    surface: [...base.surface.slice(0, 4),
-      surfaceNode('ask-1', 4, 'user/message', [textBlock('which lines do you keep?')]),
-      surfaceNode('answer-1', 5, 'user/message', [textBlock('{"keepall":true}')])],
-    items: base.items,
-  };
+  // Both rows carry the ONE pair the exchange was appended in, so the keep-all
+  // case exercises the `system/message` delete idiom and its `sections: []`
+  // source (ISSUE-609). The live mount appends these rows with NO pair at all
+  // (ISSUE-074); the keep-all case builds that shape too, and pins that the
+  // delete node borrows no later pair.
+  const ask = surfaceNode('ask-1', 4, 'user/message',
+    [textBlock('which lines do you keep?')], undefined, EXCHANGE_PAIR);
+  const answer = surfaceNode('answer-1', 5, 'user/message', [textBlock('{"keepall":true}')],
+    undefined, EXCHANGE_PAIR);
+  return { surface: [...base.surface.slice(0, 4), ask, answer], items: base.items };
 }
 
 /** A host seam that rebuilds what it splices, so the surface reads like dsh's. */
@@ -229,6 +238,9 @@ class ExchangeSession implements DshRevertSession {
 
 const EXCHANGE = { resultNodeId: 'result-1', askNodeId: 'ask-1', answerNodeId: 'answer-1',
   summary: '' };
+
+/** The `(turn, step)` an exchange was appended in, for the surfaces that carry one. */
+const EXCHANGE_PAIR = { turn: 2, step: 1 };
 
 test('a moved transcript revision refuses the entire request', async () => {
   const port = createDshPort({ sessionId: 'session-1', clock, transcript: [toolResult()] });
@@ -319,6 +331,19 @@ test('keep-all rewinds exactly the ask exchange and leaves the result turn untou
   assert.deepEqual(append.intent.surfaceOp, { op: 'replace', startSeq: 4, endSeq: 5 });
   assert.deepEqual([...append.intent.sourceEventSeqs], [4, 5]);
   // The range leaves the model wire: the replacement projects to no message.
+  // Only an empty system/developer/assistant message derives to none (dsh
+  // `deriveEventMessage`); a contentless `user/message` is an empty USER turn.
+  assert.equal(append.type, 'system/message',
+    'the delete idiom is a type the host projects to no message when empty');
+  const written = append.data['message'] as { readonly role?: unknown;
+    readonly content?: unknown; readonly source?: unknown };
+  assert.equal(written.role, 'system');
+  assert.deepEqual(written.content, []);
+  assert.deepEqual(written.source, { kind: 'system-prompt', sections: [] },
+    'the empty system/message keeps the alpha section fold inert (ISSUE-609)');
+  assert.deepEqual([append.data['turn'], append.data['step']],
+    [EXCHANGE_PAIR.turn, EXCHANGE_PAIR.step],
+    'the delete node keeps the pair of the position it took over');
   const blocks = session.surface().find(node => node.seq === 6)?.blocks ?? [];
   assert.deepEqual(blocks, [], 'a contentless node is how a range leaves the wire');
   // The landed result keeps its bytes and its id.
@@ -327,6 +352,43 @@ test('keep-all rewinds exactly the ask exchange and leaves the result turn untou
   assert.ok(port.transcript().some(item => item.id === 'result-1'));
   assert.equal(port.transcript().some(item => item.id === 'ask-1'), false);
   assert.equal(port.transcript().some(item => item.id === 'answer-1'), false);
+
+  // The LIVE shape (ISSUE-074): the mount appends BOTH exchange rows with no
+  // pair at all. The delete node must still be a type the host projects to none
+  // — a contentless `user/message` is an empty USER turn on the wire, and the
+  // host never drops one (`deriveEventMessage` returns its payload as-is).
+  const live = keeplinesFixture();
+  const liveSession = new ExchangeSession([...live.surface.slice(0, 4),
+    surfaceNode('ask-1', 4, 'user/message', [textBlock('which lines do you keep?')]),
+    surfaceNode('answer-1', 5, 'user/message', [textBlock('{"keepall":true}')])]);
+  const livePort = createDshPort({ sessionId: 'session-1', clock,
+    transcript: live.items, revert: liveSession });
+  const liveOutcome = livePort.rewindAskExchange({ ...EXCHANGE, summary: '' });
+  assert.equal(liveOutcome.status, 'applied', JSON.stringify(liveOutcome));
+  const liveWrite = liveSession.appends[0];
+  assert.equal(liveWrite?.type, 'system/message',
+    'an unpaired range still deletes through a type the host projects to none');
+  assert.equal(liveWrite?.data['turn'], undefined, 'no pair is invented');
+
+  // Its mixed twin: only the answer carries a pair, so the only pair on offer
+  // sits LATER than the position the replacement takes over. The delete node
+  // takes the position's own pair — none — and must not borrow that one:
+  // stamped with the answer's pair it would re-publish itself past the range it
+  // replaced, the write-side twin of the read-side clamp (ISSUE-608).
+  const mixed = keeplinesFixture();
+  const mixedSession = new ExchangeSession([...mixed.surface.slice(0, 4),
+    surfaceNode('ask-1', 4, 'user/message', [textBlock('which lines do you keep?')]),
+    surfaceNode('answer-1', 5, 'user/message', [textBlock('{"keepall":true}')],
+      undefined, EXCHANGE_PAIR)]);
+  const mixedPort = createDshPort({ sessionId: 'session-1', clock,
+    transcript: mixed.items, revert: mixedSession });
+  const mixedOutcome = mixedPort.rewindAskExchange({ ...EXCHANGE, summary: '' });
+  assert.equal(mixedOutcome.status, 'applied', JSON.stringify(mixedOutcome));
+  const mixedWrite = mixedSession.appends[0];
+  assert.equal(mixedWrite?.type, 'system/message',
+    'the mixed range deletes through a type the host projects to none');
+  assert.equal(mixedWrite?.data['turn'], undefined, 'no later pair is borrowed');
+  assert.equal(mixedWrite?.data['step'], undefined, 'no later pair is borrowed');
 });
 
 test('an entry application consumes the recorded exchange and lands the shaped turn', async () => {

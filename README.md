@@ -105,8 +105,9 @@ seal's negative-fact records, and (when the entry ask is enabled) its answers st
 
 ## Install
 
-Node `>=22.13.0 <23.0.0 || >=23.4.0`: `node:sqlite` is flagless from 22.13.0, and Node
-23.0.0–23.3.x are excluded.
+Node `>=22.16.0 <23.0.0 || >=24.0.0`: `node:sqlite` is flagless from 22.13.0, but the trash ledger
+reads `DatabaseSync.prototype.isTransaction` after a failed ROLLBACK (22.16.0 and 24.0.0 only),
+so every 23 release is excluded.
 
 ```sh
 npm install cremator-dsh
@@ -132,7 +133,7 @@ entry:
 ```yaml
 - insert:
     - id: cremator-mount
-      name: 'file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js'
+      name: 'file:///path/to/Agent-Memory-CREMATOR/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply
@@ -149,14 +150,14 @@ automatic trigger is disabled). The sample row sets the entry ask off; if you om
 code default runs the per-result cadence. The entry ask uses `floorBytes`; absent, a per-model table
 decides, with 512 as the fallback.
 `examples/dsh-mount/` shows the row shape. Mount details (config keys, storage layout, degradation
-behavior) are in [packages/adapters/dsh/README.md](packages/adapters/dsh/README.md). The default
+behavior) are in [`README.dsh.md`](README.dsh.md). The default
 storage root is `<DSH_HOME>/storages/cremator` (`DSH_HOME` defaults to `~/.dsh`). For OpenCode, see
 [packages/adapters/opencode/README.md](packages/adapters/opencode/README.md).
 
 The dsh adapter also installs as a dsh bundle. Point the profile at the local package directory:
 
 ```sh
-dsh plugin --profile <name> add link:<path to packages/adapters/dsh>
+dsh plugin --profile <name> add link:<path to this repo root>
 ```
 
 The host's Plugins page then lists CREMATOR, and the slash menu shows `/cremate`. A typed `/cremate`
@@ -167,7 +168,7 @@ message still triggers the same pass.
 | Package | What it carries |
 | --- | --- |
 | [`@cremator/core`](packages/core/README.md) | Meter, episodes, rules, prune families, guard, ledger, revert planner, engine; the core never imports harness code. |
-| [`cremator-dsh`](packages/adapters/dsh/README.md) | dsh adapter: seam mapping, the mount entry, the `forget` and `necromancy` tools (`necromancy` restores forgotten bytes by recall id). |
+| [`cremator-dsh`](README.dsh.md) | dsh adapter: seam mapping, the mount entry, the `forget` and `necromancy` tools (`necromancy` restores forgotten bytes by recall id). |
 | [`cremator-opencode`](packages/adapters/opencode/README.md) | OpenCode adapter: a thin seam mapping over OpenCode 2.4.0's context hooks and menu parts; functional tests only, live evidence withdrawn. |
 
 Install with `npm install cremator-dsh` or `npm install cremator-opencode`;
@@ -175,8 +176,8 @@ Install with `npm install cremator-dsh` or `npm install cremator-opencode`;
 
 ## Publishing
 
-Publish in dependency order: `@cremator/core@0.1.2` first, then `cremator-dsh@0.1.2` and
-`cremator-opencode@0.1.2`. Both adapters declare `"@cremator/core": "^0.1.0"`, so the core release
+Publish in dependency order: `@cremator/core@0.1.3` first, then `cremator-dsh@0.1.3` and
+`cremator-opencode@0.1.3`. Both adapters declare `"@cremator/core": "^0.1.3"`, so the core release
 must exist on the registry before either adapter tarball can install.
 
 ## License

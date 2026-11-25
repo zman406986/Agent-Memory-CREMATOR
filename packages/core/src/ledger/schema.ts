@@ -142,7 +142,7 @@ export function initializeSchema(db: DatabaseSync): void {
     const applicationId = pragmaValue(db, "application_id");
     if (applicationId !== 0 && applicationId !== LEDGER_APPLICATION_ID) {
       throw new LedgerError("unsupported-schema",
-        `Database is not a RACOONS trash ledger (application id ${String(applicationId)})`);
+        `Database is not a CREMATOR trash ledger (application id ${String(applicationId)})`);
     }
     assertCheckAdmitsOperations(db);
     db.exec(`PRAGMA application_id = ${LEDGER_APPLICATION_ID}`);

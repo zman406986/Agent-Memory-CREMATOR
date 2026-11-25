@@ -23,7 +23,7 @@ import {
   CREMATOR_PLUGIN_INJECT, CREMATOR_PLUGIN_NAME, createRacoonsMount, createRacoonsPlugin,
   engineConfig, eventIdFor, publishAppend, registerPluginTools, resolvePluginConfig,
   resolveSessionStorage, resolveStorage, resultFactsFromMeta, singleLiveSession,
-  surfaceTranscript, targetFromInput, toolResultItem,
+  surfaceTranscript, targetFromInput, toolResultItem, warnConfigSpellings,
 } from '../src/plugin.js';
 import type { Label, Row } from './rows.js';
 import { runRows } from './rows.js';
@@ -299,6 +299,18 @@ test('the plugin declares its name and seams, and resolvePluginConfig fills and 
   assert.equal(config.enforcement, 'apply');
   assert.equal(resolvePluginConfig({ enforcement: 'record-only' }).enforcement, 'record-only');
   assert.equal(resolvePluginConfig({ enforcement: 'apply' }).enforcement, 'apply');
+  // ISSUE-629: the guides document the nested spelling `protocol.enforcement`,
+  // and it reaches the engine through the SAME validator as the flat key. The
+  // flat key is the shipped spelling and wins when both are present.
+  const atEnforcement: Label = what => `row: enforcement spelling: ${what}`;
+  assert.equal(resolvePluginConfig({ protocol: { enforcement: 'record-only' } }).enforcement,
+    'record-only', atEnforcement('the documented nested spelling is the opt-out'));
+  assert.equal(resolvePluginConfig({ enforcement: 'apply',
+    protocol: { enforcement: 'record-only' } }).enforcement, 'apply',
+  atEnforcement('the flat key wins when both are present'));
+  assert.throws(() => resolvePluginConfig({ protocol: { enforcement: 'force' as 'apply' } }),
+    /enforcement must be "record-only" or "apply"/u,
+    atEnforcement('the nested value is refused by the same validator, not a second one'));
   assert.equal(config.recordName, 'racoons/negation');
   // The judge's two knobs: the shipped tagless arm, and the bounded stream.
   assert.equal(config.anchors, 'off');
@@ -315,11 +327,36 @@ test('the plugin declares its name and seams, and resolvePluginConfig fills and 
   // ADR-0050 decision 2: the absolute bar. Absent is null, so the deprecated
   // window half decides; an explicit value wins and is validated by name.
   assert.equal(config.pruneThresholdTokens, null);
-  // ADR-0050: the bar is absolute but the apply leg still plans against the
-  // host window, so a bar without a window is refused; both together resolve.
-  assert.throws(() => resolvePluginConfig({ pruneThresholdTokens: 60_000 }),
-    /requires contextWindowTokens/u);
+  // ADR-0078 (ISSUE-611): a bar with no window source is a sizing condition,
+  // not a config error, so the resolver no longer refuses it. The mount loads
+  // and names the condition once; the window is never guessed.
+  assert.equal(resolvePluginConfig({ pruneThresholdTokens: 60_000 })
+    .pruneThresholdTokens, 60_000);
+  {
+    const barRecords: { kind: string; [field: string]: unknown }[] = [];
+    const barMount = createRacoonsMount({
+      config: resolvePluginConfig({ pruneThresholdTokens: 60_000 }),
+      storage: resolveStorage(undefined),
+      journal: record => { barRecords.push(record as unknown as { kind: string }); },
+    });
+    try {
+      const mountLine = barRecords.find(line => line['kind'] === 'window-unresolved'
+        && line['scope'] === 'mount');
+      assert.ok(mountLine !== undefined,
+        'a bar with no window source mounts and names the condition');
+      assert.equal(mountLine['reason'], 'no-model-info-seam',
+        'the mount line reads the existing named state');
+      assert.equal(mountLine['pruneThresholdTokens'], 60_000,
+        'and names the bar it could not size');
+      assert.equal(barRecords.some(line => line['kind'] === 'window-resolved'), false,
+        'nothing invented a window');
+    } finally {
+      await barMount.close();
+    }
+  }
   // ADR-0071: the host's model-info seam is the other legal window source.
+  // The capability argument is accepted and ignored (ADR-0078), so a caller
+  // that still passes it resolves the same bar.
   assert.equal(resolvePluginConfig({ pruneThresholdTokens: 60_000 },
     { hostModelInfo: true }).pruneThresholdTokens, 60_000);
   assert.equal(resolvePluginConfig({
@@ -404,6 +441,31 @@ test('the plugin declares its name and seams, and resolvePluginConfig fills and 
   // accepted and ignored — an old config file must never crash a mount. Their
   // values never reach the engine: the thresholds carry the core defaults.
   assert.doesNotThrow(() => resolvePluginConfig({ capBytes: -1, capHeadBytes: 1.5 }));
+  // ISSUE-629: a misspelled top-level key is named once at startup and changes
+  // no resolved value (a host row reading `crematorStoragRoot` used to resolve
+  // the default root in silence). The keys the resolver accepts — the nested
+  // `protocol` object included — are never named, and a disagreement between
+  // the two enforcement spellings is named once, with both values.
+  {
+    const warns: string[] = [];
+    const typo = { crematorStoragRoot: 'C:/x' };
+    warnConfigSpellings(typo, message => { warns.push(message); });
+    assert.equal(warns.length, 1, at('a misspelled key is named exactly once'));
+    assert.match(warns[0] ?? '', /^unknown config key ignored: crematorStoragRoot$/u,
+      at('the warn names the unknown key, and says nothing else'));
+    assert.deepEqual(resolvePluginConfig(typo as never), resolvePluginConfig({}),
+      at('the typo leaves every resolved value alone'));
+    const quiet: string[] = [];
+    warnConfigSpellings({ enforcement: 'record-only', capBytes: 1, capHeadBytes: 2,
+      protocol: { enforcement: 'record-only' } }, message => { quiet.push(message); });
+    assert.deepEqual(quiet, [], at('accepted keys and the nested spelling are not named'));
+    const conflict: string[] = [];
+    warnConfigSpellings({ enforcement: 'apply', protocol: { enforcement: 'record-only' } },
+      message => { conflict.push(message); });
+    assert.equal(conflict.length, 1, at('a disagreement is named once'));
+    assert.match(conflict[0] ?? '', /enforcement="apply".*protocol\.enforcement="record-only"/u,
+      at('the warn names both values, the winner first'));
+  }
   const engine = engineConfig(resolvePluginConfig({ capBytes: 1024, capHeadBytes: 512,
     sealMaxLatencyTurns: 0, episodeNoNewPathSteps: 3, enforcement: 'apply' }));
   assert.equal(engine.thresholds.capBytes, 8192, 'the cap key is not wired');
@@ -1011,7 +1073,9 @@ test('G8: a reconciled usage reading reaches telemetry and the meter', async () 
  * The transcript's ordinal projection, all three paths: an appended node keeps
  * the (turn, step) pair it was written with, a walk across turns numbers the
  * pairs globally, and a replacement landing at a later log seq keeps the ordinal
- * of the position it took over — never its arrival seq (ISSUE-064 R-3).
+ * of the position it took over — never its arrival seq (ISSUE-064 R-3). The
+ * late-replacement row also drives the host's in-place system-prompt rewrite
+ * (ISSUE-608): a replace never stamps its node later than its position.
  */
 const ORDINAL_ROWS: readonly Row[] = [
   {
@@ -1098,24 +1162,58 @@ const ORDINAL_ROWS: readonly Row[] = [
       assert.deepEqual([result.turnOrdinal, result.stepOrdinal], [1, 5],
         at('the replacement carries the ordinal of the position it occupies, '
           + 'not its arrival seq (1:28)'));
-      for (let index = 1; index < projected.items.length; index += 1) {
-        const previous = projected.items[index - 1];
-        const current = projected.items[index];
-        assert.ok(previous !== undefined && current !== undefined,
-          at(`item ${String(index)} has both neighbours`));
-        assert.ok(current.turnOrdinal > previous.turnOrdinal
-          || (current.turnOrdinal === previous.turnOrdinal
-            && current.stepOrdinal >= previous.stepOrdinal),
-        at(`the walked ordinal decreases at ${current.id}: ${String(previous.turnOrdinal)}:`
-          + `${String(previous.stepOrdinal)} -> ${String(current.turnOrdinal)}:`
-          + `${String(current.stepOrdinal)} (a replace must not renumber the surface)`));
-      }
+      const walkMonotone = (items: readonly { id: string; turnOrdinal: number;
+        stepOrdinal: number }[]): void => {
+        for (let index = 1; index < items.length; index += 1) {
+          const previous = items[index - 1];
+          const current = items[index];
+          assert.ok(previous !== undefined && current !== undefined,
+            at(`item ${String(index)} has both neighbours`));
+          assert.ok(current.turnOrdinal > previous.turnOrdinal
+            || (current.turnOrdinal === previous.turnOrdinal
+              && current.stepOrdinal >= previous.stepOrdinal),
+          at(`the walked ordinal decreases at ${current.id}: ${String(previous.turnOrdinal)}:`
+            + `${String(previous.stepOrdinal)} -> ${String(current.turnOrdinal)}:`
+            + `${String(current.stepOrdinal)} (a replace must not renumber the surface)`));
+        }
+      };
+      walkMonotone(projected.items);
+
+      // ISSUE-608: the host's system-prompt normalization then rewrote node 0
+      // in place, stamped with the CURRENT pair (1:28), and emptied a later
+      // system node the same way. Both keep the ordinal of the position they
+      // occupy; unclamped, the head outranks every successor and the guard
+      // refuses the whole transcript as `adjacency-changed`.
+      const head = session.surface?.nodes?.[0];
+      assert.ok(head !== undefined, at('the system head is on the surface'));
+      session.append('system/message', { turn: 1, step: 28,
+        message: { role: 'system', content: [{ type: 'text', text: 'sys v2' }],
+          source: { kind: 'system-prompt' }, id: 'sys-normalized' } },
+      { surfaceOp: { op: 'replace', startSeq: head, endSeq: head },
+        sourceEventSeqs: [head] });
+      const laterHead = session.log.find((event) => event.type === 'system/message'
+        && event.surfaceOp === 'append' && event.seq > head);
+      assert.ok(laterHead !== undefined, at('a later system head is on the surface'));
+      session.append('system/message', { turn: 1, step: 28,
+        message: { role: 'system', content: [],
+          source: { kind: 'system-prompt' }, id: 'sys-emptied' } },
+      { surfaceOp: { op: 'replace', startSeq: laterHead.seq, endSeq: laterHead.seq },
+        sourceEventSeqs: [laterHead.seq] });
+      const normalized = surfaceTranscript(session, { sessionId: session.id });
+      assert.deepEqual([normalized.items[0]?.turnOrdinal, normalized.items[0]?.stepOrdinal],
+        [1, 1], at('the rewritten head keeps position 0\'s ordinal, not its 1:28 stamp'));
+      const emptied = normalized.items.find((item) => item.role === 'system'
+        && item.bytes.length === 0);
+      assert.ok(emptied !== undefined, at('the emptied system node is still projected'));
+      assert.deepEqual([emptied.turnOrdinal, emptied.stepOrdinal], [1, 2],
+        at('the emptied node keeps its position\'s ordinal, not its 1:28 stamp'));
+      walkMonotone(normalized.items);
     },
   },
 ];
 
 test('the ordinal projection holds for an append, a global walk and a late replacement '
-  + '(ISSUE-064)', async () => {
+  + '(ISSUE-064, ISSUE-608)', async () => {
   await runRows(ORDINAL_ROWS);
 });
 
@@ -1480,8 +1578,9 @@ test('the turn-stopping seam seals only for exactly one live session', async () 
   const dir = scratch();
   const listeners = new Map<string, (...args: never[]) => unknown>();
   const cleanups: (() => unknown)[] = [];
+  const warns: string[] = [];
   const ctx: DshMountContext = {
-    logger: { warn: () => {} },
+    logger: { warn: (message: string) => { warns.push(message); } },
     sessions: { list: () => [] },
     on: (event, listener) => { listeners.set(event, listener); return () => listeners.delete(event); },
     effect: (register) => { const fn = register(); if (typeof fn === 'function') cleanups.push(fn); },
@@ -1490,7 +1589,11 @@ test('the turn-stopping seam seals only for exactly one live session', async () 
   const plugin = createRacoonsPlugin({ storage: { databasePath: ':memory:' } });
   try {
     const session = fakeSession('session-turn-hook');
-    await plugin.apply(ctx, {});
+    // ISSUE-629: the startup warning for an unknown top-level key goes through
+    // the host logger ONCE, and the mount resolves as if the key were absent.
+    await plugin.apply(ctx, { crematorStoragRoot: 'C:/x' } as never);
+    assert.deepEqual(warns, ['racoons: unknown config key ignored: crematorStoragRoot'],
+      at('one startup warn names the misspelled key'));
     session.on((s, event) => {
       const listener = listeners.get('session/event');
       if (listener !== undefined) (listener as (session: FakeSession, event: DshMountEvent) => void)(s, event);

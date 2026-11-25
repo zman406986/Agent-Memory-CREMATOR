@@ -75,6 +75,17 @@ test("ROLLBACK keeps failing with the transaction open: a clear storage error na
     /reopen/.test(error.message) &&
     error.cause instanceof Error && error.cause.message === "original operation failure",
   "an unusable connection is refused by name with the original error as cause, never a poisoned BEGIN");
+  // ISSUE-621: a runtime whose `DatabaseSync` has no `isTransaction` (Node 22.13-22.15,
+  // every 23.x) cannot report whether the connection is still open. That unknown state
+  // must refuse by name exactly as an open one does, never read as "closed" and fall
+  // through to a raw "cannot start a transaction within a transaction" on the next BEGIN.
+  const legacy = new FakeConnection(Number.MAX_SAFE_INTEGER, false);
+  const withoutFlag = { exec: (sql: string): void => legacy.exec(sql) } satisfies TransactionConnection;
+  assert.throws(() => runTransaction(withoutFlag, originalFailure), (error: unknown) =>
+    error instanceof LedgerError && error.code === "storage" &&
+    /reopen/.test(error.message) &&
+    error.cause instanceof Error && error.cause.message === "original operation failure",
+  "a connection without isTransaction still refuses by name with the original error as cause");
 });
 
 test("the happy path commits and passes the operation's result through", () => {

@@ -18,8 +18,8 @@
  * last step. Everything that does NOT need the full stack — journal row
  * shape, the retry sequencing, answer-array order, marker wording — lives in
  * the fast unit tests instead (`mock-messages.test.mjs`,
- * `packages/adapters/dsh/test/entry-ask.test.ts`,
- * `packages/adapters/dsh/test/mount-entry.test.ts`).
+ * `test/entry-ask.test.ts`,
+ * `test/mount-entry.test.ts`).
  *
  * Non-vacuity: the runner takes `E2E_FLOOR_BYTES` and `E2E_ENTRY_REFUSE`, which
  * move the knobs the gate depends on. The second test below drives the floor

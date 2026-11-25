@@ -4,12 +4,12 @@
 #
 # `name` is a file:/// URL to the built entry, not a package specifier: after
 # `npm run build`, replace the placeholder with
-# `file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/dsh/dist/plugin.js`
+# `file:///C:/Users/TZhen/Desktop/racoons/dist/plugin.js`
 # (other owner device: `file:///C:/Users/TZ/Desktop/racoons/...`). Values are
 # the mount's flat config knobs; every key is optional.
 - insert:
     - id: racoons-mount
-      name: 'file:///path/to/racoons/packages/adapters/dsh/dist/plugin.js'
+      name: 'file:///path/to/racoons/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply

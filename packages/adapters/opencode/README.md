@@ -30,7 +30,7 @@ npm install cremator-opencode
 ```
 
 `@cremator/core` installs as a dependency. Requires Node
-`>=22.13.0 <23.0.0 || >=23.4.0`; the OpenCode API is duck-typed by the server
+`>=22.16.0 <23.0.0 || >=24.0.0`; the OpenCode API is duck-typed by the server
 part, never imported.
 
 ## Mount

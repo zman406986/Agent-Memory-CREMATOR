@@ -14,10 +14,10 @@
  *      fires, the same as the first trigger on a new session.
  *
  * Run: node dev/sim/trigger-shape-selftest.mjs
- * Requires: npm run build -w cremator-dsh (or the root build).
+ * Requires: npm run build (the root build).
  */
 import assert from 'node:assert/strict';
-import { PruneWindowTrigger } from '../../packages/adapters/dsh/dist/index.js';
+import { PruneWindowTrigger } from '../../dist/index.js';
 
 const WINDOW = 400_000;
 const BAR = 60_000;

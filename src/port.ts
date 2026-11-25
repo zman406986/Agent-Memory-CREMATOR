@@ -675,31 +675,41 @@ export class DshApplicationPort implements ApplicationPort {
   }
 
   /**
-   * ONE host append that replaces the exchange with a node that projects to no
-   * message. `system/message` with empty content is the host's own delete idiom
-   * and carries the host ordinals of the turn it takes over; when the exchange
-   * names no such ordinals, a contentless `user/message` is the only type the
-   * host accepts anywhere in a step.
+   * ONE host append that replaces the exchange with a node the host projects to
+   * NO model message. The host's projection decides the type
+   * (`dsh-session` `deriveEventMessage`): an empty `system/message`,
+   * `developer/message` or `assistant/message` derives to none, while
+   * `user/message` returns its payload unconditionally — so a contentless user
+   * turn is an empty turn on the wire, never a delete. The host also refuses
+   * `assistant/message` as a replacement, which leaves `system/message`: the
+   * host's own delete idiom, given `sections: []` so the alpha section fold
+   * stays inert and `rc.1` ignores the extra source field (ISSUE-609).
+   *
+   * The node carries the `(turn, step)` pair of the POSITION it takes over and
+   * nothing later: the ask exchange's rows are appended with no pair at all
+   * (ISSUE-074), so borrowing a later row's pair would re-publish the delete node
+   * past the range it replaced — the write-side twin of the read-side clamp in
+   * `contentOrdinal` (ISSUE-608). With no pair of its own the node carries none,
+   * and it still projects to no message.
    */
   private writeEmptyRange(
     session: DshRevertSession,
     range: { readonly startSeq: number; readonly endSeq: number;
       readonly shadowedSeqs: readonly number[]; readonly surface: readonly DshSurfaceNode[]; },
   ): DshEntryApplyOutcome {
-    let turn: number | null = null, step: number | null = null;
-    for (const seq of range.shadowedSeqs) {
-      const node = range.surface.find(candidate => candidate.seq === seq);
-      if (node !== undefined && isCount(node.data['turn']) && isCount(node.data['step'])) {
-        turn = node.data['turn']; step = node.data['step']; break;
-      }
-    }
+    // The position's OWN pair, never the earliest pair anywhere in the range: a
+    // range can be [unpaired user, paired answer], where the only pair on offer
+    // sits at the LATER node, not at the start the replacement takes over.
+    const start = range.surface.find(node => node.seq === range.startSeq);
+    const own = start !== undefined && isCount(start.data['turn']) && isCount(start.data['step'])
+      ? { turn: start.data['turn'], step: start.data['step'] } : null;
     const replacement: { type: DshAppendableType; data: Readonly<Record<string, unknown>> } =
-      turn !== null && step !== null
-        ? { type: 'system/message', data: { turn, step,
-            message: { id: randomUUID(), role: 'system', content: [],
-              source: { kind: 'system-prompt' } } } }
-        : { type: 'user/message', data: { id: randomUUID(), role: 'user', content: [],
-            source: { kind: 'user' } } };
+      { type: 'system/message', data: { ...(own === null ? {} : own),
+        message: { id: randomUUID(), role: 'system', content: [],
+          // sections:[] keeps the alpha host's section fold inert (ISSUE-609):
+          // a sectionless system/message would set needsRebuild and wipe the
+          // prefix cache on every removal. rc.1 ignores the extra field.
+          source: { kind: 'system-prompt', sections: [] } } } };
     try {
       const seq = session.append(replacement.type, replacement.data, {
         surfaceOp: { op: 'replace', startSeq: range.startSeq, endSeq: range.endSeq },

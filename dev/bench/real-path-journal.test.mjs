@@ -42,7 +42,7 @@ const SOURCE = readFileSync(join(BENCH_DIR, 'bench-run.mjs'), 'utf8');
 
 /** The two entries the racoons arm can mount. */
 const WRAPPER = 'C:/repo/dev/dsh-rig/rig-plugin.mjs';
-const SHIPPED = 'C:/dist/packages/adapters/dsh/src/plugin.js';
+const SHIPPED = 'C:/dist/src/plugin.js';
 
 /**
  * The least a Cordis context the mount needs to apply: an event bus, an effect

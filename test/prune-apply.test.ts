@@ -20,8 +20,9 @@
  *      file fails open: a corrupt read is 0, a failed write is journaled
  *      (CRITIC-022 P2 #6).
  *   5. nothing to apply sends no engine event, and the skip names which
- *      condition skipped it — `no-application`, `no-removals`, `no-window`
- *      (CRITIC-022 P2 #7, P3 #9).
+ *      condition skipped it — `no-application`, `no-removals` (CRITIC-022
+ *      P2 #7, P3 #9). A mount with no window never reaches the apply leg: the
+ *      pass stands down before the paid ask (ADR-0078; ISSUE-620).
  *   6. the apply line states the enforcement mode and revert capability the
  *      engine decided under, so an `unchanged` is readable (CRITIC-022 P2 #8).
  *   7. the event id is content-derived, so a reused round is a different event
@@ -314,6 +315,26 @@ test('a resolved host window reaches the apply leg and the removed-byte count', 
     windowFromHost: 200_000,
     answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
   try {
+    // ISSUE-608: the host normalized its system prompt before the pass — node 0
+    // rewritten in place and a later system head emptied, both stamped with the
+    // CURRENT (turn, step). The pass must still apply: each rewritten node keeps
+    // the ordinal of the position it occupies, so the guard's walk stays monotone.
+    const head = env.session.surfaceNodes[0];
+    assert.ok(head !== undefined, 'the system head is on the surface');
+    const laterHead = env.session.log.find(event => event.type === 'system/message'
+      && event.surfaceOp === 'append' && event.seq > head);
+    assert.ok(laterHead !== undefined, 'a later system head is on the surface');
+    env.session.append('turn/start', { turn: 4 });
+    env.session.append('step/start', { turn: 4, step: 1 });
+    env.session.append('system/message', { turn: 4, step: 1, message: { role: 'system',
+      content: [{ type: 'text', text: 'system prompt v2' }],
+      source: { kind: 'system-prompt' }, id: 'sys-normalized' } },
+    { surfaceOp: { op: 'replace', startSeq: head, endSeq: head } });
+    env.session.append('system/message', { turn: 4, step: 1, message: { role: 'system',
+      content: [], source: { kind: 'system-prompt' }, id: 'sys-emptied' } },
+    { surfaceOp: { op: 'replace', startSeq: laterHead.seq, endSeq: laterHead.seq } });
+    for (const event of env.session.log.slice(-4)) env.mount.observe(env.session, event);
+    env.mount.syncTranscript(env.entry, env.session);
     const outcome = await env.mount.runPrune(env.session);
     assert.ok(outcome !== null, 'the pass settled');
     const applied = env.records.records.find(record => record['kind'] === 'prune-apply');
@@ -822,28 +843,33 @@ test('a command step still observes the latch, and one step runs one pass', asyn
   }
 });
 
-test('a manual pass with a removal and no window records, and names no-window', async () => {
-  // CRITIC-022 P2 #7: the previous no-window test only ran a step and asserted
-  // no pass fired, so the `no-window` branch in the apply leg was never reached
-  // — a vacuous pin. Here the pass really produces a removal and the mount has
-  // no window, which is the exact state the branch exists for: record-only is
-  // the rollout's first stage, so nothing is sent to the engine and the skip
-  // says why.
-  const env = await mounted({ id: 's-no-window-removal',
-    answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
-  try {
-    const outcome = await env.mount.runPrune(env.session);
-    assert.equal(outcome?.application?.removals.length, 1, 'the pass did produce a removal');
-    assert.equal(env.records.records.some(record => record['kind'] === 'prune-apply'), false,
-      'with no window the pass is not handed to the engine');
-    const skipped = env.records.records.find(record => record['kind'] === 'prune-apply-skipped');
-    assert.equal(skipped?.['reason'], 'no-window', 'and the line names the known state');
-    assert.equal(env.session.log.filter(event => event.surfaceOp !== undefined
-      && event.surfaceOp !== 'append').length, 0, 'nothing moved on the host surface');
-  } finally {
-    await env.mount.close();
-  }
-});
+test('a manual pass with no window stands down before the paid ask, and names no-window',
+  async () => {
+    // CRITIC-022 P2 #7, re-pinned by ADR-0078/ISSUE-620: the window is a
+    // precondition of APPLYING, so it is checked before the ask. The old order
+    // sent the whole table and dropped the document in the apply leg afterwards
+    // — a full paid ask that could remove nothing, every time. This case used
+    // to assert the ask ran and the apply leg then skipped `no-window`; under
+    // the new order nothing leaves the seam at all.
+    const env = await mounted({ id: 's-no-window-removal',
+      answer: '{"2":{"forgetall":true,"summary":"an old read"}}' });
+    try {
+      assert.ok(env.llm !== undefined, 'the model seam exists, so a send was possible');
+      const outcome = await env.mount.runPrune(env.session);
+      assert.equal(outcome, null, 'the pass stood down and planned nothing');
+      assert.equal(env.llm.calls.length, 0, 'no ask left the seam');
+      assert.equal(env.records.records.some(record => record['kind'] === 'prune-apply'), false,
+        'nothing was handed to the engine');
+      assert.equal(env.records.records.some(record => record['kind'] === 'prune-apply-skipped'),
+        false, 'the apply leg was never reached, so it names no skip');
+      const off = env.records.records.find(record => record['kind'] === 'prune-off');
+      assert.equal(off?.['reason'], 'no-window', 'the standdown names the known state');
+      assert.equal(env.session.log.filter(event => event.surfaceOp !== undefined
+        && event.surfaceOp !== 'append').length, 0, 'nothing moved on the host surface');
+    } finally {
+      await env.mount.close();
+    }
+  });
 
 test('a pass whose answers remove nothing sends no engine event at all', async () => {
   const env = await mounted({ id: 's-no-removals', window: 1_000_000,

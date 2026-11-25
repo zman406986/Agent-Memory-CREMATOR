@@ -171,9 +171,12 @@ test('ISSUE-401: endSession drains a direct runPrune and a step ask that settle 
   const stepGate = gate();
   const model = gatedLlm([pruneGate, stepGate],
     ['{"keeplines":[[1,40],"None"]}', '{"keepall":true}']);
+  // A window is configured so the direct prune really reaches its ask: a mount
+  // with no window stands down before the ask (ADR-0078; ISSUE-620), and this
+  // case suspends the prune INSIDE that ask.
   const mount = createRacoonsMount({
     config: resolvePluginConfig({ floorBytes: 512, barBytes: 128,
-      entryAskTrigger: { mode: 'count' } }),
+      entryAskTrigger: { mode: 'count' }, contextWindowTokens: 1_000_000 }),
     storage: resolveStorage(undefined),
     journal: (record) => lines.push(record),
     llm: model.llm as never,
@@ -324,9 +327,10 @@ test('ISSUE-401: close drains an in-flight ask and a direct runPrune, then relea
   // Call 0 is the step's ask, call 1 the prune's; either order is a boundary.
   const model = gatedLlm([stepGate, pruneGate],
     ['{"keepall":true}', '{"keeplines":[[1,40],"None"]}']);
+  // Same reason as the case above: the prune boundary must be inside its ask.
   const mount = createRacoonsMount({
     config: resolvePluginConfig({ floorBytes: 512, barBytes: 128,
-      entryAskTrigger: { mode: 'count' } }),
+      entryAskTrigger: { mode: 'count' }, contextWindowTokens: 1_000_000 }),
     storage: resolveStorage(undefined),
     journal: (record) => lines.push(record),
     llm: model.llm as never,

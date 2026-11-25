@@ -3,7 +3,7 @@
  *
  * The mount's seams (host-event mapping, cap/seal publication, the S7 failure
  * rule, `session/event` never appending) are product code now and are tested in
- * `packages/adapters/dsh/test/plugin.test.ts`. This file tests only what the rig
+ * `test/plugin.test.ts`. This file tests only what the rig
  * owns: loading the compiled entry through `CREMATOR_RIG_DIST`, splitting the
  * rig's flat config, routing the journal to the evidence file, and opening the
  * rig's file-backed ledger so a later process can recall from it.

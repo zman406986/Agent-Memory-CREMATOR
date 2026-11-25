@@ -33,7 +33,7 @@
  *   recordName    `--record-name`, defaulting to `lane`
  *   source        `<recordName>/entry-ask` when an ask decided the row — the
  *                 mount's appended ask carries a `source.kind` of that form
- *                 (`packages/adapters/dsh/src/journal-kinds.ts:40-45`); `null`
+ *                 (`src/journal-kinds.ts:40-45`); `null`
  *                 when no ask decided it (ask-failed-fail-open, or the engine's
  *                 at-rest proof burn). The converter's output does not carry the
  *                 plugin's `recordName`, so the record's arm name stands in

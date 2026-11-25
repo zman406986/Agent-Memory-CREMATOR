@@ -139,6 +139,20 @@ export class RacoonsClosingError extends Error {
 export type RacoonsEnforcement = NonNullable<ProtocolConfig['enforcement']>;
 
 /**
+ * The nested config object the guides document (ISSUE-629).
+ *
+ * `README.md` and `docs/guides/ref-using-cremator.md` state the opt-out as
+ * `config.protocol.enforcement: "record-only"`. The resolver used to read the
+ * flat key alone, so the documented spelling resolved to `apply` — more
+ * removal than the operator asked for, with no warning. Only `enforcement` is
+ * read here, and it is the same value type as the flat key: one vocabulary,
+ * one validator (`resolvePluginConfig`).
+ */
+export interface RacoonsProtocolConfig {
+  readonly enforcement?: RacoonsEnforcement;
+}
+
+/**
  * The entry-ask trigger the mount accepts: core's two cadences plus `off`
  * (ADR-0050 decision 4). `off` is a mount-level product configuration, not an
  * engine cadence, so it is not added to core's `EntryAskTriggerConfig`.
@@ -257,6 +271,13 @@ export interface RacoonsPluginConfig {
    * nothing, so a config value is never a capability claim.
    */
   readonly enforcement?: RacoonsEnforcement;
+  /**
+   * The documented nested spelling of `enforcement` (ISSUE-629). The flat key
+   * above is the shipped spelling and wins when both are present; the mount
+   * names a disagreement between the two once at startup
+   * (`warnConfigSpellings`). Nothing else in this object is read.
+   */
+  readonly protocol?: RacoonsProtocolConfig;
   /** The `source.kind` an appended negative fact carries. */
   readonly recordName?: string;
   /** The ask stream's deadline in ms; `0` disables it. Default 120 s. */
@@ -1031,6 +1052,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * The nested spelling's value: `protocol.enforcement` (ISSUE-629).
+ *
+ * A host config is untyped JSON, so `protocol` is read as `unknown`: anything
+ * that is not an object carries no enforcement value. The returned value is
+ * whatever the operator spelled; `resolvePluginConfig`'s one enforcement
+ * check is what accepts or refuses it, so this reader adds no vocabulary.
+ */
+function nestedEnforcementOf(config: RacoonsPluginConfig): unknown {
+  const protocol: unknown = config.protocol;
+  if (!isRecord(protocol)) return undefined;
+  return protocol['enforcement'];
+}
+
 /** True when the signal exists and is aborted; a helper keeps TS from over-narrowing. */
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal !== undefined && signal.aborted;
@@ -1080,7 +1115,15 @@ function sameTriggerState(a: PruneWindowTriggerState | null,
     && a.baselinePending === b.baselinePending;
 }
 
-/** Validate the flat knobs and fill the engine's defaults. */
+/**
+ * Validate the flat knobs and fill the engine's defaults.
+ *
+ * `capabilities.hostModelInfo` is accepted and ignored (ADR-0078). It used to
+ * gate a refusal for a `pruneThresholdTokens` bar with no window source; the
+ * mount now loads and names that state instead (`window-unresolved` with
+ * `scope: 'mount'`), so no caller value decides whether a bar is configurable.
+ * The parameter stays in the signature so an existing caller keeps compiling.
+ */
 export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
   capabilities: { readonly hostModelInfo?: boolean } = {}): ResolvedRacoonsConfig {
   const config: RacoonsPluginConfig = isRecord(raw) ? raw : {};
@@ -1128,7 +1171,14 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
   // engine reads the structural flag and records the answers with
   // `unsupported-capability` (`packages/core/src/engine/engine.ts`,
   // `settleVerdicts`), so this default can never manufacture a removal.
-  const enforcement = config.enforcement ?? 'apply';
+  // ISSUE-629: the guides document the nested spelling `protocol.enforcement`.
+  // Both spellings resolve here and the value that wins goes through the ONE
+  // enforcement check below, so the documented opt-out reaches the engine and
+  // a bad value is refused by the same name whichever key carried it. The flat
+  // key is the shipped spelling and wins when both are present;
+  // `warnConfigSpellings` names a disagreement once at startup, so the
+  // operator can see which one won.
+  const enforcement: unknown = config.enforcement ?? nestedEnforcementOf(config) ?? 'apply';
   const recordName = config.recordName ?? 'racoons/negation';
   // ADR-0028: accepted and ignored — no ask reads an anchor arm any more.
   const anchors = config.anchors ?? 'off';
@@ -1145,15 +1195,13 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
   // The window alone stays as the deprecated compatibility path; the same
   // validator arms both, so no config value can reach the latch unvalidated.
   const pruneThresholdTokens = resolvePruneThresholdTokens(config.pruneThresholdTokens);
-  // The apply leg still plans against the host window (`applyPrunePass` refuses
-  // `no-window`), so a bar needs either a configured window or a host that can
-  // answer the routed model's capacity (ADR-0071). Refuse a row that has
-  // neither here, before a pass can fire and never apply.
-  if (pruneThresholdTokens !== null && contextWindowTokens === null
-      && capabilities.hostModelInfo !== true) {
-    throw new Error('cremator: pruneThresholdTokens requires contextWindowTokens '
-      + 'or a host llm.resolveModelInfo seam (the apply leg plans against the host window)');
-  }
+  // ADR-0078 (ISSUE-611): a bar with no window source is a sizing condition,
+  // not a config error, so nothing is refused here. The mount loads, names the
+  // condition once (`window-unresolved` with `scope: 'mount'`), and keeps the
+  // automatic pass off until a window resolves: the latch gate reads no window
+  // and the apply leg refuses itself by name (`no-window`), keeping every unit.
+  // That is why `capabilities.hostModelInfo` is no longer read — no window is
+  // ever guessed, and none is needed to load.
   // Owner ruling 2026-10-24: the backstop ships ON. The host's native compaction
   // stays armed, and racoons must fire earlier than the host's own trigger would
   // (the ruling applies to any harness, not only dsh); `false` is the opt-out.
@@ -1236,10 +1284,60 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
  *
  * `capBytes` / `capHeadBytes` are named here because ADR-0014 made them
  * accepted-and-ignored: the resolver deliberately never reads them, so the
- * resolved object cannot carry them.
+ * resolved object cannot carry them. The nested `protocol` object of
+ * ISSUE-629 is accepted for its one member and is left out of this list for
+ * the same reason — the resolved config states that value flat — so
+ * `unknownConfigKeys` adds it to this surface rather than keeping a second
+ * list of accepted keys.
  */
 export function racoonsPluginConfigKeys(): readonly string[] {
   return Object.freeze([...Object.keys(resolvePluginConfig({})), 'capBytes', 'capHeadBytes']);
+}
+
+/**
+ * The one accepted top-level key the resolved object cannot carry (ISSUE-629):
+ * `protocol` is read for its `enforcement` member alone, and the resolved
+ * config states that one value flat.
+ */
+const NESTED_PROTOCOL_KEY = 'protocol';
+
+/**
+ * The top-level keys of `raw` this entry reads nothing from (ISSUE-629).
+ *
+ * The accepted surface is the resolver's own key list plus the nested spelling,
+ * so a key the resolver starts reading is accepted here without a second edit.
+ * An unknown key is otherwise silent: `{crematorStoragRoot: 'C:/x'}` resolves
+ * exactly like `{}`, and the operator gets the default root with no signal.
+ */
+export function unknownConfigKeys(raw: unknown): readonly string[] {
+  const config: Readonly<Record<string, unknown>> = isRecord(raw) ? raw : {};
+  const accepted = new Set([...racoonsPluginConfigKeys(), NESTED_PROTOCOL_KEY]);
+  return Object.freeze(Object.keys(config).filter((key) => !accepted.has(key)).sort());
+}
+
+/**
+ * Name the operator's config mistakes once, at startup (ISSUE-629).
+ *
+ * Two statements, at most one of each per call: the unknown top-level keys, and
+ * a disagreement between the flat `enforcement` and the nested
+ * `protocol.enforcement`. Neither changes a resolved value — the resolver reads
+ * what it reads — and a key it accepts is never named, the nested object
+ * included. The caller supplies the sink, so nothing here decides whether a
+ * mount has one.
+ */
+export function warnConfigSpellings(raw: unknown, warn: (message: string) => void): void {
+  const unknown = unknownConfigKeys(raw);
+  if (unknown.length > 0) {
+    warn(`unknown config key${unknown.length === 1 ? '' : 's'} ignored: ${unknown.join(', ')}`);
+  }
+  const config: Readonly<Record<string, unknown>> = isRecord(raw) ? raw : {};
+  const flat = config['enforcement'];
+  const protocol = config[NESTED_PROTOCOL_KEY];
+  const nested = isRecord(protocol) ? protocol['enforcement'] : undefined;
+  if (flat !== undefined && nested !== undefined && flat !== nested) {
+    warn('enforcement is stated twice and the flat key wins: enforcement='
+      + `${JSON.stringify(flat)} over protocol.enforcement=${JSON.stringify(nested)}`);
+  }
 }
 
 /**
@@ -1575,6 +1673,30 @@ function inheritedOrdinal(event: DshMountEvent,
 }
 
 /**
+ * The ordinal a surface event's content carries (ISSUE-064, ISSUE-608). A node
+ * that states its own `(turn, step)` takes that pair's global ordinal; a node
+ * that states none inherits the position it replaced. One clamp: a replace
+ * never stamps its node LATER than the position it took over. The host
+ * rewrites the system prompt in place stamped with the CURRENT `(turn, step)`
+ * (dsh's system-prompt normalization, and the empty-tail rewrite that rides
+ * with it); unclamped, the head node outranks every successor and the guard
+ * refuses the whole transcript as `adjacency-changed`. A content-only replace
+ * carries the position's own pair (ISSUE-064), so the clamp leaves that path
+ * unchanged.
+ */
+function contentOrdinal(event: DshMountEvent,
+  stepAt: ReadonlyMap<string, number>,
+  ordinalAt: ReadonlyMap<number, { turn: number; step: number }>,
+): { turn: number; step: number } | null {
+  const own = ownOrdinal(event, stepAt);
+  const inherited = inheritedOrdinal(event, ordinalAt);
+  if (own === null) return inherited;
+  if (inherited === null) return own;
+  const movesForward = own.turn > inherited.turn || own.step > inherited.step;
+  return movesForward ? inherited : own;
+}
+
+/**
  * Walk a session's log once and return, for every surface position, the host
  * transcript item the port should hold.
  *
@@ -1591,7 +1713,10 @@ function inheritedOrdinal(event: DshMountEvent,
  *     ordinal of the position it replaced; the log position is only the
  *     fallback for a node with neither. Stamping the arrival seq instead
  *     makes the walk decrease (`1:28` then `1:5`) and the guard latches
- *     `adjacency-changed`.
+ *     `adjacency-changed`. One clamp (ISSUE-608): a replace never stamps its
+ *     node later than the position it took over — the host's in-place system
+ *     prompt rewrite carries the CURRENT pair, and unclamped it would put the
+ *     head after every successor.
  *
  * `beforeSeq` cuts the surface at one seq, exclusive. The dsh port grows by
  * appending the result it is handed, so the snapshot it plans against must be
@@ -1645,7 +1770,7 @@ export function surfaceTranscript(session: DshMountSession, options: {
     // The log position's ordinal is the fallback, never the rule: a replace's
     // own pair (or the position it took over) decides what it is stamped with,
     // and the resolved map makes a chain of replaces inherit transitively.
-    ordinalAt.set(seq, ownOrdinal(event, stepAt) ?? inheritedOrdinal(event, ordinalAt)
+    ordinalAt.set(seq, contentOrdinal(event, stepAt, ordinalAt)
       ?? { turn, step: globalStep });
   }
   const nodes = Array.isArray(session.surface?.nodes) ? session.surface.nodes : [];
@@ -1768,14 +1893,6 @@ export function createRacoonsMount(options: {
   readonly warn?: (message: string) => void;
 }): RacoonsMount {
   const { config, storage } = options;
-  // A resolved config can reach here without passing through
-  // `resolvePluginConfig` (a direct caller or a test). The same rule applies:
-  // a bar needs a configured window or the host model-info seam (ADR-0071).
-  if (config.pruneThresholdTokens !== null && config.contextWindowTokens === null
-      && typeof options.llm?.resolveModelInfo !== 'function') {
-    throw new Error('cremator: pruneThresholdTokens requires contextWindowTokens '
-      + 'or a host llm.resolveModelInfo seam (the apply leg plans against the host window)');
-  }
   const clock: Clock = options.clock ?? { nowMs: () => Date.now() };
   const emit = options.journal ?? (() => {});
   const journal = (kind: RacoonsJournalKind, fields: Record<string, unknown>): void => {
@@ -1790,6 +1907,30 @@ export function createRacoonsMount(options: {
   const safeWarn = (message: string): void => {
     try { options.warn?.(message); } catch { /* a warn sink must never change an outcome */ }
   };
+  /**
+   * ADR-0078 (ISSUE-611): a configured bar with no window source is a sizing
+   * condition, never a mount-integrity failure. A resolved config can reach here
+   * without passing through `resolvePluginConfig` (a direct caller or a test),
+   * so the condition is named here once per mount, in the same
+   * journal-and-continue shape as the route validation below. Nothing else
+   * changes: the per-route `window-unresolved` line still names
+   * `no-model-info-seam` at each boundary, the latch gate reads no window (so no
+   * automatic pass is scheduled), and the apply leg refuses by name
+   * (`no-window`) and keeps every unit. The window is never guessed (ADR-0071).
+   */
+  if (config.pruneThresholdTokens !== null && config.contextWindowTokens === null
+      && typeof options.llm?.resolveModelInfo !== 'function') {
+    journal('window-unresolved', {
+      // `scope: 'mount'` separates this line from the per-route ones: no route
+      // is known yet, so `provider`/`model` are null and the bar is named.
+      scope: 'mount', provider: null, model: null,
+      reason: 'no-model-info-seam',
+      pruneThresholdTokens: config.pruneThresholdTokens,
+      message: 'pruneThresholdTokens has no window source: the host exposes no '
+        + 'llm.resolveModelInfo seam, so automatic prune passes stay off and the '
+        + 'manual pass reports no-window',
+    });
+  }
   /**
    * The configured route, validated and normalized ONCE at mount (ISSUE-427).
    * `routeConfigured` separates "no fixed route" (the host header decides) from
@@ -2478,8 +2619,12 @@ export function createRacoonsMount(options: {
     // merely for being below a watermark. Only a real warm watermark can refuse
     // `cut-below-watermark`. The mount cannot derive one from dsh yet, so it
     // states the cache as `unknown` and lets the guard apply (ISSUE-024).
+    // ISSUE-615: the mode this session runs in, so a run log always says whether
+    // the verdict batch removes or only records. `record-only` stops the batch's
+    // apply leg alone; the proof rules still apply on the at-rest pass, and the
+    // mount's startup warn says the same sentence once.
     journal('capabilities', { sessionId, revertHistory: capabilities.revertHistory,
-      floorBytes,
+      floorBytes, enforcement: config.enforcement,
       reason: seam === null ? 'no-host-revert-seam' : 'host-session',
       cacheState: 'unknown' });
     // One config object per session, carrying this session's resolved floor, so
@@ -3446,14 +3591,20 @@ export function createRacoonsMount(options: {
    *
    * The system prompt is not in that header by design (`system?: never`): the
    * host carries it as the surface's node 0, a `system/message` event, which the
-   * projection keeps where the host put it. So the prompt is checked for
-   * presence and never guessed, and the system slot stays `''` — exactly what a
-   * captured loop-built request states, because a loop-built request leaves the
-   * slot undefined and the prompt is the leading message.
+   * projection keeps where the host put it. The prompt is never guessed and the
+   * system slot stays `''` — exactly what a captured loop-built request states,
+   * because a loop-built request leaves the slot undefined and the prompt is the
+   * leading message. ADR-0077: a surface whose node 0 is something else is
+   * recorded on the `seed-prefix` line (`promptNode: false`) and seeded anyway.
    *
-   * No prompt node, no header, no tools, a tool entry that is not a named schema
-   * (a blank name or a non-record is not a tool; a partial list is not a tool
-   * list), or a throw from the host read: null, one `seed-prefix` line naming
+   * The prompt node and the tool list are FACTS the line records, not gates
+   * (ADR-0077). A header that states no tools (or no `tools` key at all) seeds
+   * `tools: []`: core hashes whatever array it is handed (`seedFork`,
+   * packages/core/src/judge/fork.ts:161-183) and the projection already defaults
+   * a missing list to `[]` (`captureMainRequest`, src/main-wire.ts:150-151). Only
+   * a real absence refuses — no header at all, a throw from the host read, or a
+   * tool entry that is not a named schema (a blank name or a non-record; a
+   * partial list is not a tool list). Null means one `seed-prefix` line naming
    * the reason, and the caller keeps its named `no-seed`.
    */
   function hostSeedPrefix(session: DshMountSession, sessionId: string,
@@ -3465,27 +3616,27 @@ export function createRacoonsMount(options: {
     };
     const head = nodes[0];
     const first = head === undefined ? undefined : session.eventAt?.(head);
-    // A seed whose surface carries no prompt would be a conversation with no
-    // system turn; refuse by name instead of shipping it.
-    if (first === undefined || first.type !== 'system/message') {
-      return refuse('no-system-prompt');
-    }
+    // ADR-0077: the prompt node is a fact about the surface, not a gate. The
+    // system slot stays `''` either way, because the header carries no prompt.
+    const promptNode = first !== undefined && first.type === 'system/message';
     let header: unknown;
     try {
       header = typeof session.requestHeader === 'function' ? session.requestHeader() : undefined;
     } catch (error) {
       return refuse(`header-threw: ${messageOf(error)}`);
     }
-    // No header at all (an old or fake host) is a different absence from a
-    // header that states no tools: name each one.
+    // No header at all (an old or fake host) is a real absence: there is no
+    // prefix to rebuild from, so this one still refuses.
     if (!isRecord(header)) return refuse('no-header');
-    const tools = Array.isArray(header['tools']) ? header['tools'] : null;
-    if (tools === null || tools.length === 0) return refuse('no-tools');
+    // ADR-0077: an absent or empty tool list is a fact about the host's request,
+    // not a defect; only a list that is present and not well formed refuses.
+    const tools = Array.isArray(header['tools']) ? header['tools'] : [];
     if (!tools.every(tool => isRecord(tool) && typeof tool['name'] === 'string'
       && tool['name'].trim() !== '')) {
       return refuse('malformed-tools');
     }
-    journal('seed-prefix', { sessionId, source: 'request-header', tools: tools.length });
+    journal('seed-prefix', { sessionId, source: 'request-header', tools: tools.length,
+      promptNode });
     return { system: '', tools };
   }
 
@@ -4456,9 +4607,10 @@ export function createRacoonsMount(options: {
    * come from the port; the ask goes through the host's own model seam. The round ordinal is persisted beside the session's ledger, so a
    * resumed process continues the count instead of starting at round 1.
    *
-   * Record-only stays the structural default: a pass with no window configured
-   * applies nothing, and the record is telemetry. When a window IS configured
-   * the enforcement mode decides — `apply` hands the merged document to the
+   * Record-only stays the structural default: a pass whose mount has no window
+   * configured stands down BEFORE the ask (ADR-0078; ISSUE-620), because nothing
+   * it could ask about can be applied. When a window IS configured the
+   * enforcement mode decides — `apply` hands the merged document to the
    * engine's `{kind:'prune'}` input, which plans one checkpoint-revert for the
    * whole pass (one epoch break, ADR-0009); `record-only` still records.
    */
@@ -4529,6 +4681,19 @@ export function createRacoonsMount(options: {
           reason: standdown });
         note({ status: 'failed', code: 'ask-refused',
           message: `the pass stood down: ${standdown}` });
+        return null;
+      }
+      // ADR-0078 / ISSUE-620: an unknown window is a precondition of APPLYING,
+      // so it stands the pass down before it asks. The apply leg plans against
+      // the window, so a pass with none would pay for the whole table and then
+      // have its document dropped — the manual trigger asked every time and
+      // removed nothing. Same place and shape as the ledger standdown above: no
+      // request leaves the seam, no card opens, and the state is named once.
+      if (entry.windowTokens === null) {
+        journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
+          reason: 'no-window' });
+        note({ status: 'failed', code: 'no-window',
+          message: 'the model context window is unknown' });
         return null;
       }
       card = openAskCard(session);
@@ -4602,10 +4767,11 @@ export function createRacoonsMount(options: {
       }
       // The apply leg (ISSUE-022 chunk 6; ADR-0009): one engine event for the
       // whole pass, so the guard validates once and the pass costs exactly one
-      // checkpoint-revert. A mount with no window stays record-only, which is
-      // the rollout's first stage (ADR-0008). ISSUE-423: a compaction during the
-      // ask invalidated the array this document planned against, so it is
-      // refused by name instead of recording a receipt for the pre-ask array.
+      // checkpoint-revert. A mount with no window never reaches this line: the
+      // pass stood down before the ask (ADR-0078; ISSUE-620). ISSUE-423: a
+      // compaction during the ask invalidated the array this document planned
+      // against, so it is refused by name instead of recording a receipt for
+      // the pre-ask array.
       if (entry.compactionGeneration !== passGeneration) {
         cardText = { kind: 'error', text: 'prune ask refused: compaction-generation-changed' };
         journal('prune-off', { sessionId: entry.sessionId, round: entry.pruneRounds,
@@ -4643,15 +4809,13 @@ export function createRacoonsMount(options: {
         collectSettledReceipt(entry, applied.intentId);
       }
       // The command card counts what the apply leg actually landed: a pass the
-      // engine skipped (no window, record-only, nothing planned) removed
-      // nothing, whatever the plan proposed. An unresolved window is named as
-      // the reason instead of reading as a successful no-op (ADR-0071).
+      // engine skipped (record-only, nothing planned) removed nothing, whatever
+      // the plan proposed. A mount with no window never reaches this line — the
+      // pass stood down before the ask (ADR-0078; ISSUE-620) — so an unresolved
+      // window is not a card outcome here any more.
       const planned = outcome.application?.removals.length ?? 0;
       if (outcome.refusedFor === null) {
-        if (planned > 0 && entry.windowTokens === null) {
-          note({ status: 'failed', code: 'no-window',
-            message: 'the model context window is unknown' });
-        } else if (planned > 0 && applied === null) {
+        if (planned > 0 && applied === null) {
           note({ status: 'failed', code: 'failed',
             message: 'the apply leg produced no result' });
         } else {
@@ -6072,8 +6236,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
     name: CREMATOR_PLUGIN_NAME,
     inject: CREMATOR_PLUGIN_INJECT,
     async apply(ctx, rawConfig) {
-      const config = resolvePluginConfig({ ...options.config, ...rawConfig },
-        { hostModelInfo: typeof ctx.llm?.resolveModelInfo === 'function' });
+      const warn = (message: string): void => {
+        try { ctx.logger?.warn?.(`racoons: ${message}`); } catch { /* logging only */ }
+      };
+      // The row in force: the entry's own options first, the host's row over it.
+      const hostConfig = { ...options.config, ...rawConfig };
+      /**
+       * ISSUE-629: a misspelled top-level key, and an `enforcement` stated twice
+       * with two different values, are named once here rather than resolved
+       * silently. Both are startup statements about the config, so they come
+       * before the resolver can refuse a value: the operator sees the typo even
+       * when a neighbouring value does not parse.
+       */
+      warnConfigSpellings(hostConfig, warn);
+      // No capability argument (ADR-0078): a bar with no window source is named
+      // at the mount, so nothing here decides whether the row is configurable.
+      const config = resolvePluginConfig(hostConfig);
       const storage = resolveStorage(options.storage, config.crematorStorageRoot);
       /**
        * ISSUE-424 / ISSUE-577 / ADR-0075: one live mount per durable root. The
@@ -6094,9 +6272,6 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
       // and the bulk prune) journal their own off-lines instead of pretending
       // they asked.
       const llm = ctx.llm ?? undefined;
-      const warn = (message: string): void => {
-        try { ctx.logger?.warn?.(`racoons: ${message}`); } catch { /* logging only */ }
-      };
       /**
        * The wiring's own journal for a flush's set-aside row (ISSUE-523 item 2).
        * The mount keeps its journal private; this one reaches the same sink the
@@ -6131,6 +6306,19 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
         if (registryKey !== null) {
           activePluginMounts.set(registryKey, { mount, config, shares: 1 });
         }
+      }
+      /**
+       * ISSUE-615: `record-only` is the verdict batch's opt-out, not a global
+       * one — the deterministic proof rules still remove on the at-rest pass.
+       * Nothing said so at runtime, and the name reads as "nothing is applied",
+       * so the mode is named once at startup (and on every session's
+       * `capabilities` line). `wiringConfig` is the plan in force: an apply that
+       * joined a live mount adopted that mount's own configuration.
+       */
+      if (wiringConfig.enforcement === 'record-only') {
+        warn('enforcement is record-only: automatic context removal for the verdict '
+          + 'batch is recorded but not applied, while deterministic proof removals '
+          + '(stale reads and superseded reads) still apply at rest');
       }
       /**
        * ISSUE-578 / ADR-0075: record this mount under the root's `mounts/`

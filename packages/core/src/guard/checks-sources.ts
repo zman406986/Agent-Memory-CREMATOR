@@ -10,7 +10,7 @@ import type { CheckContext, DeclaredRange } from "./context.js";
  * with one answer turn must key each row under a distinct event id — the
  * engine answers an event id once — and the shipped mount does that as
  * `<answer-node>#<row>`, while a one-row ask keeps the bare id
- * (`packages/adapters/dsh/src/plugin.ts`, `rowAnswerEventId`). The suffix is
+ * (`src/plugin.ts`, `rowAnswerEventId`). The suffix is
  * host state, never the model's text: a multi-row ask's row names its own
  * result and is the newest result available to its own answer, whatever landed
  * for the other rows.

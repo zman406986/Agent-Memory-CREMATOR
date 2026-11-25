@@ -2,7 +2,7 @@
  * Which `prune-threshold` journal lines are FIRES, and which are readings.
  *
  * The mount writes one `prune-threshold` line per step boundary that evaluated
- * the bar (`packages/adapters/dsh/src/plugin.ts`), and carries `crossed` to say
+ * the bar (`src/plugin.ts`), and carries `crossed` to say
  * whether that evaluation fired the half-window trigger. Before that change a
  * line existed only when the bar crossed, so readers counted lines as fires.
  * Counting every line now would turn a metric into an evaluation rate.

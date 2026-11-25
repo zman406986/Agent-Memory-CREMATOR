@@ -4,7 +4,7 @@
  * Contract this file lives under: the mount's host mapping (turn/step
  * numbering, turn-end completion, no-agent fallback, publication shapes) and
  * its durable storage seam (ADR-0013) are product code now, in
- * `packages/adapters/dsh/src/{plugin,storage}.ts`. This file only adapts the
+ * `src/{plugin,storage}.ts`. This file only adapts the
  * rig's harness concerns onto that entry:
  *
  *   1. load the compiled plugin from the dist tree (a dsh child does not strip
@@ -47,8 +47,7 @@ export async function loadShippedPlugin(dist) {
   if (typeof dist !== 'string' || dist === '') {
     throw new Error('racoons-mount: CREMATOR_RIG_DIST is not set; run dev/dsh-rig/build-dist.mjs and launch through run.mjs');
   }
-  const entry = await import(pathToFileURL(join(dist, 'packages', 'adapters', 'dsh', 'src',
-    'plugin.js')).href);
+  const entry = await import(pathToFileURL(join(dist, 'src', 'plugin.js')).href);
   const core = await import(pathToFileURL(join(dist, 'packages', 'core', 'src', 'index.js')).href);
   if (typeof entry.createRacoonsPlugin !== 'function') {
     throw new Error(`racoons-mount: ${dist} carries no createRacoonsPlugin; rebuild the dist tree`);

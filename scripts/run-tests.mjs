@@ -80,6 +80,13 @@ export async function discoverTests() {
       `${withoutTests.length === 1 ? 'that package' : 'those packages'}.`,
     );
   }
+  // The repo root is the published `cremator-dsh` package, not a workspace member,
+  // so its own suite is named here instead of arriving through `workspaces`.
+  const rootTests = await collectTests(join(ROOT, 'test'));
+  if (rootTests.length === 0) {
+    throw new Error('test runner: no test files under test/. Cannot verify the root package.');
+  }
+  files.push(...rootTests);
   // The opencode bench lives outside the workspace packages. Its tests are part of
   // the default run, not only `npm run test:dev` (ISSUE-214 P4). The extension
   // list reaches every nested directory, so `dev/bench/multiturn/` and

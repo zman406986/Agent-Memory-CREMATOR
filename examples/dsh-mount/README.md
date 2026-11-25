@@ -14,7 +14,7 @@ patch row at the built file. See `patch.yml`; the row shape is the one the test 
    ```
 
 2. Set `name` in `patch.yml` to the built entry:
-   `file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js`. The checked-in row's
+   `file:///path/to/Agent-Memory-CREMATOR/dist/plugin.js`. The checked-in row's
    `config` is already the full block under *Config*; only `name` needs the built path.
 
 A bare `cremator-dsh/plugin` specifier resolves only after the package is installed into the profile;
@@ -60,7 +60,7 @@ depth table, so it removes when the table fires. `record-only` is the explicit o
 ```yaml
 - insert:
     - id: cremator-mount
-      name: 'file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js'
+      name: 'file:///path/to/Agent-Memory-CREMATOR/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply

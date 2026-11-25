@@ -152,7 +152,7 @@ test('watchdog (e) derive-run-b keeps a usage-less step in its message series', 
 /**
  * The shapes a cache-writing route produces. The host reports three DISJOINT
  * buckets and the product sums all three into the prompt it hands the meter
- * (`packages/adapters/dsh/src/usage.ts` `readAssistantUsage`), so the bench must
+ * (`src/usage.ts` `readAssistantUsage`), so the bench must
  * read the same three. `cacheWriteTokens: 0` is present as a zero in the
  * projcache files, absent entirely in every `session.v4.jsonl` recorded so
  * far — and it must keep the total where it was.

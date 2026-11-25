@@ -14,13 +14,17 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PACKAGES = [
   { dir: 'packages/core', name: '@cremator/core' },
-  { dir: 'packages/adapters/dsh', name: 'cremator-dsh' },
+  // The repo root is the published dsh package; `directory: '.'` says so to npm and
+  // to the plugin market, which reads the root manifest.
+  { dir: '.', name: 'cremator-dsh' },
   { dir: 'packages/adapters/opencode', name: 'cremator-opencode' },
 ];
 const REPO = 'https://github.com/zman406986/Agent-Memory-CREMATOR';
-const NODE_RANGE = '>=22.13.0 <23.0.0 || >=23.4.0';
+// ISSUE-621: the floor contains `DatabaseSync.prototype.isTransaction` (Node 22.16.0,
+// and v24.0.0 — never any 23.x), which the ledger's ROLLBACK retry reads.
+const NODE_RANGE = '>=22.16.0 <23.0.0 || >=24.0.0';
 // The two adapters: each declares its dependency on core in `dependencies`.
-const ADAPTERS = PACKAGES.filter(({ dir }) => dir.startsWith('packages/adapters/'));
+const ADAPTERS = PACKAGES.filter(({ dir }) => dir === '.' || dir.startsWith('packages/adapters/'));
 
 function manifest(dir) {
   return JSON.parse(readFileSync(join(ROOT, dir, 'package.json'), 'utf8'));
@@ -69,21 +73,27 @@ test('every publishable manifest names the repository, homepage, bugs and author
   }
 });
 
-test('the Node range excludes 23.0-23.3 and is the one sentence the README states', () => {
+test('the Node range excludes every 23.x and is the one sentence the README states', () => {
   for (const { dir, name } of PACKAGES) {
     assert.equal(manifest(dir).engines?.node, NODE_RANGE, `${name} engines.node drifted`);
   }
-  assert.ok(satisfies('22.13.0', NODE_RANGE));
+  // Pinned by literal as well: moving the floor below 22.16.0 admits a runtime whose
+  // `node:sqlite` has no `isTransaction`, which the ledger reads after a failed
+  // ROLLBACK (ISSUE-621).
+  assert.equal(NODE_RANGE, '>=22.16.0 <23.0.0 || >=24.0.0',
+    'the declared floor must contain DatabaseSync.prototype.isTransaction');
+  assert.ok(satisfies('22.16.0', NODE_RANGE));
+  assert.ok(satisfies('22.15.9', NODE_RANGE) === false);
   assert.ok(satisfies('22.12.9', NODE_RANGE) === false);
   assert.ok(satisfies('23.0.0', NODE_RANGE) === false);
   assert.ok(satisfies('23.1.0', NODE_RANGE) === false);
   assert.ok(satisfies('23.3.9', NODE_RANGE) === false);
-  assert.ok(satisfies('23.4.0', NODE_RANGE));
+  assert.ok(satisfies('23.4.0', NODE_RANGE) === false);
   assert.ok(satisfies('24.0.0', NODE_RANGE));
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
   assert.ok(readme.includes(`Node \`${NODE_RANGE}\``),
     'README Requirements does not state the manifest range');
-  assert.ok(readme.includes('23.0.0–23.3.x are excluded'),
+  assert.ok(readme.includes('every 23 release is excluded'),
     'README support sentence does not name the excluded range');
 });
 

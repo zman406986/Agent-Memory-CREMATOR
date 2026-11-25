@@ -1,31 +1,96 @@
 {
-  "name": "cremator",
-  "version": "0.1.0",
-  "private": true,
+  "name": "cremator-dsh",
+  "version": "0.1.3",
+  "private": false,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "Harness-agnostic context hygiene for coding agents: offload trash, do not summarize it.",
+  "description": "CREMATOR for dsh: removes dead tool output from the agent's context while it is fresh, and every removal is restorable byte-exact by recall id.",
+  "keywords": [
+    "context-management",
+    "context-window",
+    "context-hygiene",
+    "llm-agents",
+    "coding-agents",
+    "ai-agent",
+    "dsh-plugin",
+    "deepseek-harness",
+    "compaction"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zman406986/Agent-Memory-CREMATOR.git",
+    "directory": "."
+  },
+  "homepage": "https://github.com/zman406986/Agent-Memory-CREMATOR#readme",
+  "bugs": {
+    "url": "https://github.com/zman406986/Agent-Memory-CREMATOR/issues"
+  },
+  "author": {
+    "name": "zman406986",
+    "url": "https://github.com/zman406986"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.dsh.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.16.0 <23.0.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.0.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@cremator/core": "^0.1.3"
+  },
   "workspaces": [
     "packages/*",
     "packages/adapters/*"
   ],
   "scripts": {
-    "build": "npm run build -w @cremator/core && npm run build -w cremator-dsh && npm run build -w cremator-opencode",
+    "clean:dist": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean:dist && npm run build -w @cremator/core && tsc -p tsconfig.build.json && npm run build -w cremator-opencode",
+    "prepack": "npm run clean:dist && npm run build -w @cremator/core && tsc -p tsconfig.build.json",
     "pretest": "npm run build",
     "test": "node scripts/run-tests.mjs",
     "test:dev": "node --test \"dev/**/*.test.mjs\" \"scripts/check-core-purity.test.mjs\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check:purity": "node scripts/check-core-purity.mjs",
-    "check": "npm run typecheck && npm run check:purity && npm run test && npm run test:dev"
+    "check": "npm run typecheck && npm run check:purity && npm run test && npm run test:dev",
+    "privacy": "node dev/privacy/private-text-gate.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "es-module-lexer": "^3.0.4",
     "tsx": "^4.23.15",
     "typescript": "^5.9.0"
-  },
-  "engines": {
-    "node": ">=22.13.0 <23.0.0 || >=23.4.0"
   },
   "allowScripts": {
     "esbuild@0.28.2": true

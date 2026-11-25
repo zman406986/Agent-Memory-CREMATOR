@@ -17,7 +17,8 @@ revert planner.
 npm install @cremator/core
 ```
 
-Requires Node `>=22.13.0 <23.0.0 || >=23.4.0` (flagless `node:sqlite`). The
+Requires Node `>=22.16.0 <23.0.0 || >=24.0.0` (flagless `node:sqlite`, and the
+`DatabaseSync.isTransaction` the ledger reads after a failed ROLLBACK). The
 adapters install it as a dependency; install it directly only when using the
 core without an adapter.
 

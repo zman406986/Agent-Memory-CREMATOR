@@ -45,7 +45,7 @@ CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减�
 
 ## 安装
 
-Node `>=22.13.0 <23.0.0 || >=23.4.0`（这些版本里 `node:sqlite` 不用加 flag）。
+Node `>=22.16.0 <23.0.0 || >=24.0.0`（`node:sqlite` 从 22.13.0 起不用加 flag，但垃圾桶账本在 ROLLBACK 失败后要读 `DatabaseSync.prototype.isTransaction`，这个成员只有 22.16.0 和 24.0.0 才有，23.x 一概没有，所以 23 整个系列都被排除）。
 
 ```sh
 npm install cremator-dsh
@@ -70,7 +70,7 @@ dsh 是本项目开发时用的编码智能体 harness。OpenCode 用适配器 `
 ```yaml
 - insert:
     - id: cremator-mount
-      name: 'file:///path/to/Agent-Memory-CREMATOR/packages/adapters/dsh/dist/plugin.js'
+      name: 'file:///path/to/Agent-Memory-CREMATOR/dist/plugin.js'
       config:
         barBytes: 512
         enforcement: apply
@@ -80,14 +80,14 @@ dsh 是本项目开发时用的编码智能体 harness。OpenCode 用适配器 `
         nativeCompactionBackstop: true
 ```
 
-每个 `config` 键都可省，但有讲究：只写 `pruneThresholdTokens`、不写 `contextWindowTokens`，直接抛错，挂载失败；只写 `contextWindowTokens`，走已弃用的半窗路径；两个都省，自动 prune 不触发。示例配置用 `entryAskTrigger: { mode: 'off' }` 关掉 entry 询问（这个键只有 dsh 适配器有）；不写它，默认每个结果落地时问一次。这条通道留给手动或兼容场景用。config 键、存储布局、降级行为详见 [packages/adapters/dsh/README.md](packages/adapters/dsh/README.md)。不配存储时，垃圾账本落在 `<DSH_HOME>/storages/cremator`；DSH_HOME 没设，就是 `~/.dsh/storages/cremator`。把 URL 里的路径换成你本地克隆的绝对路径，指向 `packages/adapters/dsh/dist/plugin.js`；`file:///` 前缀保留，Windows 上写成 `file:///C:/...` 这种形式。
+每个 `config` 键都可省，但有讲究：只写 `pruneThresholdTokens`、不写 `contextWindowTokens`，直接抛错，挂载失败；只写 `contextWindowTokens`，走已弃用的半窗路径；两个都省，自动 prune 不触发。示例配置用 `entryAskTrigger: { mode: 'off' }` 关掉 entry 询问（这个键只有 dsh 适配器有）；不写它，默认每个结果落地时问一次。这条通道留给手动或兼容场景用。config 键、存储布局、降级行为详见 [`README.dsh.md`](README.dsh.md)。不配存储时，垃圾账本落在 `<DSH_HOME>/storages/cremator`；DSH_HOME 没设，就是 `~/.dsh/storages/cremator`。把 URL 里的路径换成你本地克隆的绝对路径，指向 `dist/plugin.js`；`file:///` 前缀保留，Windows 上写成 `file:///C:/...` 这种形式。
 
 [`examples/dsh-mount/`](examples/dsh-mount/README.md) 有完整写法，启动命令（从仓库根执行）：`dsh --profile headless --patch examples/dsh-mount/patch.yml "your task"`。[`examples/core-offline/`](examples/core-offline/README.md) 只跑 core，不带适配器。
 
 dsh 适配器也可以作为 dsh 插件包安装。把 profile 指向本地的包目录：
 
 ```sh
-dsh plugin --profile <name> add link:<本仓库 packages/adapters/dsh 的路径>
+dsh plugin --profile <name> add link:<本仓库根目录的路径>
 ```
 
 安装后，dsh 的插件页会列出 CREMATOR，斜杠菜单里会多出 `/cremate`；直接输入 `/cremate` 也仍然能触发同一轮清理。
@@ -99,7 +99,7 @@ dsh plugin --profile <name> add link:<本仓库 packages/adapters/dsh 的路径>
 | 包 | 内容 |
 | --- | --- |
 | [`@cremator/core`](packages/core/README.md) | 计量器（估算 prompt 的 token 数）、片段（episode，围绕一个目标归组的对话段）、规则、全有或全无的守卫、只追加的 SQLite 垃圾账本、回退规划器（core 定回退点与回执挂点，适配器写回保留行）、引擎。不导入任何 harness 代码。 |
-| [`cremator-dsh`](packages/adapters/dsh/README.md) | dsh 适配器：接缝映射、挂载入口、`forget` 与 `necromancy` 两个工具。`necromancy` 按召回 id 把删掉的字节原样还原。 |
+| [`cremator-dsh`](README.dsh.md) | dsh 适配器：接缝映射、挂载入口、`forget` 与 `necromancy` 两个工具。`necromancy` 按召回 id 把删掉的字节原样还原。 |
 | [`cremator-opencode`](packages/adapters/opencode/README.md) | OpenCode 适配器，细节见其 README。 |
 
 ## 许可证

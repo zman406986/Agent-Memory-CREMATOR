@@ -12,7 +12,7 @@ folded S7. This file says exactly which §6 rows that made green and which are s
 | S2 Cap **applies** as a surface replacement | **superseded (ADR-0014)** | No cap plan, marker or archive can exist. The replacement leg that survived is the entry checkpoint's (`run-entry-e2e.mjs`). |
 | S3 Seal of a failed-search episode | **green** | `scenarios/seal-failed-search.json`: two zero-match `grep`s (`meta.total === 0`, `truncated === false`) in one step; the turn-end at-rest pass seals the closed episode; one negative fact, no removal, evidence derived as `miss` (not `unknown`). |
 | S4 Seal applied at rest | **green** (append leg, with S3) | The session log holds one appended `user/message` whose `source.kind` is `racoons/negation` and it is the newest surface message; its text equals the published record byte for byte; the ledger's own summary records one sealed episode id. The row's "the next request's history contains it" clause is **not** assertable in this run: the seal lands at the turn-end seam, after the final request of a one-shot run. Asserting that clause needs a second-run resume or a two-turn script, which is a later scenario, not this one. |
-| S5 Revert via shadow-replace | **documented-blocked** (seam landed, scenario unbuilt) | ISSUE-024 chunk 1 landed the seam: the mount derives the host revert session (`packages/adapters/dsh/src/mount-revert.ts`) and declares `revertHistory` only when one exists, and `enforcement` now defaults to `apply` per ADR-0008. The one fact still blocking a live apply: dsh exposes no cache watermark, so core's fresh zone starts at the transcript end and every cut is refused `cut-below-watermark`. The scenario stays unbuilt rather than faked. |
+| S5 Revert via shadow-replace | **documented-blocked** (seam landed, scenario unbuilt) | ISSUE-024 chunk 1 landed the seam: the mount derives the host revert session (`src/mount-revert.ts`) and declares `revertHistory` only when one exists, and `enforcement` now defaults to `apply` per ADR-0008. The one fact still blocking a live apply: dsh exposes no cache watermark, so core's fresh zone starts at the transcript end and every cut is refused `cut-below-watermark`. The scenario stays unbuilt rather than faked. |
 | S6 Seam facts the adapter assumes | **green** | `agent/pre-step` precedes each request (the mount journals one `at-rest` per step and the cap scenario asserts a request count equal to the scripted steps); every `tool/result` carries `data.message` (the mount maps `message.content` to the item body); the outbound `messages` order equals the harness history (the replay projection check covers this, unchanged). |
 | S7 A failed result is never delivered | **green** | `scenarios/failed-result-not-delivered.json`: one oversized `pwsh` success and one failing `read` whose not-found body is also large; the mount observes the failure for the transcript, journals one `skip` with `reason: 'failed-result'` for the read, and leaves the failing result unreplaced in the session log. The spec row also names the three mock failure shapes (4xx, SSE `error`, truncated stream); those end a run non-zero at the *request*, not as a tool result, so they are covered by `mock-messages.test.mjs` and are not an S7 case. |
 | §8 tier 3, real call | **green, opt-in** | `scenarios/tier3-real-api.json` with `RIG_REAL_API=1 RIG_KILL_TIMER_MS=120000`. Exit 0 in 8.6 s; 2 requests; `assistant/message` usage rows carrying 246 output tokens total; `request/context` stamped with the route's provider and model; the answer named `port = 99999`. 16 assertions, including "mock never started" and "no record names 127.0.0.1". Perturbation (disable `credentials`) failed by name with `MISSING_CREDENTIAL` and zero usage rows. |
@@ -50,7 +50,7 @@ states a per-pass count as an ARRAY — `planUnits: [1,2,2]`, `tableUnits: [1,2,
 asked table in order — and a scalar keeps meaning "every table".
 
 What still blocks an **apply-mode** e2e: the mount's port state is `cache: {kind:'unknown'}`
-(`packages/adapters/dsh/src/port.ts`), and core's `computeFreshZone` starts the fresh zone at the
+(`src/port.ts`), and core's `computeFreshZone` starts the fresh zone at the
 transcript end for unknown cache. The knob a caller must state is `port.updateState({cache: {kind:
 'warm', watermarkNodeIndex: <n>}})`, which only the mount's own tests do; dsh exposes no watermark, so
 the rig cannot. An applying scenario needs either a host-derived watermark or a stated one, never a
@@ -58,7 +58,7 @@ faked `warm`.
 
 ## What the mount is, and what it is not
 
-`packages/adapters/dsh/src/plugin.ts` (subpath export `cremator-dsh/plugin`) is the shipped Cordis
+`src/plugin.ts` (subpath export `cremator-dsh/plugin`) is the shipped Cordis
 plugin: `createRacoonsPlugin(options)` returns `{ name: 'racoons', inject: ['sessions'], apply(ctx,
 config) }`. It owns the host mapping — which event becomes which `DshToolResultItem`, the turn/step
 numbering, turn-end completion, the no-agent fallback, and the two publication shapes — and it calls
@@ -79,11 +79,11 @@ legs read a closed database a different process wrote.
 
 A dsh child is plain Node and cannot import the workspace TypeScript. `dev/dsh-rig/build-dist.mjs`
 runs the repo's own `tsc` with `dev/dsh-rig/tsconfig.rig-dist.json` and emits `packages/core` +
-`packages/adapters/dsh` into `scratchpad/dsh-rig/dist/` (gitignored), plus the two `node_modules`
+`src/` into `scratchpad/dsh-rig/dist/` (gitignored), plus the two `node_modules`
 shims that make the bare `@cremator/core` and `cremator-dsh` specifiers resolve there. The build is
 stamped by a hash of the tsconfig and every included source, so repeated scenario runs reuse it.
 Nothing in the dist tree is committed. The wrapper imports the emitted
-`packages/adapters/dsh/src/plugin.js`; the dist emits subpath files as plain paths, so no package
+`src/plugin.js`; the dist emits subpath files as plain paths, so no package
 `exports` map is involved.
 
 ## Host facts slice C added to the spec's §1 list

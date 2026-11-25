@@ -268,7 +268,12 @@ test('ISSUE-433: an opened session is evicted on session/end as before', async (
 
 test('ISSUE-402: a pending /cremate request is cleared by eviction, not replayed on reopen', async () => {
   const lines: Line[] = [];
-  const mount = createRacoonsMount({ config: resolvePluginConfig({}),
+  // A window is configured so the /cremate request still runs a pass: a mount
+  // with no window stands down before the ask (ADR-0078; ISSUE-620), and this
+  // case is about the request's lifecycle across eviction. The half-window line
+  // (500,000) is far above this fixture's content, so nothing auto-fires.
+  const mount = createRacoonsMount({ config: resolvePluginConfig({
+    contextWindowTokens: 1_000_000 }),
     storage: resolveStorage(undefined), journal: (record) => lines.push(record) });
   const prunes = (): number => lines.filter((line) => line.kind === 'prune-recorded').length;
   try {

@@ -38,12 +38,12 @@ const TSCONFIG = join(RIG_DIR, 'tsconfig.rig-dist.json');
 const STAMP = join(DIST_DIR, '.stamp');
 const SOURCE_ROOTS = [
   join(REPO_ROOT, 'packages', 'core', 'src'),
-  join(REPO_ROOT, 'packages', 'adapters', 'dsh', 'src'),
+  join(REPO_ROOT, 'src'),
 ];
 /** Relative paths inside the dist tree the plugin imports by name. */
 const SHIMS = [
   { name: '@cremator/core', target: 'packages/core/src/index.js' },
-  { name: 'cremator-dsh', target: 'packages/adapters/dsh/src/index.js' },
+  { name: 'cremator-dsh', target: 'src/index.js' },
 ];
 
 function listTypeScript(dir, out = []) {
@@ -146,7 +146,7 @@ export function pluginFileUrl() {
 /** Import the emitted core and adapter, as the plugin does at apply time. */
 export async function importRuntime(distDir = DIST_DIR) {
   const core = await import(pathToFileURL(join(distDir, 'packages', 'core', 'src', 'index.js')).href);
-  const adapter = await import(pathToFileURL(join(distDir, 'packages', 'adapters', 'dsh', 'src', 'index.js')).href);
+  const adapter = await import(pathToFileURL(join(distDir, 'src', 'index.js')).href);
   return { ...core, ...adapter };
 }
 

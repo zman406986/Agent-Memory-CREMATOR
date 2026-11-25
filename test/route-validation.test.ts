@@ -104,9 +104,12 @@ interface JournalLine { readonly kind: string; readonly [field: string]: unknown
 
 function mountWith(route: unknown, journal: JournalLine[], llm: FakeLlm) {
   return createRacoonsMount({
+    // A window is configured so these cases still reach the ROUTE refusal they
+    // are about: a mount with no window now stands down before the ask and would
+    // name the window first (ADR-0078; ISSUE-620).
     config: resolvePluginConfig({ floorBytes: 512, barBytes: 64, capBytes: 1 << 20,
       episodeNoNewPathSteps: null, entryAskTrigger: { mode: 'count' },
-      entryAskGrammar: '3option' }),
+      entryAskGrammar: '3option', contextWindowTokens: 1_000_000 }),
     storage: resolveStorage(undefined),
     journal: record => journal.push(record),
     llm: llm as never,

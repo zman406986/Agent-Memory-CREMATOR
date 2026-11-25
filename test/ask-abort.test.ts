@@ -176,9 +176,12 @@ test('ISSUE-405: the host pre-step signal aborts the prune ask promptly', { time
     const session = fakeSession('s-prune-abort');
     const journal: JournalLine[] = [];
     const llm = stalledLlm();
+    // A window is configured so the prune ask really leaves the seam: this
+    // case is about aborting an in-flight ask, and a mount with no window now
+    // stands down before the ask (ADR-0078; ISSUE-620).
     const mount = mountWith({ barBytes: 64, capBytes: 1 << 20,
       episodeNoNewPathSteps: null, entryAskTrigger: { mode: 'off' },
-      judgeTimeoutMs: 0 }, llm, journal);
+      contextWindowTokens: 1_000_000, judgeTimeoutMs: 0 }, llm, journal);
     const controller = new AbortController();
     try {
       mount.observeWire({ sessionId: session.id, provider: ROUTE.provider,

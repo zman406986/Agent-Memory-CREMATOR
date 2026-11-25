@@ -401,7 +401,7 @@ const countOr0 = (value) => {
  *
  * The grant used to compare `billedPromptTokens` from `assistant/message` rows,
  * which is main prompt only. Asks never enter the session log
- * (`packages/adapters/dsh/src/llm-ask.ts` writes their usage to the mount
+ * (`src/llm-ask.ts` writes their usage to the mount
  * journal), completion tokens are summed but were never compared, and the
  * host's native compaction call (ISSUE-237) was outside every stream. A 50M
  * main-only grant therefore permitted a true spend of roughly 66–73M on the

@@ -61,7 +61,7 @@
  * This file makes no paid call by default. Evidence (send lane only) goes under
  * `scratchpad/launch/<yyyy-mm-dd>-replay-depth-table/` and is never committed.
  *
- * Build first: `npm run build -w @cremator/core && npm run build -w cremator-dsh`.
+ * Build first: `npm run build -w @cremator/core && npm run build`.
  */
 import fs from 'node:fs';
 import os from 'node:os';

@@ -12,7 +12,7 @@ to end) and ISSUE-022 chunk 5 (the record-only `/prune` round-trip). Committed h
 | `mock-messages.mjs` | Anthropic Messages SSE mock. Loopback only, `GET /health`, `POST /v1/messages`, per-request JSONL log with the lane (`main`/`entry`/`prune`/`compaction`/`post-compaction`/`title`; ADR-0028 removed the judge lane), title requests answered deterministically. |
 | `run.mjs` | Driver: throwaway `DSH_HOME`, patch file, `workFiles` seeding, one `dsh --profile headless` process (plus an optional session-resuming `secondLaunch`), kill timer per launch, assertions, evidence, canonical projection. A scenario with a `racoons` block mounts the plugin. |
 | `rig-plugin.mjs` | **A thin wrapper over the shipped entry.** Loads `cremator-dsh/plugin` from `CREMATOR_RIG_DIST`, routes its journal to `<evidence>/racoons/cremator-events.jsonl`, and points `crematorStorageRoot` at a throwaway directory under the evidence dir so the entry opens its own durable per-session ledger. It supplies no ledger: the product's storage seam is the one under test. The host mapping itself lives in the product package. |
-| `build-dist.mjs` + `tsconfig.rig-dist.json` | **The compile step.** Emits `packages/core` + `packages/adapters/dsh` to `scratchpad/dsh-rig/dist/` (gitignored) and writes the `node_modules` shims, because a dsh child does not strip TypeScript. |
+| `build-dist.mjs` + `tsconfig.rig-dist.json` | **The compile step.** Emits `packages/core` + `src/` to `scratchpad/dsh-rig/dist/` (gitignored) and writes the `node_modules` shims, because a dsh child does not strip TypeScript. |
 | `inspect-ledger.mjs` | Reads the rig ledger outside dsh: one recall by id (`--recall`) or the append-only summary. Used by the driver's ledger-side assertions. |
 | `replay.mjs` | Tier-2 converter: a zcode `transcript.jsonl` becomes a mock script, with redaction, mapping stats and a leak scan. |
 | `fixtures/replay-session.json` | One committed replay script (placeholder text mode: no recorded prose). |
@@ -32,7 +32,7 @@ to end) and ISSUE-022 chunk 5 (the record-only `/prune` round-trip). Committed h
 | `run-entry-e2e.mjs` | **The entry lane end to end** (ISSUE-058 chunk P3d). One real `dsh` session, four steps, the three answers scripted through `answers.entry`. Asserts the floor gate (over-floor asked, under-floor silent and journal-silent), keep-all rewind with the result node untouched, forgetall and keeplines as one atomic rewind+append each, the marker identity `landed = kept + gaps×markerBytes + summaryBytes + framing` with every term printed (every term measured: `kept` is located in the original body, so `framing` is the bytes that are none of the three), recall bound to the unit whose own marker named the id (byte-exact, whole body), and prefix discipline across the whole run. `E2E_FLOOR_BYTES` is its perturbation hook. |
 | `run-entry-e2e.test.mjs` | The gate around that runner: green, red-by-name when the floor is moved out of reach, and the synthetic-evidence legs no healthy run can produce — a crossed recall id (A's id returning B's bytes), a re-keyed or truncated archive, and one extra byte in a shaped turn (the framing term must catch it). |
 | `scenarios/entry-e2e.json` | The runner's scenario, rewritten each run beside it so the shape under test is reviewable in the diff. |
-| `rig-plugin.test.mjs` | Wrapper tests only (entry load, config split, evidence routing, storage-root derivation); the mount's seams are tested in `packages/adapters/dsh/test/plugin.test.ts`. |
+| `rig-plugin.test.mjs` | Wrapper tests only (entry load, config split, evidence routing, storage-root derivation); the mount's seams are tested in `test/plugin.test.ts`. |
 | `NOTES.md` | Which §6 matrix rows are green and which are still blocked; the table-lane recipe. |
 | `reference.md` | The compile step, the mount's seams and the Tier 3 lane, in detail. |
 
@@ -44,7 +44,7 @@ stated cache watermark; see `NOTES.md`).
 ```sh
 # every rig check. This glob includes run-entry-e2e.test.mjs, so the entry E2E
 # gate runs too: two real offline dsh sessions on top of the unit checks.
-# The mount's own seams are covered by packages/adapters/dsh/test/plugin.test.ts.
+# The mount's own seams are covered by test/plugin.test.ts.
 node --test "dev/dsh-rig/**/*.test.mjs"
 
 # the compile step on its own; a no-op when the sources are unchanged

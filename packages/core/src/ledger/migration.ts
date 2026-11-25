@@ -190,7 +190,7 @@ function planFor(main: string, facts: Facts): FilePlan {
   }
   if (facts.applicationId !== 0 && facts.applicationId !== LEDGER_APPLICATION_ID) {
     return { kind: "refuse", error: new LedgerError("unsupported-schema",
-      `Database is not a RACOONS trash ledger (application id ${String(facts.applicationId)})`) };
+      `Database is not a CREMATOR trash ledger (application id ${String(facts.applicationId)})`) };
   }
   if (facts.version === SCHEMA_VERSION || facts.version === 0) {
     // 0 is an uninitialized SQLite file: `initializeSchema` stamps it, or
