@@ -1,6 +1,7 @@
 # Bundle patch for cremator-dsh. Selected through `dsh.bundle.patch`.
 #
-# It contributes one row: the plugin itself. Install with
+# It contributes two rows: the plugin itself and a bare-name probe row that
+# exists only so dsh scans the package for its client manifest. Install with
 # `dsh plugin --profile web add cremator-dsh`: dsh selects this bundle on
 # install. Do not also insert the row by hand. Two rows with one id make the
 # settings form unaddressable.
@@ -19,3 +20,6 @@
         pruneThresholdTokens: 60000
         entryAskTrigger: { mode: 'off' }
         nativeCompactionBackstop: true
+    # Bare name: dsh's client-module scanner skips subpath rows.
+    - id: cremator-client
+      name: 'cremator-dsh'

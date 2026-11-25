@@ -60,6 +60,7 @@ import { JudgeRouteError, judgeRouteOf, normalizeJudgeRoute } from './route.js';
 import type { JudgeRoute } from './route.js';
 import { captureMainRequest, createMainWireCapture, seedRouteStale } from './main-wire.js';
 import type { CapturedMainRequest, MainWireCapture } from './main-wire.js';
+import { registerCrematedRoute } from './cremated-route.js';
 import { runRecordOnlyPrune, PRUNE_COMMAND } from './prune.js';
 import type { RecordOnlyPruneOutcome } from './prune.js';
 import { CREMATE_COMMAND_NAME, createCremateCommand, cremateMarkerOf } from './cremate-command.js';
@@ -541,6 +542,12 @@ export interface DshMountContext {
   commands?: DshCommandRegistry;
   tools?: DshToolHost;
   get?(name: string): unknown;
+  /**
+   * Cordis's dependency-scoped inject. Used here for the optional `webServer`
+   * service: it activates the counter route whenever the host has one, and
+   * never makes the mount depend on a browser.
+   */
+  inject?(deps: readonly string[], callback: (ctx: DshMountContext) => unknown): unknown;
 }
 
 /** The one model call an ask needs: stream a request, read its text deltas. */
@@ -6320,6 +6327,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
           + 'batch is recorded but not applied, while deterministic proof removals '
           + '(stale reads and superseded reads) still apply at rest');
       }
+      /**
+       * Display-only seam for the composer dock counter: one same-origin GET
+       * that sums this session's applied-removal bytes from the live ledger.
+       * A profile with no webserver, or a client that loads before this mount,
+       * simply gets no route and the dock renders "-"; neither is an error.
+       */
+      try {
+        ctx.inject?.(['webServer'], scoped => {
+          try {
+            const dispose = registerCrematedRoute(scoped.get?.('webServer'), mount);
+            if (dispose !== null) {
+              scoped.effect?.(() => () => { dispose(); }, 'racoons.cremated-route');
+            }
+          } catch { /* display only: never refuse the mount for a counter */ }
+        });
+      } catch { /* a host without inject keeps the mount */ }
       /**
        * ISSUE-578 / ADR-0075: record this mount under the root's `mounts/`
        * folder, so another process on the same folder can see it exists. The

@@ -1,5 +1,16 @@
 export const PACKAGE_NAME = 'cremator-dsh';
 
+/**
+ * Inert Loader entry. dsh's client-module scanner ignores rows whose `name` is
+ * a package subpath such as `cremator-dsh/plugin`; this bare-name row exists
+ * only so the package is scanned for its `dsh.client` manifest. It does nothing
+ * and deliberately imports no host module.
+ */
+export default {
+  name: 'cremator-bundle-probe',
+  apply() {},
+};
+
 export {
   DSH_CAPABILITIES, DSH_FULL_SEAM_CAPABILITIES, createDshCapabilities,
 } from './capabilities.js';
