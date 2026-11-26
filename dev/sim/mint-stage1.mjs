@@ -41,7 +41,7 @@
  *                  (§1(i), §7(c)). Two shapes, both real: the transcript's
  *                  `racoons:breaker-disabled:<session>` record (the engine's
  *                  `announceBreaker` → `publishAppend` row, whose text is
- *                  `RACOONS disabled after two validation failures…`), and, with
+ *                  `CREMATOR: only its automatic context removal…`), and, with
  *                  `--ledger`, a `breaker-disabled` event or a `validation`
  *                  carrying `adjacency-changed` (ISSUE-064).
  *   3. REPRODUCTION  the check handed over from T-4, run twice over the set:
@@ -136,8 +136,16 @@ const CLEAN_ENDINGS = Object.freeze(["turn/end", "turn/error", "session/end"]);
 
 /** The record id the engine appends when it disables the breaker (notice.ts). */
 const BREAKER_RECORD_PREFIX = "racoons:breaker-disabled:";
-/** The notice's own text, for a transcript that dropped the record id. */
-const BREAKER_NOTICE = "RACOONS disabled after two validation failures";
+/**
+ * The notice text's own prefixes, for a transcript that dropped the record id.
+ * ISSUE-613 moved the shipped copy to CREMATOR; captured fixtures still carry the
+ * retired spelling, because a record keeps the name it recorded (ADR-0059 §5).
+ * Both latch, so an old transcript and a new one are read the same way.
+ */
+const BREAKER_NOTICE_TEXTS = Object.freeze([
+  "CREMATOR: only its automatic context removal",
+  "RACOONS disabled after two validation failures",
+]);
 
 /** A refusal with the code a caller asserts on. */
 export class MintRefusal extends Error {
@@ -286,7 +294,7 @@ export function latchOf(rows) {
   for (const [rowIndex, row] of rows.entries()) {
     const recordId = recordIdOf(row);
     const latched = (recordId !== null && recordId.startsWith(BREAKER_RECORD_PREFIX))
-      || textOf(row).includes(BREAKER_NOTICE);
+      || BREAKER_NOTICE_TEXTS.some(text => textOf(row).includes(text));
     if (latched) return { rowIndex, seq: row?.seq ?? null, type: row?.type ?? null, recordId };
   }
   return null;

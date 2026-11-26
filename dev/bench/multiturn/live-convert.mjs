@@ -170,7 +170,7 @@ const FIXTURE_KEEP_FLOOR = 1280;
 const OLD_BAR_FLOOR = 8192;
 /**
  * The tool class a witness search filters on, from the SHIPPED classifier
- * (`src/evidence.ts:44-52`): `read`/`read_file`/`read-file` map to
+ * (`adapters/dsh/src/evidence.ts:44-52`): `read`/`read_file`/`read-file` map to
  * `read`; `write`/`edit`/`apply_patch` map to `write` and are excluded BEFORE
  * any argument is read, so a change can never be mistaken for a reread.
  */

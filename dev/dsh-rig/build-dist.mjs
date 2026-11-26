@@ -146,7 +146,7 @@ export function pluginFileUrl() {
 /** Import the emitted core and adapter, as the plugin does at apply time. */
 export async function importRuntime(distDir = DIST_DIR) {
   const core = await import(pathToFileURL(join(distDir, 'packages', 'core', 'src', 'index.js')).href);
-  const adapter = await import(pathToFileURL(join(distDir, 'src', 'index.js')).href);
+  const adapter = await import(pathToFileURL(join(distDir, 'packages', 'adapters', 'dsh', 'src', 'index.js')).href);
   return { ...core, ...adapter };
 }
 

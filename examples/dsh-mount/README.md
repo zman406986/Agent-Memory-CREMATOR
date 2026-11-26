@@ -1,8 +1,10 @@
 # dsh mount example
 
-The packages are not published to npm (owner decision, ISSUE-069). Build the mount, then point the
-patch row at the built file. See `patch.yml`; the row shape is the one the test rig uses in
-`dev/dsh-rig/run.mjs` (`mountRows`).
+The adapter is published to npm as `cremator-dsh`, so the short path is
+`dsh plugin --profile web add cremator-dsh`: the bundle patch mounts it, and no
+patch row is written by hand. The source-checkout path below builds the mount and
+points a patch row at the built file. See `patch.yml`; the row shape is the one the
+test rig uses in `dev/dsh-rig/run.mjs` (`mountRows`).
 
 ## Steps
 

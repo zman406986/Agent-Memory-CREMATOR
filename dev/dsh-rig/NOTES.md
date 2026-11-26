@@ -79,7 +79,7 @@ legs read a closed database a different process wrote.
 
 A dsh child is plain Node and cannot import the workspace TypeScript. `dev/dsh-rig/build-dist.mjs`
 runs the repo's own `tsc` with `dev/dsh-rig/tsconfig.rig-dist.json` and emits `packages/core` +
-`src/` into `scratchpad/dsh-rig/dist/` (gitignored), plus the two `node_modules`
+the root `src` into `scratchpad/dsh-rig/dist/` (gitignored), plus the two `node_modules`
 shims that make the bare `@cremator/core` and `cremator-dsh` specifiers resolve there. The build is
 stamped by a hash of the tsconfig and every included source, so repeated scenario runs reuse it.
 Nothing in the dist tree is committed. The wrapper imports the emitted

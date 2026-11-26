@@ -8,8 +8,11 @@ https://github.com/zman406986/Agent-Memory-CREMATOR.
 ## Install
 
 ```sh
-npm install cremator-dsh
+dsh plugin --profile web add cremator-dsh
 ```
+
+That installs the package into the profile and selects its dsh bundle; the mount row comes from
+`cordis.patch.yml`. `npm install cremator-dsh` alone gives the library, not the mount.
 
 `@cremator/core` installs as a dependency. Requires Node
 `>=22.16.0 <23.0.0 || >=24.0.0`.
@@ -91,7 +94,8 @@ per-result cadence; `entryAskBatchSize` applies only on that path.
 `capBytes` and `capHeadBytes` are accepted and ignored since 2026-10-23: ADR-0014 scrapped the
 entry-time cap, so an old config file still mounts and neither value is read. Remove them from new
 rows. `minCutFreedBytes` is also accepted and ignored: the cut is the earliest forgotten node
-(ADR-0034).
+(ADR-0034). `anchors` is also accepted and ignored: ADR-0028 removed the judge pass, so the entry
+checkpoint's ask renders its anchors unconditionally and no config value selects an arm.
 
 ## Durable storage
 
@@ -105,8 +109,8 @@ refused with `explicit-storage-paths`, because one shared ledger would break the
 
 `crematorStorageRoot` is the config key. It must be absolute. Absent, it resolves to
 `<DSH_HOME>/storages/cremator`, where `DSH_HOME` defaults to `~/.dsh`:
-`C:\Users\TZhen\.dsh\storages\CREMATOR` on one owner device, `C:\Users\TZ\.dsh\storages\CREMATOR`
-on the other. `storages` is dsh's own storage root; `CREMATOR` is a subdirectory, so no dsh file
+`C:\Users\TZhen\.dsh\storages\cremator` on one owner device, `C:\Users\TZ\.dsh\storages\cremator`
+on the other. `storages` is dsh's own storage root; `cremator` is a subdirectory, so no dsh file
 is ever shared — CREMATOR stamps its own `application_id` and `user_version`, and a shared file
 would be unreadable by both sides.
 

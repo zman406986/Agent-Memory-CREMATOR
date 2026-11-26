@@ -81,7 +81,7 @@ const CORE_DIST = process.env.CREMATOR_CORE_DIST
 const CORE_ENTRY = path.join(CORE_DIST, 'index.js');
 const ADAPTER_DIST = process.env.CREMATOR_ADAPTER_DIST
   ? path.resolve(process.env.CREMATOR_ADAPTER_DIST)
-  : path.join(REPO_ROOT, 'dist');
+  : path.join(REPO_ROOT, 'packages', 'adapters', 'dsh', 'dist');
 const ADAPTER_ENTRY = path.join(ADAPTER_DIST, 'judge-tables.js');
 const CRED = path.join(process.env.USERPROFILE || process.env.HOME || '', '.dsh', '.credentials.yaml');
 const CALL_TIMEOUT_MS = 120000;

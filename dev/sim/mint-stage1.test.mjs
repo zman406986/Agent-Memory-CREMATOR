@@ -110,7 +110,9 @@ function cutRecord(out, count) {
 
 /** The latch row the engine writes: one `user/message` record with its record id. */
 function latchRow(sessionId = "session-sim-5f1c0a2e", seq = 999, { withRecordId = true } = {}) {
-  const text = "RACOONS disabled after two validation failures. Recall remains available.";
+  const text = "CREMATOR: only its automatic context removal (pruning/compaction) is paused,"
+    + " after two failed validations of its own removal plans.\n"
+    + "Every other tool, plugin, format and feature is unaffected.";
   return {
     type: "user/message", seq, time: 1760000900000,
     data: {
