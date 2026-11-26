@@ -47,9 +47,18 @@ CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减�
 
 Node `>=22.16.0 <23.0.0 || >=24.0.0`（`node:sqlite` 从 22.13.0 起不用加 flag，但垃圾桶账本在 ROLLBACK 失败后要读 `DatabaseSync.prototype.isTransaction`，这个成员只有 22.16.0 和 24.0.0 才有，23.x 一概没有，所以 23 整个系列都被排除）。
 
+在 dsh 上装插件包，一条命令，挂载随包一起来：
+
+```sh
+dsh plugin --profile web add cremator-dsh
+```
+
+装完 dsh 的插件页会列出 CREMATOR，斜杠菜单里会多出 `/cremate`；直接输入 `/cremate` 也能触发同一轮清理。
+
+OpenCode、或者只想把适配器当库用、不挂 dsh：
+
 ```sh
 npm install cremator-dsh
-# 或
 npm install cremator-opencode
 ```
 
@@ -84,13 +93,7 @@ dsh 是本项目开发时用的编码智能体 harness。OpenCode 用适配器 `
 
 [`examples/dsh-mount/`](examples/dsh-mount/README.md) 有完整写法，启动命令（从仓库根执行）：`dsh --profile headless --patch examples/dsh-mount/patch.yml "your task"`。[`examples/core-offline/`](examples/core-offline/README.md) 只跑 core，不带适配器。
 
-dsh 适配器也可以作为 dsh 插件包安装。把 profile 指向本地的包目录：
-
-```sh
-dsh plugin --profile <name> add link:<本仓库根目录的路径>
-```
-
-安装后，dsh 的插件页会列出 CREMATOR，斜杠菜单里会多出 `/cremate`；直接输入 `/cremate` 也仍然能触发同一轮清理。
+上面那条 `dsh plugin --profile web add cremator-dsh` 是推荐路径；手写 patch 行只用于挂本地构建。
 
 ## 包
 
