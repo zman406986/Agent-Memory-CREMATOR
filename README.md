@@ -109,9 +109,19 @@ Node `>=22.16.0 <23.0.0 || >=24.0.0`: `node:sqlite` is flagless from 22.13.0, bu
 reads `DatabaseSync.prototype.isTransaction` after a failed ROLLBACK (22.16.0 and 24.0.0 only),
 so every 23 release is excluded.
 
+On dsh, install the bundle. One command, and the mount comes with it:
+
+```sh
+dsh plugin --profile web add cremator-dsh
+```
+
+The Plugins page then lists CREMATOR and the slash menu shows `/cremate`; a typed `/cremate` message
+triggers the same pass.
+
+For OpenCode, or to use either adapter as a library without the dsh mount:
+
 ```sh
 npm install cremator-dsh
-# or
 npm install cremator-opencode
 ```
 
@@ -154,14 +164,7 @@ behavior) are in [`README.dsh.md`](README.dsh.md). The default
 storage root is `<DSH_HOME>/storages/cremator` (`DSH_HOME` defaults to `~/.dsh`). For OpenCode, see
 [packages/adapters/opencode/README.md](packages/adapters/opencode/README.md).
 
-The dsh adapter also installs as a dsh bundle. Point the profile at the local package directory:
-
-```sh
-dsh plugin --profile <name> add link:<path to this repo root>
-```
-
-The host's Plugins page then lists CREMATOR, and the slash menu shows `/cremate`. A typed `/cremate`
-message still triggers the same pass.
+The bundle install above is the recommended path; the raw row is for mounting a local build.
 
 ## Packages
 
